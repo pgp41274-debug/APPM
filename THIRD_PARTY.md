@@ -12,4 +12,4 @@ The APK bundles PdfCraft's browser build and the material PdfCraft itself bundle
 | hayro, lopdf, egui/eframe and PdfCraft's other Rust dependencies | crates.io, via PdfCraft | See PdfCraft's `NOTICE` and `ATTRIBUTION.md` |
 | AndroidX Activity, Core and WebKit | https://developer.android.com/jetpack/androidx | Apache-2.0 |
 
-The ArtCraft name, wordmark and logos are trademarks of the ArtCraft Team and are not used here. `patches/pdfcraft/` holds this project's only change to PdfCraft's source, offered under PdfCraft's own licence terms.
+The ArtCraft name, wordmark and logos are trademarks of the ArtCraft Team and are not used here. `patches/pdfcraft/` holds this project's only changes to PdfCraft's source, offered under PdfCraft's own licence terms.

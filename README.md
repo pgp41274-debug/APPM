@@ -26,7 +26,7 @@ You need Android 10 or newer with a current **Android System WebView** (it updat
 PdfCraft's interface is its desktop interface, drawn at your screen's resolution. On a phone it starts with the Tools panel closed so the page gets the full width. The panel button at the top left brings it back.
 
 - Turn the phone sideways for the full toolbar.
-- Dialogs larger than the screen (Print, Properties) scroll. Drag inside them to reach their buttons.
+- Dialogs larger than the screen (Print, Properties) and the command palette scroll. Drag inside them to reach their buttons.
 - **Menu ▸ Preferences ▸ Interface size** makes everything smaller (down to 75%) or larger.
 - A tablet shows PdfCraft much as the desktop app does.
 
@@ -54,7 +54,7 @@ Android app (android/)                         assets/app/
 - `MainActivity` serves the APK's assets at `https://appassets.androidplatform.net/app/` (with `application/wasm` for the module) and serves files handed in by other apps at `/incoming/<id>`. It also connects PdfCraft's Open to Android's document picker and handles "Open with" and share intents.
 - PdfCraft's browser build already has a **host bridge** for embedding (`apps/pdfcraft-web/src/main.rs`, `mod host`). Started with `?host=parent` in a same-origin frame, it posts `pdfcraft:ready`, `pdfcraft:save {name, saveAs, bytes}` and `pdfcraft:dirty`, and accepts `pdfcraft:open {name, bytes}`. `shell.js` relays these to Java (`ShellBridge`), sending file bytes in base64 slices.
 - `shell.js` also covers what a browser does but a WebView doesn't. Downloads of `blob:` URLs become exports. `window.open` links go to the browser. PdfCraft's print sheets (PNG pages in a hidden frame) go to `Printer`, which builds a PDF for Android's `PrintManager`.
-- `patches/pdfcraft/0001-scroll-dialogs-on-small-screens.patch` is the only change to PdfCraft. On screens under 720 points it lets dialogs scroll inside the screen instead of running off it. Desktop sizes are unaffected.
+- `patches/pdfcraft/` holds the only changes to PdfCraft, two small ones that apply below 720 points: dialogs (0001) and the command palette (0002) fit inside the screen and scroll, instead of running off it. Desktop sizes are unaffected.
 - On first launch on a phone, the shell seeds PdfCraft's saved settings with the Tools panel closed. PdfCraft's own settings take over from then on.
 
 ## Build it yourself
