@@ -46,6 +46,9 @@ jobs:
           sudo apt-get install -y -qq poppler-utils
           scripts/test-print-pdf.sh build/test-print
 
+      - name: Test where saves go
+        run: scripts/test-save-targets.sh
+
       # The wasm build compiles a few hundred crates; keep them between runs.
       - name: Cache the PdfCraft build
         uses: actions/cache@v4

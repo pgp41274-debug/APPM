@@ -74,8 +74,9 @@ const mockBridge = () => {
       return String(window.__saves.length - 1);
     },
     appendChunk(id, b64) { window.__saves[+id].data += b64; return true; },
-    endSave(id) { window.__saves[+id].done = true; window.__ended.push(+id); return true; },
+    endSave(id) { window.__saves[+id].done = true; window.__ended.push(+id); window.__calls.push(['endSave', window.__saves[+id].name]); return true; },
     abortSave(id) { window.__calls.push(['abortSave', id]); },
+    closed(id, doc) { window.__calls.push(['closed', id, doc]); },
     setDirty(d) { window.__calls.push(['setDirty', d]); },
     openExternal(u) { window.__calls.push(['openExternal', u]); },
     beginPrint(name) { window.__print = { name, pages: [], done: false }; return 'p1'; },
@@ -266,14 +267,18 @@ try {
   });
   check('Save of a document with no id sends only PdfCraft\'s document number',
     fresh && fresh.id === '' && /^\d+$/.test(fresh.doc) && fresh.doc !== (save && save.doc) && !fresh.saveAs, JSON.stringify(fresh));
-  // Close it again ("Close file"), so showcase.pdf is the document in front.
+  // Close it again ("Close file"), so showcase.pdf is the document in front. Android hears of
+  // the close by the number the save carried, and lets go of the file that save went to.
   await focus();
   await page.keyboard.press('Control+k');
   await sleep(600);
   await page.keyboard.type('Close file', { delay: 20 });
   await sleep(600);
   await page.keyboard.press('Enter');
-  await sleep(1000);
+  await page.waitForFunction(() => window.__calls.some((c) => c[0] === 'closed'), null, { timeout: 5000 }).catch(() => {});
+  const closedTab = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'closed'));
+  check('closing a tab reports pdfcraft:closed with its document number',
+    fresh && closedTab.length === 1 && closedTab[0][1] === '' && closedTab[0][2] === fresh.doc, JSON.stringify(closedTab));
 
   // 5c. Two quick saves reach Android in the order PdfCraft made them, even when the older one
   // is far bigger and takes longer to read.
@@ -290,6 +295,22 @@ try {
   const order = await page.evaluate(() =>
     window.__ended.map((i) => window.__saves[i]).filter((s) => s.name === 'order.pdf').map((s) => s.data.length));
   check('two quick saves reach Android in order', order.length === 2 && order[0] > order[1], JSON.stringify(order));
+
+  // 5d. A close reaches Android only after the saves PdfCraft made of the document before it,
+  // even one that takes long to read: Android must not let go of the file that save goes to.
+  await app.evaluate(() => {
+    const bytes = new Uint8Array(24 << 20);
+    bytes.set([37, 80, 68, 70, 45]); // %PDF-
+    parent.postMessage({ type: 'pdfcraft:save', name: 'closing.pdf', saveAs: false, bytes: bytes.buffer, id: 'f7', doc: 7 },
+      location.origin, [bytes.buffer]);
+    parent.postMessage({ type: 'pdfcraft:closed', id: 'f7', doc: 7 }, location.origin);
+  });
+  await page.waitForFunction(() => window.__calls.some((c) => c[0] === 'closed' && c[1] === 'f7'), null, { timeout: 30000 })
+    .catch(() => {});
+  const closing = await page.evaluate(() =>
+    window.__calls.filter((c) => (c[0] === 'endSave' && c[1] === 'closing.pdf') || (c[0] === 'closed' && c[1] === 'f7')));
+  check('a close reaches Android after the save made before it',
+    closing.length === 2 && closing[0][0] === 'endSave' && closing[1][2] === '7', JSON.stringify(closing));
 
   // 6. Other downloads (PdfCraft's download(): <a download> on a revoked blob: URL) go to Android.
   await app.evaluate(() => {
@@ -383,6 +404,40 @@ try {
   await sleep(2500);
   check('a file shared later opens too', served.includes('f2'));
   await page.screenshot({ path: path.join(shots, '4-second-file.png') });
+
+  // 9b. Close all: each tab from Android reports its id with its number.
+  await page.waitForFunction(() => window.__opened.some((o) => o.id === 'f2'), null, { timeout: 10000 }).catch(() => {});
+  await sleep(500);
+  await focus();
+  await page.keyboard.press('Control+k');
+  await sleep(600);
+  await page.keyboard.type('Close all', { delay: 20 });
+  await sleep(600);
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => window.__calls.filter((c) => c[0] === 'closed' && /^f[12]$/.test(c[1])).length === 2, null,
+    { timeout: 5000 }).catch(() => {});
+  const closedAll = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'closed' && /^f[12]$/.test(c[1])));
+  const showcaseDoc = save && save.doc;
+  check('Close all reports each tab Android opened, by its id and number',
+    closedAll.length === 2 && closedAll.some((c) => c[1] === 'f1' && c[2] === showcaseDoc)
+      && closedAll.some((c) => c[1] === 'f2' && /^\d+$/.test(c[2]) && c[2] !== showcaseDoc),
+    JSON.stringify(closedAll));
+
+  // 9c. Files from Android that never become a document of their own report their id alone:
+  // one PdfCraft can't open, and a picture PdfCraft makes a new PDF of (that PDF is not the
+  // picture's file, so its saves must never go there).
+  incoming.set('f3', Buffer.from('not a PDF'));
+  incoming.set('f4', await page.screenshot({ clip: { x: 0, y: 0, width: 24, height: 24 } }));
+  await page.evaluate(() => {
+    window.__pending.push({ id: 'f3', name: 'broken.pdf' }, { id: 'f4', name: 'receipt.png' });
+    window.shell.incoming();
+  });
+  await page.waitForFunction(() => ['f3', 'f4'].every((i) => window.__calls.some((c) => c[0] === 'closed' && c[1] === i)), null,
+    { timeout: 10000 }).catch(() => {});
+  const unopened = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'closed' && /^f[34]$/.test(c[1])));
+  check('files that never become their own document report pdfcraft:closed by id',
+    unopened.length === 2 && unopened.every((c) => c[2] === ''), JSON.stringify(unopened));
+  await page.screenshot({ path: path.join(shots, '4b-picture-made-a-pdf.png') });
 
 
   const toasts = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'toast'));

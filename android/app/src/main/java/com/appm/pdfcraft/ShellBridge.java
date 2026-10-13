@@ -84,6 +84,16 @@ final class ShellBridge {
         files.abort(id);
     }
 
+    /**
+     * PdfCraft closed the document {@code id} or else {@code doc} names (as in {@link #beginSave}),
+     * or file {@code id} never became a document. Once the saves sent before are written, its
+     * file is free: opened again, it saves back there.
+     */
+    @JavascriptInterface
+    public void closed(String id, String doc) {
+        activity.onSave(files.closed(id, doc));
+    }
+
     /** PdfCraft has (or no longer has) unsaved work. */
     @JavascriptInterface
     public void setDirty(boolean dirty) {

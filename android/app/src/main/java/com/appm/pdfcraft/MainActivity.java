@@ -87,6 +87,8 @@ public final class MainActivity extends ComponentActivity {
      * Android ends the process while the picker is open, the answer comes to a new activity.
      */
     private FileStore.SaveJob asking;
+    /** A save is being written: the next job waits, as it may depend on where this one goes. */
+    private boolean writing;
     private volatile boolean dirty;
 
     private final ActivityResultLauncher<String[]> openOne = registerForActivityResult(
@@ -144,7 +146,9 @@ public final class MainActivity extends ComponentActivity {
         super.onSaveInstanceState(out);
         if (asking != null) out.putBundle(STATE_ASKING, asking.toBundle());
         ArrayList<Bundle> queued = new ArrayList<>();
-        for (FileStore.SaveJob job : saves) queued.add(job.toBundle());
+        for (FileStore.SaveJob job : saves) {
+            if (!job.isClose()) queued.add(job.toBundle());
+        }
         out.putParcelableArrayList(STATE_SAVES, queued);
     }
 
@@ -456,7 +460,7 @@ public final class MainActivity extends ComponentActivity {
 
     // ---- saving ----
 
-    /** PdfCraft handed over a file (from the bridge thread). */
+    /** PdfCraft handed over a file, or closed a document (from the bridge thread). */
     void onSave(FileStore.SaveJob job) {
         runOnUiThread(() -> {
             saves.add(job);
@@ -464,15 +468,26 @@ public final class MainActivity extends ComponentActivity {
         });
     }
 
+    /**
+     * Take the next job, once the one before is done: a save goes where the saves before it left
+     * its document bound, and a close lets go of that only after them.
+     */
     private void nextSave() {
-        if (asking != null) return;
+        if (asking != null || writing) return;
         FileStore.SaveJob job = saves.poll();
         if (job == null) return;
+        if (job.isClose()) {
+            files.forget(job.key);
+            nextSave();
+            return;
+        }
         if (!job.saveAs && !job.isExport()) {
             Uri target = files.targetFor(job.key, job.name);
+            writing = true;
             io.execute(() -> {
                 String message = write(job, target);
                 runOnUiThread(() -> {
+                    writing = false;
                     toast(message);
                     nextSave();
                 });
@@ -497,9 +512,9 @@ public final class MainActivity extends ComponentActivity {
         asking = null;
         if (job == null) {
             // Android ended the app while the picker was open, and the save didn't survive:
-            // don't leave the empty file the picker made.
+            // don't leave the empty file the picker made. A file chosen to be replaced stays.
             if (uri != null) {
-                io.execute(() -> files.deleteCreated(uri));
+                io.execute(() -> files.deleteIfEmpty(uri));
                 toast(getString(R.string.save_lost));
             }
             nextSave();
@@ -515,11 +530,13 @@ public final class MainActivity extends ComponentActivity {
         // PdfCraft already counts the document as saved, so a cancelled Save As still keeps
         // a copy (in Downloads/PdfCraft) rather than losing the work.
         if (uri != null && !job.isExport()) files.bind(job.key, uri);
+        writing = true;
         io.execute(() -> {
             String message = write(job, uri);
             if (uri == null) message = getString(R.string.save_as_cancelled, message);
             String shown = message;
             runOnUiThread(() -> {
+                writing = false;
                 toast(shown);
                 nextSave();
             });

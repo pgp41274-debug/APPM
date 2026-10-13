@@ -2,9 +2,9 @@
 //
 // PdfCraft runs in the iframe with `?host=parent`, so it talks to this page by postMessage
 // (apps/pdfcraft-web/src/main.rs, `mod host` in PdfCraft): it posts pdfcraft:ready,
-// pdfcraft:save and pdfcraft:dirty, and takes pdfcraft:open. This page relays those to Android
-// (`window.AndroidShell`, ShellBridge.java), and takes over the things a browser does that a
-// WebView doesn't: downloading blob: URLs, window.open() and window.print().
+// pdfcraft:save, pdfcraft:closed and pdfcraft:dirty, and takes pdfcraft:open. This page relays
+// those to Android (`window.AndroidShell`, ShellBridge.java), and takes over the things a
+// browser does that a WebView doesn't: downloading blob: URLs, window.open() and window.print().
 (() => {
   'use strict';
 
@@ -129,6 +129,11 @@
           doc: Number.isInteger(msg.doc) ? String(msg.doc) : '',
         });
         break;
+      case 'pdfcraft:closed':
+        // A tab closed (or a file Android sent never became a document): Android lets go of
+        // the file it saved to, once the saves sent before this are written.
+        closed(typeof msg.id === 'string' ? msg.id : '', Number.isInteger(msg.doc) ? String(msg.doc) : '');
+        break;
       case 'pdfcraft:dirty':
         if (android) android.setDirty(!!msg.dirty);
         break;
@@ -158,9 +163,22 @@
           frame.contentWindow.postMessage({ type: 'pdfcraft:open', name: file.name, id: file.id, bytes }, origin, [bytes]);
         } catch (e) {
           android.toast(`Couldn't open ${file.name}: ${e.message}`);
+          closed(file.id, '');
         }
       }
     });
+  }
+
+  /**
+   * Tell Android a document is closed: `id` and `doc` name it as in 'pdfcraft:save'. It waits
+   * in line with the saves, so it never reaches Android before a save of that document that
+   * PdfCraft made first.
+   */
+  function closed(id, doc) {
+    if (!android) return;
+    handing = handing
+      .then(() => android.closed(id, doc))
+      .catch(() => {});
   }
 
   /**
