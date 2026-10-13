@@ -24,8 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned: PdfCraft's lockfile pins wasm-bindgen, and a newer compiler can outrun it.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.0"
           targets: wasm32-unknown-unknown
 
       - uses: actions/setup-java@v4
@@ -48,10 +50,15 @@ jobs:
             ~/.cargo/git/db
             build/target
             build/tools
+            ~/.cache/trunk
           key: pdfcraft-wasm-${{ hashFiles('scripts/build-web.sh', 'patches/**') }}
           restore-keys: pdfcraft-wasm-
 
+      # No fallback to the official prebuilt site here: it lacks patches/pdfcraft/, and a
+      # release must never ship without them.
       - name: Build PdfCraft for the browser (wasm)
+        env:
+          PDFCRAFT_NO_FALLBACK: "1"
         run: scripts/build-web.sh
 
       - name: Test the shell around PdfCraft in Chromium

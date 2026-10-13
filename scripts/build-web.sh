@@ -91,6 +91,8 @@ from_source() {
     # craft-libs is a git dependency; the git CLI honours proxy and credential config.
     export CARGO_NET_GIT_FETCH_WITH_CLI=true
     export CRAFT_FONTS_DIR="$SRC/craft-fonts"
+    # Fail rather than quietly build a site without the Japanese, Thai and other UI fonts.
+    export CRAFT_FONTS_REQUIRED=1
     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/build/target}"
     "$trunk" build --release --dist "$OUT"
   )
@@ -107,7 +109,17 @@ from_source() {
 
 if [ "${1:-}" = "--prebuilt" ]; then
   prebuilt
-elif ! from_source; then
+  exit 0
+fi
+
+# Not `if ! from_source`: bash ignores `set -e` inside a function called as a condition, so a
+# failed fetch or patch would carry on and still count as a successful build. A subshell with
+# its own `set -e` stops at the first failing step.
+set +e
+(set -e; from_source)
+status=$?
+set -e
+if [ "$status" -ne 0 ]; then
   if [ "${PDFCRAFT_NO_FALLBACK:-0}" = "1" ]; then
     echo "error: source build failed" >&2
     exit 1
