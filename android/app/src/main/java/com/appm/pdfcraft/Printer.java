@@ -3,10 +3,9 @@ package com.appm.pdfcraft;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.graphics.Canvas;
-import android.graphics.Paint;
-import android.graphics.RectF;
-import android.graphics.pdf.PdfDocument;
+import android.graphics.BitmapRegionDecoder;
+import android.graphics.Rect;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.os.ParcelFileDescriptor;
@@ -16,6 +15,7 @@ import android.print.PrintDocumentAdapter;
 import android.print.PrintDocumentInfo;
 import android.util.Base64;
 
+import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -74,6 +74,12 @@ final class Printer {
         }
     }
 
+    /**
+     * The most pixels decoded at once (16 MB). A PNG can only be read from its start, so each strip
+     * rereads the rows above it, and fewer, taller strips are faster.
+     */
+    private static final int STRIP_PIXELS = 1 << 22;
+
     private final File root;
     private final AtomicInteger ids = new AtomicInteger();
     private final Map<String, Job> jobs = new HashMap<>();
@@ -116,7 +122,7 @@ final class Printer {
         if (job != null) deleteTree(job.dir);
     }
 
-    /** Draw the sheets into a PDF. Slow: call it off the UI thread. */
+    /** Write the sheets into a PDF, one at a time. Slow: call it off the UI thread. */
     Document build(String id) throws IOException {
         Job job;
         synchronized (this) {
@@ -127,44 +133,73 @@ final class Printer {
             deleteTree(job.dir);
             throw new IOException("nothing to print");
         }
-        PdfDocument doc = new PdfDocument();
+        File pdf = new File(job.dir, "print.pdf");
         try {
-            Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
-            int number = 0;
-            for (Page sheet : job.pages) {
-                int w = Math.max(1, (int) Math.round(sheet.widthPt));
-                int h = Math.max(1, (int) Math.round(sheet.heightPt));
-                PdfDocument.Page page = doc.startPage(new PdfDocument.PageInfo.Builder(w, h, ++number).create());
-                Bitmap bitmap = BitmapFactory.decodeFile(sheet.png.getPath());
-                if (bitmap == null) throw new IOException("sheet " + number + " isn't a picture");
-                Canvas canvas = page.getCanvas();
-                if (sheet.turned) {
-                    // The picture is drawn landscape on a portrait sheet, as PdfCraft's print page
-                    // does it: translate(0, h) rotate(-90deg).
-                    canvas.save();
-                    canvas.translate(0, h);
-                    canvas.rotate(-90);
-                    canvas.drawBitmap(bitmap, null, new RectF(0, 0, h, w), paint);
-                    canvas.restore();
-                } else {
-                    canvas.drawBitmap(bitmap, null, new RectF(0, 0, w, h), paint);
+            try (OutputStream out = new BufferedOutputStream(new FileOutputStream(pdf), 1 << 16);
+                    PrintPdfWriter writer = new PrintPdfWriter(out)) {
+                int number = 0;
+                for (Page sheet : job.pages) {
+                    writeSheet(writer, sheet, ++number);
+                    //noinspection ResultOfMethodCallIgnored
+                    sheet.png.delete();
                 }
-                bitmap.recycle();
-                doc.finishPage(page);
-                //noinspection ResultOfMethodCallIgnored
-                sheet.png.delete();
-            }
-            File pdf = new File(job.dir, "print.pdf");
-            try (OutputStream out = new FileOutputStream(pdf)) {
-                doc.writeTo(out);
+                writer.finish();
             }
             return new Document(job.name, pdf, job.pages.size(), job.dir);
         } catch (IOException | RuntimeException e) {
+            // The sheets and the unfinished PDF go with the job's folder.
             deleteTree(job.dir);
             throw e;
-        } finally {
-            doc.close();
         }
+    }
+
+    /**
+     * Sheet {@code number}'s picture into {@code writer}, decoded a strip of rows at a time. Decoded
+     * whole, a sheet takes up to 256 MB (64 megapixels).
+     */
+    private static void writeSheet(PrintPdfWriter writer, Page sheet, int number) throws IOException {
+        BitmapRegionDecoder decoder;
+        try {
+            decoder = newDecoder(sheet.png.getPath());
+        } catch (IOException e) {
+            throw new IOException("sheet " + number + " isn't a picture", e);
+        }
+        if (decoder == null) throw new IOException("sheet " + number + " isn't a picture");
+        try {
+            int width = decoder.getWidth();
+            int height = decoder.getHeight();
+            if (width <= 0 || height <= 0) throw new IOException("sheet " + number + " isn't a picture");
+            writer.beginSheet(sheet.widthPt, sheet.heightPt, sheet.turned, width, height);
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            int strip = Math.max(1, Math.min(height, STRIP_PIXELS / width));
+            int[] row = new int[width];
+            for (int top = 0; top < height; top += strip) {
+                int rows = Math.min(strip, height - top);
+                Bitmap bitmap = decoder.decodeRegion(new Rect(0, top, width, top + rows), options);
+                if (bitmap == null) throw new IOException("sheet " + number + " can't be read");
+                try {
+                    if (bitmap.getWidth() != width || bitmap.getHeight() != rows) {
+                        throw new IOException("sheet " + number + " can't be read");
+                    }
+                    for (int y = 0; y < rows; y++) {
+                        bitmap.getPixels(row, 0, width, 0, y, width, 1);
+                        writer.writeRow(row);
+                    }
+                } finally {
+                    bitmap.recycle();
+                }
+            }
+            writer.endSheet();
+        } finally {
+            decoder.recycle();
+        }
+    }
+
+    @SuppressWarnings("deprecation") // newInstance(String, boolean) is the only one before Android 12.
+    private static BitmapRegionDecoder newDecoder(String path) throws IOException {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) return BitmapRegionDecoder.newInstance(path);
+        return BitmapRegionDecoder.newInstance(path, false);
     }
 
     /** Hands a built PDF to the print framework, and deletes it once the framework is done. */
