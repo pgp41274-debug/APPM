@@ -1,6 +1,8 @@
 package com.appm.pdfcraft;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -38,12 +40,25 @@ final class SaveTargets<F> {
     private final Map<String, Set<F>> sources = new HashMap<>();
     /** Files picked in PdfCraft's own Open that may be written, with each one's own name. */
     private final Map<F, String> pickedWritable = new HashMap<>();
+    /** Files handed in by id ("Open with", share), with the name each came under, until PdfCraft lets go of them. */
+    private final Map<String, Handed<F>> handed = new HashMap<>();
+
+    private static final class Handed<F> {
+        final F file;
+        final String name;
+
+        Handed(F file, String name) {
+            this.file = file;
+            this.name = name;
+        }
+    }
     /** PdfCraft's starts in the WebView so far: its document numbers begin again with each. */
     private int page;
 
     /** File {@code id}, called {@code name}, goes to PdfCraft; {@code canWrite} if a Save may overwrite it. */
     synchronized void addIncoming(String id, String name, F file, boolean canWrite) {
         addSource(name, file);
+        handed.put(id, new Handed<>(file, name));
         if (canWrite) targets.put(id + tag, file);
     }
 
@@ -76,10 +91,21 @@ final class SaveTargets<F> {
         return null;
     }
 
-    /** PdfCraft (re)started: forget its old document numbers, which it now hands out again. */
-    synchronized void newPage() {
+    /**
+     * PdfCraft (re)started: forget its old document numbers, which it now hands out again. A
+     * restart (the WebView's renderer was killed) takes the old page's documents with it without
+     * a close for any of them, so also let go of every file it was handed, except those still
+     * {@code waiting} for the new page to fetch.
+     */
+    synchronized void newPage(Collection<String> waiting) {
         page++;
         targets.keySet().removeIf(key -> key.startsWith(DOC_KEY));
+        for (String id : new ArrayList<>(handed.keySet())) {
+            if (!waiting.contains(id)) {
+                targets.remove(id + tag);
+                release(id);
+            }
+        }
     }
 
     /**
@@ -114,6 +140,26 @@ final class SaveTargets<F> {
 
     /** Document {@code key} is closed: its file is free for the next document opened from it. */
     synchronized void forget(String key) {
-        if (key != null) targets.remove(key);
+        if (key == null) return;
+        targets.remove(key);
+        if (!key.startsWith(DOC_KEY) && key.endsWith(tag)) release(key.substring(0, key.length() - tag.length()));
+    }
+
+    /**
+     * File {@code id} is no longer open in PdfCraft. Unless another open document came from the
+     * same file, stop counting it under its own name, so that picking it again in PdfCraft's Open
+     * (often under a different URI than "Open with" gave) isn't taken for a second file of that
+     * name. Its "{stem}.pdf" entry stays: a PDF PdfCraft made of an image may still be open.
+     */
+    private void release(String id) {
+        Handed<F> gone = handed.remove(id);
+        if (gone == null) return;
+        for (Handed<F> other : handed.values()) {
+            if (other.file.equals(gone.file)) return;
+        }
+        Set<F> files = sources.get(gone.name);
+        if (files == null) return;
+        files.remove(gone.file);
+        if (files.isEmpty()) sources.remove(gone.name);
     }
 }

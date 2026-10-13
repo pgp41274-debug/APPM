@@ -473,7 +473,9 @@ public final class MainActivity extends ComponentActivity {
      * its document bound, and a close lets go of that only after them.
      */
     private void nextSave() {
-        if (asking != null || writing) return;
+        // A destroyed activity's last write can finish after its successor took over the queue
+        // (from the saved state); this one's executor and pickers are gone.
+        if (isDestroyed() || asking != null || writing) return;
         FileStore.SaveJob job = saves.poll();
         if (job == null) return;
         if (job.isClose()) {
@@ -628,6 +630,7 @@ public final class MainActivity extends ComponentActivity {
     }
 
     void toast(String message) {
-        runOnUiThread(() -> Toast.makeText(this, message, Toast.LENGTH_LONG).show());
+        // The application's context: a save can finish after this activity is destroyed.
+        runOnUiThread(() -> Toast.makeText(getApplicationContext(), message, Toast.LENGTH_LONG).show());
     }
 }

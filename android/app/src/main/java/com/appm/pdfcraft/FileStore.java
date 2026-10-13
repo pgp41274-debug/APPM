@@ -203,9 +203,12 @@ final class FileStore {
 
     // ---- where saves go ----
 
-    /** PdfCraft (re)started: forget its old document numbers, which it now hands out again. */
-    void newPage() {
-        targets.newPage();
+    /**
+     * PdfCraft (re)started: forget its old document numbers and the files its old page had
+     * already taken, keeping those still queued for the new page ({@link SaveTargets#newPage}).
+     */
+    synchronized void newPage() {
+        targets.newPage(new ArrayList<>(pending));
     }
 
     /** Where a Save of document {@code key}, called {@code name}, should be written ({@link SaveTargets#targetFor}). */

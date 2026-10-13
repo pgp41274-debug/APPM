@@ -7,6 +7,7 @@ package com.appm.pdfcraft;
  * picked in PdfCraft's Open, saves of a document by its key, a Save As, a close.
  */
 final class SaveTargetsTest {
+    private static final java.util.List<String> NONE = java.util.Collections.emptyList();
     private static int checks;
     private static int failures;
 
@@ -36,7 +37,7 @@ final class SaveTargetsTest {
     /** Picked receipt.jpg (writable): PdfCraft makes a new receipt.pdf of it, whose Save never overwrites the picture. */
     private static void convertedImage() {
         SaveTargets<String> t = new SaveTargets<>();
-        t.newPage();
+        t.newPage(NONE);
         t.addPicked("receipt.jpg", "content://docs/receipt.jpg", true);
         String doc = t.keyFor("", "1");
         check("a PDF made from a picked image is not saved over the image", t.targetFor(doc, "receipt.pdf") == null);
@@ -52,13 +53,13 @@ final class SaveTargetsTest {
     /** Picked report.pdf (writable): its Save goes back to it, and stays there. */
     private static void pickedPdf() {
         SaveTargets<String> t = new SaveTargets<>();
-        t.newPage();
+        t.newPage(NONE);
         t.addPicked("report.pdf", "content://docs/report.pdf", true);
         String doc = t.keyFor("", "1");
         check("Save of a picked writable PDF goes back to it", "content://docs/report.pdf".equals(t.targetFor(doc, "report.pdf")));
         check("... every time", "content://docs/report.pdf".equals(t.targetFor(doc, "report.pdf")));
         SaveTargets<String> readOnly = new SaveTargets<>();
-        readOnly.newPage();
+        readOnly.newPage(NONE);
         readOnly.addPicked("report.pdf", "content://docs/report.pdf", false);
         check("a picked file that can't be written is never saved to", readOnly.targetFor(readOnly.keyFor("", "1"), "report.pdf") == null);
     }
@@ -66,7 +67,7 @@ final class SaveTargetsTest {
     /** Picked scan.jpg and scan.pdf: a document called scan.pdf may be either, so it goes to neither. */
     private static void ambiguousName() {
         SaveTargets<String> t = new SaveTargets<>();
-        t.newPage();
+        t.newPage(NONE);
         t.addPicked("scan.jpg", "content://docs/scan.jpg", true);
         t.addPicked("scan.pdf", "content://docs/scan.pdf", true);
         String converted = t.keyFor("", "1");
@@ -78,7 +79,7 @@ final class SaveTargetsTest {
     /** "Open with" a read-only scan.pdf, and pick a writable scan.pdf in PdfCraft's Open. */
     private static void openWithAndPicked() {
         SaveTargets<String> t = new SaveTargets<>();
-        t.newPage();
+        t.newPage(NONE);
         t.addIncoming("f1", "scan.pdf", "content://mail/scan.pdf", false);
         t.addPicked("scan.pdf", "content://docs/scan.pdf", true);
         String openWith = t.keyFor("f1", "1");
@@ -88,14 +89,14 @@ final class SaveTargetsTest {
                         && "downloads/scan.pdf".equals(t.targetFor(openWith, "scan.pdf")));
         // The same file both ways: the picked document may have it, the Open-with one still not.
         SaveTargets<String> same = new SaveTargets<>();
-        same.newPage();
+        same.newPage(NONE);
         same.addIncoming("f1", "scan.pdf", "content://docs/scan.pdf", false);
         same.addPicked("scan.pdf", "content://docs/scan.pdf", true);
         check("the Open-with document of a picked file doesn't save to it either", same.targetFor(same.keyFor("f1", "1"), "scan.pdf") == null);
         check("the picked document of that file does", "content://docs/scan.pdf".equals(same.targetFor(same.keyFor("", "2"), "scan.pdf")));
         // A writable "Open with" file is the Open-with document's own.
         SaveTargets<String> writable = new SaveTargets<>();
-        writable.newPage();
+        writable.newPage(NONE);
         writable.addIncoming("f1", "scan.pdf", "content://docs/scan.pdf", true);
         writable.addPicked("scan.pdf", "content://docs/scan.pdf", true);
         check("a writable Open-with file is saved to by its document",
@@ -107,7 +108,7 @@ final class SaveTargetsTest {
     /** Names PdfCraft gives the documents it makes are never a picked file's. */
     private static void madeNames() {
         SaveTargets<String> t = new SaveTargets<>();
-        t.newPage();
+        t.newPage(NONE);
         t.addPicked("Untitled.pdf", "content://docs/Untitled.pdf", true);
         check("a new blank document isn't saved over a picked Untitled.pdf", t.targetFor(t.keyFor("", "1"), "Untitled.pdf") == null);
     }
@@ -115,7 +116,7 @@ final class SaveTargetsTest {
     /** Two documents from one picked file: the first to save has it, the other gets a copy. */
     private static void busyFile() {
         SaveTargets<String> t = new SaveTargets<>();
-        t.newPage();
+        t.newPage(NONE);
         t.addPicked("report.pdf", "content://docs/report.pdf", true);
         String first = t.keyFor("", "1");
         String second = t.keyFor("", "2");
@@ -126,7 +127,7 @@ final class SaveTargetsTest {
     /** Close a picked document, open the file again: the new document saves back to it. */
     private static void closeFreesFile() {
         SaveTargets<String> t = new SaveTargets<>();
-        t.newPage();
+        t.newPage(NONE);
         t.addPicked("report.pdf", "content://docs/report.pdf", true);
         String first = t.keyFor("", "1");
         t.targetFor(first, "report.pdf");
@@ -143,7 +144,7 @@ final class SaveTargetsTest {
     /** Close an "Open with" document, then pick its file in PdfCraft's Open. */
     private static void closeAfterOpenWith() {
         SaveTargets<String> t = new SaveTargets<>();
-        t.newPage();
+        t.newPage(NONE);
         t.addIncoming("f1", "report.pdf", "content://docs/report.pdf", true);
         String openWith = t.keyFor("f1", "1");
         check("the Open-with document saves to its file", "content://docs/report.pdf".equals(t.targetFor(openWith, "report.pdf")));
@@ -154,18 +155,42 @@ final class SaveTargetsTest {
         // A file PdfCraft never opened (an image it made a new PDF of, or one it couldn't read)
         // is let go of by its id alone.
         SaveTargets<String> failed = new SaveTargets<>();
-        failed.newPage();
+        failed.newPage(NONE);
         failed.addIncoming("f1", "report.pdf", "content://docs/report.pdf", true);
         failed.forget(failed.keyFor("f1", ""));
         failed.addPicked("report.pdf", "content://docs/report.pdf", true);
         check("a file Android handed in that never opened is free for the next document",
                 "content://docs/report.pdf".equals(failed.targetFor(failed.keyFor("", "1"), "report.pdf")));
+        // The file manager's "Open with" URI and the system picker's URI for one file differ.
+        SaveTargets<String> two = new SaveTargets<>();
+        two.newPage(NONE);
+        two.addIncoming("f1", "report.pdf", "content://files/report.pdf", true);
+        two.forget(two.keyFor("f1", "1"));
+        two.addPicked("report.pdf", "content://docs/report.pdf", true);
+        check("... also when the picker gives another URI than Open with did",
+                "content://docs/report.pdf".equals(two.targetFor(two.keyFor("", "2"), "report.pdf")));
+        SaveTargets<String> both = new SaveTargets<>();
+        both.newPage(NONE);
+        both.addIncoming("f1", "report.pdf", "content://files/report.pdf", true);
+        both.addIncoming("f2", "report.pdf", "content://files/report.pdf", true);
+        both.forget(both.keyFor("f1", "1"));
+        both.addPicked("report.pdf", "content://docs/report.pdf", true);
+        check("while another Open-with tab of that file is open, picking it under another URI gets a copy",
+                both.targetFor(both.keyFor("", "3"), "report.pdf") == null);
+        // scan.jpg arrives by Open with and becomes a new scan.pdf (its id is let go of at once).
+        SaveTargets<String> image = new SaveTargets<>();
+        image.newPage(NONE);
+        image.addIncoming("f1", "scan.jpg", "content://files/scan.jpg", true);
+        image.forget(image.keyFor("f1", ""));
+        image.addPicked("scan.pdf", "content://docs/scan.pdf", true);
+        check("a PDF made from an Open-with image never takes a picked file of its name",
+                image.targetFor(image.keyFor("", "1"), "scan.pdf") == null);
     }
 
     /** Save As to a file, close the document, pick that file: its new document saves to it. */
     private static void closeAfterSaveAs() {
         SaveTargets<String> t = new SaveTargets<>();
-        t.newPage();
+        t.newPage(NONE);
         t.addPicked("report.pdf", "content://docs/report.pdf", true);
         String doc = t.keyFor("", "1");
         t.targetFor(doc, "report.pdf");
@@ -183,16 +208,28 @@ final class SaveTargetsTest {
     /** A restarted PdfCraft numbers documents afresh: an old number's file goes with it. */
     private static void newPage() {
         SaveTargets<String> t = new SaveTargets<>();
-        t.newPage();
+        t.newPage(NONE);
         t.addPicked("report.pdf", "content://docs/report.pdf", true);
         String old = t.keyFor("", "1");
         t.targetFor(old, "report.pdf");
-        t.newPage();
+        t.newPage(NONE);
         String renumbered = t.keyFor("", "1");
         check("document 1 of a restarted PdfCraft is another document", !old.equals(renumbered));
         check("... and may have the file document 1 had", "content://docs/report.pdf".equals(t.targetFor(renumbered, "report.pdf")));
         check("a key comes only with an id or a number", t.keyFor("", "") == null && t.keyFor(null, null) == null);
         check("an id names the document before its number", t.keyFor("f1", "1").equals(t.keyFor("f1", "2")));
+        // The WebView's renderer died: its documents went without a close. f1 was already
+        // opened by the old page; f2 is still queued for the new one.
+        SaveTargets<String> r = new SaveTargets<>();
+        r.newPage(NONE);
+        r.addIncoming("f1", "report.pdf", "content://files/report.pdf", true);
+        r.addIncoming("f2", "other.pdf", "content://files/other.pdf", true);
+        r.newPage(java.util.Collections.singletonList("f2"));
+        r.addPicked("report.pdf", "content://files/report.pdf", true);
+        check("after a restart, a file the old page had opened saves back when picked again",
+                "content://files/report.pdf".equals(r.targetFor(r.keyFor("", "1"), "report.pdf")));
+        check("... and a file still queued for the new page keeps its target",
+                "content://files/other.pdf".equals(r.targetFor(r.keyFor("f2", ""), "other.pdf")));
     }
 
     private static void check(String name, boolean ok) {
