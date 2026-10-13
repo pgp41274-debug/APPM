@@ -32,11 +32,21 @@ final class ShellBridge {
         return files.drainPending();
     }
 
-    /** Start a save; returns its id, or "" if it can't be spooled. */
+    /** PdfCraft (re)started in the page: the documents of the one before are gone. */
     @JavascriptInterface
-    public String beginSave(String name, String mime, boolean saveAs, String kind) {
+    public void appReady() {
+        files.newPage();
+    }
+
+    /**
+     * Start a save; returns its id, or "" if it can't be spooled. A document save names the
+     * document by {@code id}, the id it was opened with (see {@link #pending}), or else by
+     * {@code doc}, PdfCraft's number for it; "" when there is none.
+     */
+    @JavascriptInterface
+    public String beginSave(String name, String mime, boolean saveAs, String kind, String id, String doc) {
         try {
-            return files.begin(name, mime, saveAs, kind);
+            return files.begin(name, mime, saveAs, kind, id, doc);
         } catch (IOException e) {
             activity.toast("Couldn't save " + name + ": " + e.getMessage());
             return "";

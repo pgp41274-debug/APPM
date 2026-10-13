@@ -13,4 +13,5 @@
     <string name="saved_to">Saved to %1$s</string>
     <string name="saved_instead">Couldn\'t write the original file; saved to %1$s</string>
     <string name="save_failed">Couldn\'t save %1$s: %2$s</string>
+    <string name="save_lost">Android closed PdfCraft while you were choosing where to save, and that save was lost. Please save again.</string>
 </resources>

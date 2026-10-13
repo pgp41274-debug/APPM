@@ -32,9 +32,11 @@ import androidx.activity.ComponentActivity;
 import androidx.activity.OnBackPressedCallback;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.annotation.NonNull;
 import androidx.core.content.ContextCompat;
 import androidx.core.content.IntentCompat;
 import androidx.core.graphics.Insets;
+import androidx.core.os.BundleCompat;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
@@ -44,6 +46,7 @@ import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 
 import java.io.ByteArrayInputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -66,6 +69,9 @@ public final class MainActivity extends ComponentActivity {
     private static final String TAG = "PdfCraft";
     static final String HOST = "appassets.androidplatform.net";
     private static final String START = "https://" + HOST + "/app/shell/index.html";
+    // Instance state: saves waiting on (or queued behind) the "Save as" picker.
+    private static final String STATE_ASKING = "asking";
+    private static final String STATE_SAVES = "saves";
 
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final ArrayDeque<FileStore.SaveJob> saves = new ArrayDeque<>();
@@ -76,7 +82,10 @@ public final class MainActivity extends ComponentActivity {
     private FrameLayout root;
     private WebView web;
     private ValueCallback<Uri[]> chooser;
-    /** The save waiting on the "Save as" picker, if one is open. */
+    /**
+     * The save waiting on the "Save as" picker, if one is open. Kept in the instance state: if
+     * Android ends the process while the picker is open, the answer comes to a new activity.
+     */
     private FileStore.SaveJob asking;
     private volatile boolean dirty;
 
@@ -94,6 +103,7 @@ public final class MainActivity extends ComponentActivity {
         super.onCreate(state);
         files = new FileStore(this);
         printer = new Printer(this);
+        restoreSaves(state);
         loader = new WebViewAssetLoader.Builder()
                 .setDomain(HOST)
                 .addPathHandler("/app/", new AssetHandler(getAssets()))
@@ -126,6 +136,38 @@ public final class MainActivity extends ComponentActivity {
 
         handle(getIntent());
         web.loadUrl(START);
+        nextSave();
+    }
+
+    @Override
+    protected void onSaveInstanceState(@NonNull Bundle out) {
+        super.onSaveInstanceState(out);
+        if (asking != null) out.putBundle(STATE_ASKING, asking.toBundle());
+        ArrayList<Bundle> queued = new ArrayList<>();
+        for (FileStore.SaveJob job : saves) queued.add(job.toBundle());
+        out.putParcelableArrayList(STATE_SAVES, queued);
+    }
+
+    /**
+     * Take back the saves an ended process left waiting on the "Save as" picker, and delete the
+     * spool files of any others.
+     */
+    private void restoreSaves(Bundle state) {
+        List<File> keep = new ArrayList<>();
+        if (state != null) {
+            asking = FileStore.SaveJob.fromBundle(state.getBundle(STATE_ASKING));
+            if (asking != null) keep.add(asking.file);
+            ArrayList<Bundle> queued = BundleCompat.getParcelableArrayList(state, STATE_SAVES, Bundle.class);
+            if (queued != null) {
+                for (Bundle b : queued) {
+                    FileStore.SaveJob job = FileStore.SaveJob.fromBundle(b);
+                    if (job == null) continue;
+                    saves.add(job);
+                    keep.add(job.file);
+                }
+            }
+        }
+        files.sweepSpools(keep);
     }
 
     @Override
@@ -171,14 +213,20 @@ public final class MainActivity extends ComponentActivity {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 Uri url = request.getUrl();
-                if (HOST.equals(url.getHost())) return loader.shouldInterceptRequest(url);
-                // The app is offline. A link that would navigate a frame away from PdfCraft opens
-                // in the browser; "204 No Content" leaves the frame where it is.
-                if (isNavigation(request)) {
-                    runOnUiThread(() -> openExternal(url));
-                    return empty(204, "No Content");
+                // An exception thrown here would end the app; fail just the request instead.
+                try {
+                    if (HOST.equals(url.getHost())) return loader.shouldInterceptRequest(url);
+                    // The app is offline. A link that would navigate a frame away from PdfCraft
+                    // opens in the browser; "204 No Content" leaves the frame where it is.
+                    if (isNavigation(request)) {
+                        runOnUiThread(() -> openExternal(url));
+                        return empty(204, "No Content");
+                    }
+                    return empty(403, "Offline");
+                } catch (RuntimeException e) {
+                    Log.w(TAG, "can't answer " + url, e);
+                    return empty(500, "Internal Server Error");
                 }
-                return empty(403, "Offline");
             }
 
             @Override
@@ -274,7 +322,9 @@ public final class MainActivity extends ComponentActivity {
     private WebResourceResponse incoming(String id) {
         try {
             return new WebResourceResponse("application/pdf", null, files.openIncoming(id));
-        } catch (IOException | SecurityException e) {
+        } catch (IOException | RuntimeException e) {
+            // Any app can send us a URI, and its provider may throw anything (SecurityException,
+            // IllegalArgumentException, ...): the shell then says the file couldn't be opened.
             Log.w(TAG, "can't read incoming file " + id, e);
             byte[] message = String.valueOf(e.getMessage()).getBytes(StandardCharsets.UTF_8);
             return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", Collections.emptyMap(),
@@ -350,12 +400,18 @@ public final class MainActivity extends ComponentActivity {
     private void chosen(Uri[] uris) {
         ValueCallback<Uri[]> callback = chooser;
         chooser = null;
-        if (uris != null) {
-            for (Uri uri : uris) {
-                if (keepAccess(uri)) files.remember(files.displayName(uri), uri);
+        if (callback != null) {
+            if (uris != null) {
+                for (Uri uri : uris) files.addPicked(uri, keepAccess(uri));
             }
+            callback.onReceiveValue(uris);
+            return;
         }
-        if (callback != null) callback.onReceiveValue(uris);
+        // Nobody is waiting for the files: Android ended the app while the picker was open.
+        // Open them as if they were shared, once PdfCraft is ready.
+        if (uris == null) return;
+        for (Uri uri : uris) files.addIncoming(uri, keepAccess(uri));
+        if (web != null) web.evaluateJavascript("window.shell && shell.incoming()", null);
     }
 
     /** Keep read (and, where offered, write) access to a picked file; true if it is writable. */
@@ -413,7 +469,7 @@ public final class MainActivity extends ComponentActivity {
         FileStore.SaveJob job = saves.poll();
         if (job == null) return;
         if (!job.saveAs && !job.isExport()) {
-            Uri target = files.targetFor(job.name);
+            Uri target = files.targetFor(job.key, job.name);
             io.execute(() -> {
                 String message = write(job, target);
                 runOnUiThread(() -> {
@@ -439,7 +495,16 @@ public final class MainActivity extends ComponentActivity {
     private void created(Uri uri) {
         FileStore.SaveJob job = asking;
         asking = null;
-        if (job == null) return;
+        if (job == null) {
+            // Android ended the app while the picker was open, and the save didn't survive:
+            // don't leave the empty file the picker made.
+            if (uri != null) {
+                io.execute(() -> files.deleteCreated(uri));
+                toast(getString(R.string.save_lost));
+            }
+            nextSave();
+            return;
+        }
         if (uri == null && job.isExport()) {
             //noinspection ResultOfMethodCallIgnored
             job.file.delete();
@@ -449,7 +514,7 @@ public final class MainActivity extends ComponentActivity {
         }
         // PdfCraft already counts the document as saved, so a cancelled Save As still keeps
         // a copy (in Downloads/PdfCraft) rather than losing the work.
-        if (uri != null && !job.isExport()) files.prefer(job.name, uri);
+        if (uri != null && !job.isExport()) files.bind(job.key, uri);
         io.execute(() -> {
             String message = write(job, uri);
             if (uri == null) message = getString(R.string.save_as_cancelled, message);
@@ -473,7 +538,12 @@ public final class MainActivity extends ComponentActivity {
                 }
             }
             Uri copy = files.saveToDownloads(job.name, job.mime, job.file);
-            if (!job.isExport()) files.prefer(job.name, copy);
+            // Later saves of the document update this copy. A cancelled Save As leaves them
+            // going where they went before, if anywhere.
+            if (!job.isExport()) {
+                if (target == null && job.saveAs) files.bindIfUnbound(job.key, copy);
+                else files.bind(job.key, copy);
+            }
             String where = FileStore.DOWNLOADS_FOLDER + "/" + files.displayName(copy);
             return target != null ? getString(R.string.saved_instead, where) : getString(R.string.saved_to, where);
         } catch (IOException | RuntimeException e) {

@@ -5,7 +5,9 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Bundle;
 import android.os.Environment;
+import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.util.Base64;
@@ -23,23 +25,35 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
-import java.util.LinkedHashSet;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The files PdfCraft opened and saved, and where a save of each document should go.
  *
- * <p>PdfCraft's host bridge names a saved document only by its file name, so files are tracked
- * by name: a Save goes back to the one writable file of that name, or to the file a Save As or
- * an earlier fallback save chose; with no such file it goes to Downloads/PdfCraft.
+ * <p>A save is matched to its document, never to a file name alone: two files can share a name,
+ * and PdfCraft names the documents it makes itself. A document opened from here ("Open with",
+ * share) carries the id it was handed in with; any other one is known by PdfCraft's number for
+ * it, which holds until PdfCraft reloads. Each such key is bound to where its saves go: the file
+ * it came from when that may be written, the file a Save As chose, or the Downloads/PdfCraft
+ * copy an earlier save made. A key bound to nothing gets a new copy.
  */
 final class FileStore {
     static final String DOWNLOADS_FOLDER = Environment.DIRECTORY_DOWNLOADS + "/PdfCraft";
+    private static final String DOC_KEY = "doc:";
+    /** Names PdfCraft gives documents it makes (create_ui.rs, Combine): never a picked file. */
+    private static final List<String> MADE_NAMES = Arrays.asList("Untitled.pdf", "Clipboard.pdf", "Images.pdf", "Combined.pdf");
+
+    /** Whether this process has deleted the spool files earlier processes left behind. */
+    private static boolean swept;
 
     /** A file handed to PdfCraft, waiting to be fetched from {@code /incoming/<id>}. */
     private static final class Incoming {
@@ -59,18 +73,43 @@ final class FileStore {
         final boolean saveAs;
         /** {@code "save"} for a document save, {@code "export"} for any other download. */
         final String kind;
+        /** The document saved (see {@link FileStore}), or null: an export, or no id came. */
+        final String key;
         final File file;
 
-        SaveJob(String name, String mime, boolean saveAs, String kind, File file) {
+        SaveJob(String name, String mime, boolean saveAs, String kind, String key, File file) {
             this.name = name;
             this.mime = mime;
             this.saveAs = saveAs;
             this.kind = kind;
+            this.key = key;
             this.file = file;
         }
 
         boolean isExport() {
             return "export".equals(kind);
+        }
+
+        /** The job as instance state, so it outlives the process while a picker is open. */
+        Bundle toBundle() {
+            Bundle b = new Bundle();
+            b.putString("name", name);
+            b.putString("mime", mime);
+            b.putBoolean("saveAs", saveAs);
+            b.putString("kind", kind);
+            b.putString("key", key);
+            b.putString("file", file.getPath());
+            return b;
+        }
+
+        /** The job {@link #toBundle} kept, or null if there is none or its bytes are gone. */
+        static SaveJob fromBundle(Bundle b) {
+            if (b == null) return null;
+            String name = b.getString("name");
+            String path = b.getString("file");
+            if (name == null || path == null || !new File(path).isFile()) return null;
+            return new SaveJob(name, b.getString("mime"), b.getBoolean("saveAs"), b.getString("kind"), b.getString("key"),
+                    new File(path));
         }
     }
 
@@ -86,12 +125,20 @@ final class FileStore {
 
     private final Context context;
     private final ContentResolver resolver;
+    /** Ends every key, so a save kept from an ended process can't bind a document of this one. */
+    private final String tag = "@" + UUID.randomUUID().toString().substring(0, 8);
     private final AtomicInteger ids = new AtomicInteger();
     private final Map<String, Incoming> incoming = new HashMap<>();
     private final List<String> pending = new ArrayList<>();
-    private final Map<String, Set<Uri>> writable = new HashMap<>();
-    private final Map<String, Uri> preferred = new HashMap<>();
+    /** Where saves of each document go, by key. */
+    private final Map<String, Uri> targets = new HashMap<>();
+    /** Every file PdfCraft was given, under each name a document made from it can have. */
+    private final Map<String, Set<Uri>> sources = new HashMap<>();
+    /** Files picked in PdfCraft's own Open that may be written. */
+    private final Set<Uri> pickedWritable = new HashSet<>();
     private final Map<String, Spool> spools = new HashMap<>();
+    /** PdfCraft's starts in the WebView so far: its document numbers begin again with each. */
+    private int page;
 
     FileStore(Context context) {
         this.context = context.getApplicationContext();
@@ -100,15 +147,41 @@ final class FileStore {
 
     // ---- opening ----
 
-    /** Queue {@code uri} for PdfCraft to open; {@code canWrite} if a Save may overwrite it. */
+    /**
+     * Queue {@code uri} for PdfCraft to open; {@code canWrite} if a Save may overwrite it. The id
+     * goes to PdfCraft with the file and comes back with every save of that document.
+     */
     String addIncoming(Uri uri, boolean canWrite) {
         String name = displayName(uri);
         synchronized (this) {
             String id = "f" + ids.incrementAndGet();
             incoming.put(id, new Incoming(uri, name));
             pending.add(id);
-            if (canWrite) remember(name, uri);
+            addSource(name, uri);
+            if (canWrite) targets.put(id + tag, uri);
             return id;
+        }
+    }
+
+    /** Note a file picked in PdfCraft's own Open; {@code canWrite} if a Save may overwrite it. */
+    void addPicked(Uri uri, boolean canWrite) {
+        String name = displayName(uri);
+        synchronized (this) {
+            addSource(name, uri);
+            if (canWrite) pickedWritable.add(uri);
+        }
+    }
+
+    /** {@code uri} can become a document called {@code name}, or "{stem}.pdf" (an image or text file). */
+    private void addSource(String name, Uri uri) {
+        int dot = name.lastIndexOf('.');
+        for (String n : new String[] {name, (dot >= 0 ? name.substring(0, dot) : name) + ".pdf"}) {
+            Set<Uri> uris = sources.get(n);
+            if (uris == null) {
+                uris = new HashSet<>();
+                sources.put(n, uris);
+            }
+            uris.add(uri);
         }
     }
 
@@ -140,31 +213,6 @@ final class FileStore {
         return stream;
     }
 
-    /** Note that a document called {@code name} may be saved back to {@code uri}. */
-    synchronized void remember(String name, Uri uri) {
-        Set<Uri> uris = writable.get(name);
-        if (uris == null) {
-            uris = new LinkedHashSet<>();
-            writable.put(name, uris);
-        }
-        uris.add(uri);
-    }
-
-    /** Make {@code uri} where later saves of {@code name} go (after a Save As, say). */
-    synchronized void prefer(String name, Uri uri) {
-        preferred.put(name, uri);
-        remember(name, uri);
-    }
-
-    /** Where a Save of {@code name} should be written, or null when that isn't known. */
-    synchronized Uri targetFor(String name) {
-        Uri uri = preferred.get(name);
-        if (uri != null) return uri;
-        Set<Uri> uris = writable.get(name);
-        // Two writable files with the same name: we can't tell which one this document is.
-        return uris != null && uris.size() == 1 ? uris.iterator().next() : null;
-    }
-
     String displayName(Uri uri) {
         String name = null;
         if ("content".equals(uri.getScheme())) {
@@ -179,16 +227,65 @@ final class FileStore {
         return safeName(name);
     }
 
+    // ---- where saves go ----
+
+    /** PdfCraft (re)started: forget its old document numbers, which it now hands out again. */
+    synchronized void newPage() {
+        page++;
+        targets.keySet().removeIf(key -> key.startsWith(DOC_KEY));
+    }
+
+    /**
+     * Where a Save of document {@code key}, called {@code name}, should be written, or null for a
+     * new copy in Downloads/PdfCraft. A document from PdfCraft's own Open has no id, only its
+     * name: its first save may go back to the picked file only when nothing else PdfCraft was
+     * given could have made a document of that name, and no other document saves there. That
+     * file is then bound to it.
+     */
+    synchronized Uri targetFor(String key, String name) {
+        if (key == null) return null;
+        Uri bound = targets.get(key);
+        if (bound != null || !key.startsWith(DOC_KEY) || MADE_NAMES.contains(name)) return bound;
+        Set<Uri> uris = sources.get(name);
+        if (uris == null || uris.size() != 1) return null;
+        Uri uri = uris.iterator().next();
+        if (!pickedWritable.contains(uri) || targets.containsValue(uri)) return null;
+        targets.put(key, uri);
+        return uri;
+    }
+
+    /** Make {@code uri} where later saves of document {@code key} go. */
+    synchronized void bind(String key, Uri uri) {
+        if (key != null) targets.put(key, uri);
+    }
+
+    /** {@link #bind}, unless saves of {@code key} go somewhere already. */
+    synchronized void bindIfUnbound(String key, Uri uri) {
+        if (key != null) targets.putIfAbsent(key, uri);
+    }
+
     // ---- saving ----
 
-    /** Start spooling a save; returns the id the chunks are sent with. */
-    String begin(String name, String mime, boolean saveAs, String kind) throws IOException {
-        File dir = new File(context.getCacheDir(), "saves");
+    /**
+     * Start spooling a save; returns the id the chunks are sent with. A document save names its
+     * document by {@code hostId} (the id it was opened with) or else by {@code doc} (PdfCraft's
+     * number for it); either may be empty.
+     */
+    String begin(String name, String mime, boolean saveAs, String kind, String hostId, String doc) throws IOException {
+        File dir = spoolDir();
         if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("can't create " + dir);
         String safe = safeName(name == null || name.trim().isEmpty() ? "document.pdf" : name);
         String id = "s" + ids.incrementAndGet();
-        File file = new File(dir, id + ".part");
-        SaveJob job = new SaveJob(safe, mimeFor(safe, mime), saveAs, kind, file);
+        // A new name: a job kept from an earlier process may still be waiting in this folder.
+        File file = File.createTempFile(id + "-", ".part", dir);
+        String key = null;
+        if ("save".equals(kind)) {
+            synchronized (this) {
+                if (hostId != null && !hostId.isEmpty()) key = hostId + tag;
+                else if (doc != null && !doc.isEmpty()) key = DOC_KEY + page + ":" + doc + tag;
+            }
+        }
+        SaveJob job = new SaveJob(safe, mimeFor(safe, mime), saveAs, kind, key, file);
         OutputStream out = new BufferedOutputStream(new FileOutputStream(file), 1 << 16);
         synchronized (this) {
             spools.put(id, new Spool(job, out));
@@ -230,6 +327,27 @@ final class FileStore {
         spool.job.file.delete();
     }
 
+    private File spoolDir() {
+        return new File(context.getCacheDir(), "saves");
+    }
+
+    /**
+     * Once per process, delete the spool files an earlier process left behind when it ended
+     * mid-save, except {@code keep}: the jobs restored from its saved state.
+     */
+    void sweepSpools(Collection<File> keep) {
+        synchronized (FileStore.class) {
+            if (swept) return;
+            swept = true;
+        }
+        File[] parts = spoolDir().listFiles((dir, n) -> n.endsWith(".part"));
+        if (parts == null) return;
+        for (File part : parts) {
+            //noinspection ResultOfMethodCallIgnored
+            if (!keep.contains(part)) part.delete();
+        }
+    }
+
     /** Replace the contents of {@code uri} with {@code file}. */
     void writeTo(Uri uri, File file) throws IOException {
         try (InputStream in = new FileInputStream(file); OutputStream out = openForWrite(uri)) {
@@ -249,6 +367,15 @@ final class FileStore {
             }
         }
         throw new FileNotFoundException("can't write " + uri);
+    }
+
+    /** Delete the empty document a "save to" picker created, where its provider allows. */
+    void deleteCreated(Uri uri) {
+        try {
+            DocumentsContract.deleteDocument(resolver, uri);
+        } catch (FileNotFoundException | RuntimeException e) {
+            // It stays behind, empty.
+        }
     }
 
     /** Write {@code file} to Downloads/PdfCraft/{@code name}; returns the new file's URI. */

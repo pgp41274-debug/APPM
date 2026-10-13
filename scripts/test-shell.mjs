@@ -52,16 +52,28 @@ const base = `http://127.0.0.1:${server.address().port}`;
 
 // ---- the stand-in for ShellBridge.java ----
 const mockBridge = () => {
-  if (window.top !== window) return;
+  if (window.top !== window) {
+    // What PdfCraft's frame hears from the shell: the pdfcraft:open messages.
+    window.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'pdfcraft:open' && window.top.__opened) window.top.__opened.push({ name: e.data.name, id: e.data.id });
+    });
+    return;
+  }
   window.__calls = [];
   window.__pending = [{ id: 'f1', name: 'showcase.pdf' }];
+  window.__opened = [];
   window.__saves = [];
+  window.__ended = [];
   window.__print = null;
   window.AndroidShell = {
     pending() { const p = window.__pending; window.__pending = []; window.__calls.push(['pending', p.length]); return JSON.stringify(p); },
-    beginSave(name, mime, saveAs, kind) { window.__saves.push({ name, mime, saveAs, kind, data: '', done: false }); return String(window.__saves.length - 1); },
+    appReady() { window.__calls.push(['appReady']); },
+    beginSave(name, mime, saveAs, kind, id, doc) {
+      window.__saves.push({ name, mime, saveAs, kind, id, doc, data: '', done: false });
+      return String(window.__saves.length - 1);
+    },
     appendChunk(id, b64) { window.__saves[+id].data += b64; return true; },
-    endSave(id) { window.__saves[+id].done = true; return true; },
+    endSave(id) { window.__saves[+id].done = true; window.__ended.push(+id); return true; },
     abortSave(id) { window.__calls.push(['abortSave', id]); },
     setDirty(d) { window.__calls.push(['setDirty', d]); },
     openExternal(u) { window.__calls.push(['openExternal', u]); },
@@ -122,6 +134,10 @@ try {
   await page.waitForFunction(() => window.__calls.some((c) => c[0] === 'pending'));
   await sleep(4000);
   check('a file queued by Android is fetched from /incoming/', served.includes('f1'));
+  const opened = await page.evaluate(() => window.__opened);
+  check('the open message carries Android\'s id for the file', opened.some((o) => o.name === 'showcase.pdf' && o.id === 'f1'),
+    JSON.stringify(opened));
+  check('a (re)started PdfCraft is reported to Android', await page.evaluate(() => window.__calls.some((c) => c[0] === 'appReady')));
   await page.screenshot({ path: path.join(shots, '1-opened-portrait.png') });
 
   const canvas = page.frameLocator('#app').locator('canvas');
@@ -146,10 +162,12 @@ try {
   await page.waitForFunction(() => window.__saves.some((s) => s.done && s.kind === 'save'), null, { timeout: 20000 }).catch(() => {});
   const save = await page.evaluate(() => {
     const s = window.__saves.find((x) => x.done && x.kind === 'save');
-    return s && { name: s.name, saveAs: s.saveAs, size: atob(s.data).length, head: atob(s.data.slice(0, 12)) };
+    return s && { name: s.name, saveAs: s.saveAs, id: s.id, doc: s.doc, size: atob(s.data).length, head: atob(s.data.slice(0, 12)) };
   });
   check('Save sends the document to Android as a PDF', save && save.head.startsWith('%PDF-') && save.name === 'showcase.pdf' && !save.saveAs,
     JSON.stringify(save));
+  check('Save of the "Open with" file sends its id back, with PdfCraft\'s document number',
+    save && save.id === 'f1' && /^\d+$/.test(save.doc), JSON.stringify(save && { id: save.id, doc: save.doc }));
   await sleep(800);
   const clean = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'setDirty').map((c) => c[1]));
   check('after saving, the document is clean again', clean[clean.length - 1] === false, JSON.stringify(clean));
@@ -159,6 +177,49 @@ try {
   await page.keyboard.press('Control+Shift+s');
   await page.waitForFunction(() => window.__saves.some((s) => s.done && s.saveAs), null, { timeout: 20000 }).catch(() => {});
   check('Save As is marked saveAs', await page.evaluate(() => window.__saves.some((s) => s.done && s.saveAs && s.kind === 'save')));
+
+  // 5b. A document PdfCraft made itself (palette ▸ "New blank PDF") has no id from Android: its
+  // Save names it by PdfCraft's document number instead, so it never takes another file's place.
+  await focus();
+  await page.keyboard.press('Control+k');
+  await sleep(600);
+  await page.keyboard.type('New blank PDF', { delay: 20 });
+  await sleep(600);
+  await page.keyboard.press('Enter');
+  await sleep(1500);
+  await focus();
+  await page.keyboard.press('Control+s');
+  await page.waitForFunction(() => window.__saves.some((s) => s.done && s.name === 'Untitled.pdf'), null, { timeout: 20000 }).catch(() => {});
+  const fresh = await page.evaluate(() => {
+    const s = window.__saves.find((x) => x.done && x.name === 'Untitled.pdf');
+    return s && { id: s.id, doc: s.doc, saveAs: s.saveAs };
+  });
+  check('Save of a document with no id sends only PdfCraft\'s document number',
+    fresh && fresh.id === '' && /^\d+$/.test(fresh.doc) && fresh.doc !== (save && save.doc) && !fresh.saveAs, JSON.stringify(fresh));
+  // Close it again ("Close file"), so showcase.pdf is the document in front.
+  await focus();
+  await page.keyboard.press('Control+k');
+  await sleep(600);
+  await page.keyboard.type('Close file', { delay: 20 });
+  await sleep(600);
+  await page.keyboard.press('Enter');
+  await sleep(1000);
+
+  // 5c. Two quick saves reach Android in the order PdfCraft made them, even when the older one
+  // is far bigger and takes longer to read.
+  await app.evaluate(() => {
+    for (const size of [24 << 20, 1024]) {
+      const bytes = new Uint8Array(size);
+      bytes.set([37, 80, 68, 70, 45]); // %PDF-
+      parent.postMessage({ type: 'pdfcraft:save', name: 'order.pdf', saveAs: false, bytes: bytes.buffer, id: 'f1', doc: 1 },
+        location.origin, [bytes.buffer]);
+    }
+  });
+  await page.waitForFunction(() => window.__saves.filter((s) => s.done && s.name === 'order.pdf').length === 2, null, { timeout: 30000 })
+    .catch(() => {});
+  const order = await page.evaluate(() =>
+    window.__ended.map((i) => window.__saves[i]).filter((s) => s.name === 'order.pdf').map((s) => s.data.length));
+  check('two quick saves reach Android in order', order.length === 2 && order[0] > order[1], JSON.stringify(order));
 
   // 6. Other downloads (PdfCraft's download(): <a download> on a revoked blob: URL) go to Android.
   await app.evaluate(() => {

@@ -23,6 +23,7 @@
   let lastError = '';
   let watchdog = 0;
   let opening = Promise.resolve();
+  let handing = Promise.resolve();
 
   // PdfCraft 0.7.1's default workspace (its saved "docking" setting): Tools beside the page.
   const DEFAULT_DOCKING = {
@@ -116,10 +117,17 @@
         clearTimeout(watchdog);
         splash.hidden = true;
         errorBox.hidden = true;
+        // A new PdfCraft numbers its documents afresh.
+        if (android) android.appReady();
         incoming();
         break;
       case 'pdfcraft:save':
-        hand(msg.name, new Blob([msg.bytes], { type: 'application/pdf' }), !!msg.saveAs, 'save');
+        // `id`: the id Android opened the document with, if it did; `doc`: PdfCraft's number for
+        // it. Android saves by these, so two documents with the same name stay apart.
+        hand(msg.name, new Blob([msg.bytes], { type: 'application/pdf' }), !!msg.saveAs, 'save', {
+          id: typeof msg.id === 'string' ? msg.id : '',
+          doc: Number.isInteger(msg.doc) ? String(msg.doc) : '',
+        });
         break;
       case 'pdfcraft:dirty':
         if (android) android.setDirty(!!msg.dirty);
@@ -146,7 +154,8 @@
           const res = await fetch('/incoming/' + encodeURIComponent(file.id));
           if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
           const bytes = await res.arrayBuffer();
-          frame.contentWindow.postMessage({ type: 'pdfcraft:open', name: file.name, bytes }, origin, [bytes]);
+          // PdfCraft hands the id back with every save of the document.
+          frame.contentWindow.postMessage({ type: 'pdfcraft:open', name: file.name, id: file.id, bytes }, origin, [bytes]);
         } catch (e) {
           android.toast(`Couldn't open ${file.name}: ${e.message}`);
         }
@@ -154,13 +163,25 @@
     });
   }
 
-  /** Give a file to Android: a document save, or an export (any other download). */
-  async function hand(name, blob, saveAs, kind) {
+  /**
+   * Give a file to Android: a document save, or an export (any other download). `which` names
+   * the saved document ({ id, doc }, see 'pdfcraft:save'). Files go one at a time, in the order
+   * PdfCraft made them: a bigger file takes longer to read, and an older save must never reach
+   * Android after a newer one and overwrite it.
+   */
+  function hand(name, blob, saveAs, kind, which = { id: '', doc: '' }) {
+    handing = handing
+      .then(() => handNow(name, blob, saveAs, kind, which))
+      .catch((e) => android && android.toast(`Couldn't save ${name}: ${e.message}`));
+    return handing;
+  }
+
+  async function handNow(name, blob, saveAs, kind, which) {
     if (!android) {
       plainDownload(name, blob);
       return;
     }
-    const id = android.beginSave(String(name || 'document.pdf'), blob.type || '', saveAs, kind);
+    const id = android.beginSave(String(name || 'document.pdf'), blob.type || '', saveAs, kind, which.id, which.doc);
     if (!id) return;
     try {
       const data = await base64(blob);
