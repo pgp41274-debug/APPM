@@ -40,6 +40,12 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Test the print PDF writer
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          scripts/test-print-pdf.sh build/test-print
+
       # The wasm build compiles a few hundred crates; keep them between runs.
       - name: Cache the PdfCraft build
         uses: actions/cache@v4

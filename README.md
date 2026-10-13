@@ -15,7 +15,7 @@ You need Android 10 or newer with a current **Android System WebView** (it updat
 ## Using it
 
 - **Open a PDF**: tap **Open** in PdfCraft, choose PdfCraft under "Open with" in your Files app, or share a PDF to PdfCraft from any app. Shared files open in new tabs, even while PdfCraft is running.
-- **Save** (Ctrl+S, or the save icon) writes back to the original file when the app that opened it allowed writing. Otherwise the file goes to `Downloads/PdfCraft/`, and later saves of that document update the same copy. A toast says where every save went.
+- **Save** (Ctrl+S, or the save icon) writes back to the original file when the app that opened it allowed writing. Otherwise the first Save puts a copy in `Downloads/PdfCraft/`, and later saves of that document update that copy. Every open document is tracked by its own ID, so a Save never lands on a different file that happens to share its name. A toast says where every save went.
 - **Save as** and **exports** (pages as images, CSV, extracted files and so on) open Android's "save to" picker. If you cancel a Save As, a copy is still kept in `Downloads/PdfCraft/`, so no work is lost.
 - **Print** opens Android's print dialog: printers on your network, or **Save as PDF**.
 - **Links** in PdfCraft (Help, release notes, credits) open in your browser.
@@ -52,9 +52,9 @@ Android app (android/)                         assets/app/
 ```
 
 - `MainActivity` serves the APK's assets at `https://appassets.androidplatform.net/app/` (with `application/wasm` for the module) and serves files handed in by other apps at `/incoming/<id>`. It also connects PdfCraft's Open to Android's document picker and handles "Open with" and share intents.
-- PdfCraft's browser build already has a **host bridge** for embedding (`apps/pdfcraft-web/src/main.rs`, `mod host`). Started with `?host=parent` in a same-origin frame, it posts `pdfcraft:ready`, `pdfcraft:save {name, saveAs, bytes}` and `pdfcraft:dirty`, and accepts `pdfcraft:open {name, bytes}`. `shell.js` relays these to Java (`ShellBridge`), sending file bytes in base64 slices.
-- `shell.js` also covers what a browser does but a WebView doesn't. Downloads of `blob:` URLs become exports. `window.open` links go to the browser. PdfCraft's print sheets (PNG pages in a hidden frame) go to `Printer`, which builds a PDF for Android's `PrintManager`.
-- `patches/pdfcraft/` holds the only changes to PdfCraft, two small ones that apply below 720 points: dialogs (0001) and the command palette (0002) fit inside the screen and scroll, instead of running off it. Desktop sizes are unaffected.
+- PdfCraft's browser build already has a **host bridge** for embedding (`apps/pdfcraft-web/src/main.rs`, `mod host`). Started with `?host=parent` in a same-origin frame, it posts `pdfcraft:ready`, `pdfcraft:save {name, saveAs, bytes, id, doc}` and `pdfcraft:dirty`, and accepts `pdfcraft:open {name, bytes, id}` (`id` and `doc` come from patch 0003). `shell.js` relays these to Java (`ShellBridge`) in the order PdfCraft sent them, with file bytes in base64 slices. `FileStore` picks where a save goes by the document's `id` (files Android handed in) or `doc` number (everything else), never by name alone.
+- `shell.js` also covers what a browser does but a WebView doesn't. Downloads of `blob:` URLs become exports. `window.open` links go to the browser. PdfCraft's print sheets (PNG pages in a hidden frame) go to `Printer`, which streams them into a PDF one strip at a time (`PrintPdfWriter`, about 16 MB of memory however long the document) for Android's `PrintManager`.
+- `patches/pdfcraft/` holds the only changes to PdfCraft. Below 720 points, dialogs (0001) and the command palette (0002) fit inside the screen and scroll instead of running off it; desktop sizes are unaffected. 0003 gives documents from the host an ID that comes back with every save.
 - On first launch on a phone, the shell seeds PdfCraft's saved settings with the Tools panel closed. PdfCraft's own settings take over from then on.
 
 ## Build it yourself
@@ -66,16 +66,16 @@ scripts/build-web.sh     # PdfCraft v0.7.1 -> wasm, into build/web-assets (about
 scripts/build-apk.sh     # installs the Android SDK into ~/android-sdk if needed -> dist/PdfCraft-0.7.1.apk
 ```
 
-`build-web.sh` clones PdfCraft and [craft-fonts](https://github.com/storytold/craft-fonts) at pinned revisions, applies `patches/pdfcraft/`, and builds with [trunk](https://trunkrs.dev). If the source build fails, it falls back to unpacking PdfCraft's official `pdfcraft-web-0.7.1.zip` release, which is the same code without the phone patch. `scripts/build-web.sh --prebuilt` uses that zip directly. To follow a newer PdfCraft release, set `PDFCRAFT_VERSION` (and refresh the patch and the docking seed in `shell.js` if they no longer apply).
+`build-web.sh` clones PdfCraft and [craft-fonts](https://github.com/storytold/craft-fonts) at pinned revisions, applies `patches/pdfcraft/`, and builds with [trunk](https://trunkrs.dev). If the source build fails, it falls back to unpacking PdfCraft's official `pdfcraft-web-0.7.1.zip` release, which is the same code without these patches (CI sets `PDFCRAFT_NO_FALLBACK=1` so a release never ships without them). `scripts/build-web.sh --prebuilt` uses that zip directly. To follow a newer PdfCraft release, set `PDFCRAFT_VERSION` (and refresh the patches and the docking seed in `shell.js` if they no longer apply).
 
-`scripts/test-shell.mjs` runs PdfCraft inside the shell in Chromium (the engine of Android System WebView) at a Pixel 7's screen size and scale. It drives open, edit, save, save as, export, links and PdfCraft's own Print button against a stand-in for the Java bridge, and writes screenshots to `build/test-shots/`:
+`scripts/test-shell.mjs` runs PdfCraft inside the shell in Chromium (the engine of Android System WebView) at a Pixel 7's screen size and scale. It drives open, edit, save, save as, export, links and PdfCraft's own Print button against a stand-in for the Java bridge, and writes screenshots to `build/test-shots/`. `scripts/test-print-pdf.sh` checks the print PDF writer on a desktop JVM: structure, every pixel, where plain and turned sheets land (rendered with `pdftoppm`) and a 64-megapixel sheet in a 32 MB heap.
 
 ```sh
 npm install --no-save playwright@1.56.1 && npx playwright install chromium
 node scripts/test-shell.mjs
 ```
 
-`.github/workflows/android.yml` runs all three on every pull request and push to `main`. Pushes to `main` also publish the APK as a release.
+`.github/workflows/android.yml` runs the builds and both tests on every pull request and push to `main`. Pushes to `main` also publish the APK as a release.
 
 ## Licences
 
