@@ -1,8 +1,8 @@
 diff --git a/crates/ui-egui/src/widgets.rs b/crates/ui-egui/src/widgets.rs
-index 4f5aaa7..27c0f2d 100644
+index 4f5aaa7..44b0cb5 100644
 --- a/crates/ui-egui/src/widgets.rs
 +++ b/crates/ui-egui/src/widgets.rs
-@@ -28,12 +28,31 @@ pub fn modal(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug) ->
+@@ -28,12 +28,51 @@ pub fn modal(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug) ->
      egui::Modal::new(egui::Id::new(id)).frame(dialog_frame(ctx))
  }
  
@@ -18,19 +18,39 @@ index 4f5aaa7..27c0f2d 100644
 +    let screen = ctx.content_rect().size();
 +    let small = screen.x < SMALL_SCREEN || screen.y < SMALL_SCREEN;
 +    // The room a card may take: the screen less the card's padding and a margin all round.
-+    let room = screen - 2.0 * vec2(f32::from(DIALOG_PAD_X) + 8.0, f32::from(DIALOG_PAD_Y) + 8.0);
++    let room = (screen - 2.0 * vec2(f32::from(DIALOG_PAD_X) + 8.0, f32::from(DIALOG_PAD_Y) + 8.0)).max(vec2(120.0, 120.0));
++    // The contents keep one id whether they scroll or not. The keyboard a field opens can make
++    // the screen small, and new ids would take the field's focus and close the keyboard again.
++    let body = |ui: &mut egui::Ui, builder: egui::UiBuilder| ui.scope_builder(builder.id(stored.with("body")), content).inner;
      modal(ctx, id).show(ctx, |ui| {
          begin_dialog(ui);
 -        let inner = content(ui);
 +        let inner = if small {
-+            egui::ScrollArea::both()
-+                .id_salt(stored.with("scroll"))
-+                .max_width(room.x.max(120.0))
-+                .max_height(room.y.max(120.0))
-+                .show(ui, content)
-+                .inner
++            // The card keeps the size it had, a smaller dialog's or the one from before the
++            // keyboard closed, so it is measured again in all the room when it opens and when
++            // the screen changes: laid out at its smallest (a sizing pass) in a pass that is
++            // discarded, so the measuring never shows. An Area's own sizing pass would disable
++            // the controls, and a disabled field loses its focus.
++            let pass = ui.ctx().cumulative_pass_nr();
++            let (seen, last) = ui.ctx().data(|d| (d.get_temp::<u64>(stored.with("seen")), d.get_temp::<egui::Vec2>(stored.with("room"))));
++            let measure = seen.is_none_or(|p| p.saturating_add(1) != pass) || last != Some(room);
++            ui.ctx().data_mut(|d| {
++                d.insert_temp(stored.with("seen"), pass);
++                d.insert_temp(stored.with("room"), room);
++            });
++            let mut region = ui.available_rect_before_wrap();
++            let mut builder = egui::UiBuilder::new();
++            if measure {
++                ui.ctx().request_discard("dialog size");
++                region = Rect::from_min_size(region.min, room);
++                builder = builder.sizing_pass();
++            }
++            ui.scope_builder(egui::UiBuilder::new().max_rect(region), |ui| {
++                egui::ScrollArea::both().id_salt(stored.with("scroll")).max_width(room.x).max_height(room.y).show(ui, |ui| body(ui, builder)).inner
++            })
++            .inner
 +        } else {
-+            content(ui)
++            body(ui, egui::UiBuilder::new())
 +        };
          // The frame's stroke sits outside this content rect; the stored card is the fill.
          let card = ui.min_rect().expand2(egui::vec2(f32::from(DIALOG_PAD_X), f32::from(DIALOG_PAD_Y)));

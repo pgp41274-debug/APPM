@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 
 const require = createRequire(import.meta.url);
 const { chromium, devices } = require('playwright');
@@ -94,6 +95,74 @@ function check(name, ok, detail = '') {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---- reading screenshots (8-bit RGB or RGBA PNGs, as Chromium writes them) ----
+function decodePng(png) {
+  let width = 0;
+  let height = 0;
+  let channels = 0;
+  const idat = [];
+  for (let pos = 8; pos < png.length; pos += 12 + png.readUInt32BE(pos)) {
+    const type = png.toString('latin1', pos + 4, pos + 8);
+    const data = png.subarray(pos + 8, pos + 8 + png.readUInt32BE(pos));
+    if (type === 'IHDR') {
+      [width, height, channels] = [data.readUInt32BE(0), data.readUInt32BE(4), { 2: 3, 6: 4 }[data[9]]];
+      if (data[8] !== 8 || !channels || data[12] !== 0) throw new Error('not an 8-bit RGB(A) PNG');
+    } else if (type === 'IDAT') idat.push(data);
+  }
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const stride = width * channels;
+  const rgb = Buffer.alloc(width * height * 3);
+  let prev = Buffer.alloc(stride);
+  for (let y = 0; y < height; y++) {
+    const filter = raw[y * (stride + 1)];
+    const row = Buffer.from(raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)));
+    for (let i = 0; i < stride; i++) {
+      const a = i < channels ? 0 : row[i - channels];
+      const b = prev[i];
+      const c = i < channels ? 0 : prev[i - channels];
+      if (filter === 1) row[i] += a;
+      else if (filter === 2) row[i] += b;
+      else if (filter === 3) row[i] += (a + b) >> 1;
+      else if (filter === 4) {
+        const pa = Math.abs(b - c);
+        const pb = Math.abs(a - c);
+        const pc = Math.abs(a + b - 2 * c);
+        row[i] += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+      }
+    }
+    for (let x = 0; x < width; x++) row.copy(rgb, (y * width + x) * 3, x * channels, x * channels + 3);
+    prev = row;
+  }
+  return { width, height, rgb };
+}
+
+// The bounding box, in screenshot pixels, of the largest 4-connected patch of pixels that
+// `match(r, g, b)` accepts at or below row `top`, of those that `keep(box)` accepts.
+function largestPatch({ width, height, rgb }, top, match, keep = () => true) {
+  const seen = new Uint8Array(width * height);
+  const take = (x, y) => {
+    const i = y * width + x;
+    if (x < 0 || x >= width || y < top || y >= height || seen[i] || !match(rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2])) return false;
+    seen[i] = 1;
+    return true;
+  };
+  let best = null;
+  for (let y = top; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!take(x, y)) continue;
+      const patch = { n: 0, x0: x, x1: x, y0: y, y1: y };
+      for (const stack = [[x, y]]; stack.length;) {
+        const [px, py] = stack.pop();
+        patch.n++;
+        [patch.x0, patch.x1, patch.y0, patch.y1] = [Math.min(patch.x0, px), Math.max(patch.x1, px), Math.min(patch.y0, py), Math.max(patch.y1, py)];
+        for (const [nx, ny] of [[px + 1, py], [px - 1, py], [px, py + 1], [px, py - 1]]) if (take(nx, ny)) stack.push([nx, ny]);
+      }
+      if ((!best || patch.n > best.n) && keep(patch)) best = patch;
+    }
+  }
+  return best;
+}
+
 // A phone-sized window at a Pixel 7's real device scale factor. Playwright's emulated
 // deviceScaleFactor is not enough: under it Chromium reports devicePixelContentBoxSize in CSS
 // pixels, so eframe would size its canvas at 1x and draw a blurry, oversized interface that no
@@ -108,7 +177,8 @@ try {
   // A real multi-page PDF to open: PdfCraft's own demo page, printed by Chromium.
   const maker = await browser.newPage();
   await maker.goto('file://' + path.join(root, 'build/src/pdfcraft/assets/demo/showcase.html'));
-  incoming.set('f1', await maker.pdf({ format: 'A4', printBackground: true }));
+  const showcase = await maker.pdf({ format: 'A4', printBackground: true });
+  incoming.set('f1', showcase);
   await maker.close();
   incoming.set('f2', fs.readFileSync(path.join(root, 'build/src/pdfcraft/crates/ui-egui/tests/data/form.pdf')));
 
@@ -247,25 +317,48 @@ try {
   check('window.open links go to Android (new tab and _self)', links.length === 2, JSON.stringify(links));
   check('PdfCraft stays loaded after a _self link', app.url().includes('/app/pdfcraft/index.html'));
 
-  // 8. Print: PdfCraft's print sheets reach Android's print framework instead of a no-op print().
+  // 8. Print: PdfCraft's own Print button sends its print sheets to Android's print framework
+  // instead of a no-op print(). Nothing stands in for PdfCraft: without its sheets this fails.
   await focus();
   await page.keyboard.press('Control+p');
   await sleep(1500);
-  await page.screenshot({ path: path.join(shots, '3-print-dialog.png') });
-  // The dialog scrolls on a phone: wheel to its end and look at the buttons.
+  const screen = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+  const dialog = decodePng(await page.screenshot({ path: path.join(shots, '3-print-dialog.png') }));
+  const px = dialog.width / screen.width;
+  const pt = (b) => b && { x: (b.x0 + b.x1 + 1) / 2 / px, y: (b.y0 + b.y1 + 1) / 2 / px, w: (b.x1 - b.x0 + 1) / px, h: (b.y1 - b.y0 + 1) / px };
+  // The card is all the pure white left: the backdrop dims the rest of the screen. Print is
+  // taller than half a phone's screen, so a card that is not cut short (say to egui's default
+  // 400-point area) spans more than that.
+  const card = pt(largestPatch(dialog, 0, (r, g, b) => r > 250 && g > 250 && b > 250));
+  check('the Print dialog spans the phone\'s width and more than half its height',
+    card && card.w > screen.width - 24 && card.h > screen.height / 2,
+    card && `card ${card.w.toFixed(0)} x ${card.h.toFixed(0)} pt on a ${screen.width} x ${screen.height} pt screen`);
+  // The dialog scrolls on a phone: wheel to its end, where its buttons are.
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   for (let i = 0; i < 6; i++) { await page.mouse.wheel(600, 600); await sleep(150); }
   await sleep(500);
-  await page.screenshot({ path: path.join(shots, '3b-print-dialog-scrolled.png') });
-  // PdfCraft's Print button, bottom right of the scrolled dialog on a 412-point-wide phone.
-  await page.mouse.click(356, 625);
-  await sleep(3000);
-  await page.screenshot({ path: path.join(shots, '3c-after-print.png') });
+  const scrolled = decodePng(await page.screenshot({ path: path.join(shots, '3b-print-dialog-scrolled.png') }));
+  // PdfCraft's Print button is a pill (28 points tall) filled with the theme's accent (#1B63E0,
+  // or #4B8BF5 when dark) behind white text: the largest patch of that blue in the lower half.
+  const accent = (r, g, b) => [[0x1b, 0x63, 0xe0], [0x4b, 0x8b, 0xf5]]
+    .some(([R, G, B]) => Math.abs(r - R) + Math.abs(g - G) + Math.abs(b - B) <= 24);
+  const pill = (b) => b.y1 - b.y0 + 1 > 18 * px && b.y1 - b.y0 + 1 < 36 * px && b.x1 - b.x0 + 1 > 30 * px && b.x1 - b.x0 + 1 < 160 * px;
+  const button = pt(largestPatch(scrolled, Math.round(scrolled.height / 2), accent, pill));
+  check('PdfCraft\'s Print button shows on the scrolled dialog', button,
+    button && `at ${button.x.toFixed(0)}, ${button.y.toFixed(0)}, ${button.w.toFixed(0)} x ${button.h.toFixed(0)} pt`);
+  if (button) await page.mouse.click(button.x, button.y);
   await page.waitForFunction(() => window.__print && window.__print.done, null, { timeout: 30000 }).catch(() => {});
-  let printed = await page.evaluate(() => window.__print);
+  await page.screenshot({ path: path.join(shots, '3c-after-print.png') });
+  const printed = await page.evaluate(() => window.__print);
+  // All pages at their size: a sheet of US Letter or A4 (the locale's paper) for every page.
+  const pages = (showcase.toString('latin1').match(/\/Type\s*\/Page\b/g) || []).length;
+  const paper = (p) => [[612, 792], [595.28, 841.89]].some(([w, h]) => Math.abs(Math.min(p.w, p.h) - w) < 1 && Math.abs(Math.max(p.w, p.h) - h) < 1);
+  check('PdfCraft\'s own Print reaches Android: a PNG on paper for every page',
+    pages > 0 && printed && printed.done && printed.pages.length === pages && printed.pages.every((p) => p.png && paper(p)),
+    `${printed ? printed.pages.length : 0} sheets for ${pages} pages: ${JSON.stringify(printed && printed.pages.slice(0, 2))}`);
   if (!printed || !printed.done) {
-    // The print dialog may want a click rather than Enter; exercise the same frame shape directly.
-    printed = await app.evaluate(async () => {
+    // Diagnostic only: does the shell pass on a print frame shaped like PdfCraft's at all?
+    const relayed = await app.evaluate(async () => {
       const c = document.createElement('canvas');
       c.width = 85; c.height = 110;
       c.getContext('2d').fillRect(10, 10, 20, 20);
@@ -277,13 +370,10 @@ try {
       frame.addEventListener('load', () => setTimeout(() => frame.contentWindow.print(), 50));
       document.body.appendChild(frame);
       for (let i = 0; i < 50 && !(window.top.__print && window.top.__print.done); i++) await new Promise((r) => setTimeout(r, 100));
-      return window.top.__print;
+      return !!(window.top.__print && window.top.__print.done);
     });
-    console.log('      (PdfCraft\'s Print button was not hit; tested the print frame directly)');
+    console.log(`      (a stand-in print frame ${relayed ? 'does' : 'does not either'} reach Android)`);
   }
-  check('PdfCraft\'s own Print reaches Android with sizes and PNGs',
-    printed && printed.done && printed.pages.length > 0 && printed.pages.every((p) => p.png && p.w > 0 && p.h > 0),
-    JSON.stringify(printed && printed.pages.slice(0, 3)));
 
   // 9. A file shared while PdfCraft is open arrives in a new tab.
   await page.evaluate(() => {
