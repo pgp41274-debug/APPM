@@ -1,0 +1,102 @@
+name: Android APK
+
+# Builds PdfCraft's browser version from source (scripts/build-web.sh), tests the Android shell
+# around it in Chromium (scripts/test-shell.mjs), and packs both into a signed APK. Every run
+# uploads the APK as an artifact; a push to main also publishes it as a GitHub release, so the
+# newest APK is always at https://github.com/<owner>/<repo>/releases/latest.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The wasm build compiles a few hundred crates; keep them between runs.
+      - name: Cache the PdfCraft build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            build/target
+            build/tools
+          key: pdfcraft-wasm-${{ hashFiles('scripts/build-web.sh', 'patches/**') }}
+          restore-keys: pdfcraft-wasm-
+
+      - name: Build PdfCraft for the browser (wasm)
+        run: scripts/build-web.sh
+
+      - name: Test the shell around PdfCraft in Chromium
+        run: |
+          npm install --no-save --no-package-lock playwright@1.56.1
+          npx playwright install --with-deps chromium
+          node scripts/test-shell.mjs build/test-shots
+
+      - name: Build the APK
+        env:
+          # Optional: a private signing key instead of the committed sideload key.
+          PDFCRAFT_KEYSTORE_B64: ${{ secrets.PDFCRAFT_KEYSTORE_B64 }}
+          PDFCRAFT_KEYSTORE_PASSWORD: ${{ secrets.PDFCRAFT_KEYSTORE_PASSWORD }}
+          PDFCRAFT_KEY_ALIAS: ${{ secrets.PDFCRAFT_KEY_ALIAS }}
+          PDFCRAFT_KEY_PASSWORD: ${{ secrets.PDFCRAFT_KEY_PASSWORD }}
+        run: |
+          # Without the secrets, the committed sideload key signs (empty values count as unset).
+          if [ -n "$PDFCRAFT_KEYSTORE_B64" ]; then
+            echo "$PDFCRAFT_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            export PDFCRAFT_KEYSTORE="$RUNNER_TEMP/release.jks"
+          fi
+          scripts/build-apk.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PdfCraft-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-screenshots
+          path: build/test-shots/
+          if-no-files-found: ignore
+
+      - name: Publish a release (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-${{ github.run_number }}
+          name: PdfCraft for Android (build ${{ github.run_number }})
+          make_latest: true
+          files: dist/*.apk
+          body: |
+            PdfCraft (storytold/pdfcraft, pinned release) packaged for Android.
+            Download the APK on your phone, allow your browser or Files app to install unknown apps, and open it.
+            Built from ${{ github.sha }}.

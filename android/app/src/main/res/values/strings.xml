@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PdfCraft</string>
+    <string name="kept_running">PdfCraft keeps running in the background with your unsaved changes.</string>
+    <string name="restarted">PdfCraft ran out of memory and was restarted.</string>
+    <string name="no_picker">No app on this device can pick files.</string>
+    <string name="no_browser">No app can open %1$s</string>
+    <string name="no_printing">Printing isn\'t available on this device.</string>
+    <string name="print_failed">Couldn\'t print: %1$s</string>
+    <string name="export_cancelled">Export cancelled.</string>
+    <string name="save_as_cancelled">%1$s (Save As was cancelled)</string>
+    <string name="saved">Saved %1$s</string>
+    <string name="saved_to">Saved to %1$s</string>
+    <string name="saved_instead">Couldn\'t write the original file; saved to %1$s</string>
+    <string name="save_failed">Couldn\'t save %1$s: %2$s</string>
+</resources>

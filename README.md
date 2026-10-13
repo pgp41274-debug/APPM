@@ -1,1 +1,82 @@
-# APPM
+# PdfCraft for Android
+
+[PdfCraft](https://github.com/storytold/pdfcraft) is the ArtCraft team's open-source PDF reader and editor: a clean-room Rust reimplementation of Acrobat (view, annotate, fill and sign, organize, combine, split, protect, redact, compress). It ships for desktop and the web but not for phones. This repository packages it as an Android app you can install from an APK.
+
+Nothing here is reverse engineered. PdfCraft is MIT OR Apache-2.0 licensed, so the build compiles PdfCraft's own browser (WebAssembly) version from its source, pinned to release **v0.7.1**, and wraps it in a small native Android shell. The app runs entirely offline: it has no INTERNET permission, no account and no telemetry.
+
+## Install on your phone
+
+1. Get the APK: download `PdfCraft-0.7.1.apk` from this repository's [latest release](../../releases/latest), or from the `PdfCraft-apk` artifact of a workflow run under **Actions**.
+2. Open the downloaded file. Android asks you to allow your browser (or Files app) to "install unknown apps"; allow it, go back, and tap **Install**.
+3. Open **PdfCraft** from your app drawer.
+
+You need Android 10 or newer with a current **Android System WebView** (it updates through the Play Store). Every build is signed with the same key, so a newer APK installs over the old one and keeps your settings.
+
+## Using it
+
+- **Open a PDF**: tap **Open** in PdfCraft, choose PdfCraft under "Open with" in your Files app, or share a PDF to PdfCraft from any app. Shared files open in new tabs, even while PdfCraft is running.
+- **Save** (Ctrl+S, or the save icon) writes back to the original file when the app that opened it allowed writing. Otherwise the file goes to `Downloads/PdfCraft/`, and later saves of that document update the same copy. A toast says where every save went.
+- **Save as** and **exports** (pages as images, CSV, extracted files and so on) open Android's "save to" picker. If you cancel a Save As, a copy is still kept in `Downloads/PdfCraft/`, so no work is lost.
+- **Print** opens Android's print dialog: printers on your network, or **Save as PDF**.
+- **Links** in PdfCraft (Help, release notes, credits) open in your browser.
+- **Back** sends PdfCraft to the background with its documents still open, like Home does.
+
+### Tips for a phone screen
+
+PdfCraft's interface is its desktop interface, drawn at your screen's resolution. On a phone it starts with the Tools panel closed so the page gets the full width. The panel button at the top left brings it back.
+
+- Turn the phone sideways for the full toolbar.
+- Dialogs larger than the screen (Print, Properties) scroll. Drag inside them to reach their buttons.
+- **Menu ▸ Preferences ▸ Interface size** makes everything smaller (down to 75%) or larger.
+- A tablet shows PdfCraft much as the desktop app does.
+
+## Limitations
+
+- The UI is PdfCraft's desktop egui interface, not one designed for touch. It works with taps, drags, pinch-zoom and long-press, but controls are small on a 6-inch screen.
+- Anything PdfCraft leaves out of its own browser build is missing here too. The main gaps are OCR (its models only ship with the desktop app) and batch actions on folders.
+- PdfCraft runs as WebAssembly on one thread, so very large or complex PDFs render slower than in the desktop app. The APK is about 23 MB, and each start compiles a 44 MB WebAssembly module, which can take a few seconds on an older phone.
+- Signing uses `android/signing/sideload.jks`, a key committed on purpose (passwords in `android/app/build.gradle.kts`) so every build, local or CI, installs as an update. Anyone with access to this repository could sign an "update" with it. That is fine for a personal sideloaded app. To use a private key, add the repository secrets `PDFCRAFT_KEYSTORE_B64` (the keystore, base64), `PDFCRAFT_KEYSTORE_PASSWORD`, `PDFCRAFT_KEY_ALIAS` and `PDFCRAFT_KEY_PASSWORD`. Android refuses to update across a key change, so uninstall the old app once when you switch.
+
+## How it works
+
+```
+Android app (android/)                         assets/app/
+┌──────────────────────────────┐              ┌──────────────────────────────────────┐
+│ MainActivity                 │  serves      │ shell/index.html + shell.js          │
+│  WebView ◀──── WebViewAsset- │─────────────▶│   └─ <iframe> pdfcraft/index.html    │
+│                Loader        │  https://    │         ?host=parent                 │
+│  ShellBridge (AndroidShell) ◀┼──────────────┤      PdfCraft's wasm build, unmodified│
+│  FileStore  (open / save)    │  JS bridge   │      except patches/pdfcraft/        │
+│  Printer    (PrintManager)   │              └──────────────────────────────────────┘
+└──────────────────────────────┘
+```
+
+- `MainActivity` serves the APK's assets at `https://appassets.androidplatform.net/app/` (with `application/wasm` for the module) and serves files handed in by other apps at `/incoming/<id>`. It also connects PdfCraft's Open to Android's document picker and handles "Open with" and share intents.
+- PdfCraft's browser build already has a **host bridge** for embedding (`apps/pdfcraft-web/src/main.rs`, `mod host`). Started with `?host=parent` in a same-origin frame, it posts `pdfcraft:ready`, `pdfcraft:save {name, saveAs, bytes}` and `pdfcraft:dirty`, and accepts `pdfcraft:open {name, bytes}`. `shell.js` relays these to Java (`ShellBridge`), sending file bytes in base64 slices.
+- `shell.js` also covers what a browser does but a WebView doesn't. Downloads of `blob:` URLs become exports. `window.open` links go to the browser. PdfCraft's print sheets (PNG pages in a hidden frame) go to `Printer`, which builds a PDF for Android's `PrintManager`.
+- `patches/pdfcraft/0001-scroll-dialogs-on-small-screens.patch` is the only change to PdfCraft. On screens under 720 points it lets dialogs scroll inside the screen instead of running off it. Desktop sizes are unaffected.
+- On first launch on a phone, the shell seeds PdfCraft's saved settings with the Tools panel closed. PdfCraft's own settings take over from then on.
+
+## Build it yourself
+
+Needs Linux or macOS, Rust 1.95+ (rustup), JDK 17+, and about 6 GB of disk.
+
+```sh
+scripts/build-web.sh     # PdfCraft v0.7.1 -> wasm, into build/web-assets (about 10 min the first time)
+scripts/build-apk.sh     # installs the Android SDK into ~/android-sdk if needed -> dist/PdfCraft-0.7.1.apk
+```
+
+`build-web.sh` clones PdfCraft and [craft-fonts](https://github.com/storytold/craft-fonts) at pinned revisions, applies `patches/pdfcraft/`, and builds with [trunk](https://trunkrs.dev). If the source build fails, it falls back to unpacking PdfCraft's official `pdfcraft-web-0.7.1.zip` release, which is the same code without the phone patch. `scripts/build-web.sh --prebuilt` uses that zip directly. To follow a newer PdfCraft release, set `PDFCRAFT_VERSION` (and refresh the patch and the docking seed in `shell.js` if they no longer apply).
+
+`scripts/test-shell.mjs` runs PdfCraft inside the shell in Chromium (the engine of Android System WebView) at a Pixel 7's screen size and scale. It drives open, edit, save, save as, export, links and PdfCraft's own Print button against a stand-in for the Java bridge, and writes screenshots to `build/test-shots/`:
+
+```sh
+npm install --no-save playwright@1.56.1 && npx playwright install chromium
+node scripts/test-shell.mjs
+```
+
+`.github/workflows/android.yml` runs all three on every pull request and push to `main`. Pushes to `main` also publish the APK as a release.
+
+## Licences
+
+PdfCraft is © the ArtCraft Team and the PdfCraft contributors, MIT OR Apache-2.0. The APK carries its licences, `NOTICE`, `ATTRIBUTION.md` and the font licences under `assets/app/pdfcraft/licenses/`. See [THIRD_PARTY.md](THIRD_PARTY.md). This project is not affiliated with or endorsed by the ArtCraft Team, and it uses none of the ArtCraft trademarks (the ArtCraft name and the logos in PdfCraft's `docs/brand/`).

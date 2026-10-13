@@ -1,0 +1,37 @@
+diff --git a/crates/ui-egui/src/widgets.rs b/crates/ui-egui/src/widgets.rs
+index 4f5aaa7..27c0f2d 100644
+--- a/crates/ui-egui/src/widgets.rs
++++ b/crates/ui-egui/src/widgets.rs
+@@ -28,12 +28,31 @@ pub fn modal(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug) ->
+     egui::Modal::new(egui::Id::new(id)).frame(dialog_frame(ctx))
+ }
+ 
++/// Below this width or height (in points) the screen is small, a phone's: dialogs scroll.
++const SMALL_SCREEN: f32 = 720.0;
++
+ /// Show [`modal`], outline its controls, and remember the card rect for layout checks.
++///
++/// On a small screen the contents scroll inside a card no larger than the screen, so a dialog
++/// laid out for a desktop window (Print is 820 points wide) keeps its buttons within reach.
+ pub fn show_modal<R>(ctx: &egui::Context, id: &str, content: impl FnOnce(&mut egui::Ui) -> R) -> egui::ModalResponse<R> {
+     let stored = egui::Id::new(id);
++    let screen = ctx.content_rect().size();
++    let small = screen.x < SMALL_SCREEN || screen.y < SMALL_SCREEN;
++    // The room a card may take: the screen less the card's padding and a margin all round.
++    let room = screen - 2.0 * vec2(f32::from(DIALOG_PAD_X) + 8.0, f32::from(DIALOG_PAD_Y) + 8.0);
+     modal(ctx, id).show(ctx, |ui| {
+         begin_dialog(ui);
+-        let inner = content(ui);
++        let inner = if small {
++            egui::ScrollArea::both()
++                .id_salt(stored.with("scroll"))
++                .max_width(room.x.max(120.0))
++                .max_height(room.y.max(120.0))
++                .show(ui, content)
++                .inner
++        } else {
++            content(ui)
++        };
+         // The frame's stroke sits outside this content rect; the stored card is the fill.
+         let card = ui.min_rect().expand2(egui::vec2(f32::from(DIALOG_PAD_X), f32::from(DIALOG_PAD_Y)));
+         ui.ctx().data_mut(|d| d.insert_temp(stored.with("card"), card));
