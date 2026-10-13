@@ -1,8 +1,8 @@
 diff --git a/crates/ui-egui/src/widgets.rs b/crates/ui-egui/src/widgets.rs
-index 4f5aaa7..44b0cb5 100644
+index 4f5aaa7..f9d63e1 100644
 --- a/crates/ui-egui/src/widgets.rs
 +++ b/crates/ui-egui/src/widgets.rs
-@@ -28,12 +28,51 @@ pub fn modal(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug) ->
+@@ -28,15 +28,88 @@ pub fn modal(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug) ->
      egui::Modal::new(egui::Id::new(id)).frame(dialog_frame(ctx))
  }
  
@@ -34,9 +34,15 @@ index 4f5aaa7..44b0cb5 100644
 +            let pass = ui.ctx().cumulative_pass_nr();
 +            let (seen, last) = ui.ctx().data(|d| (d.get_temp::<u64>(stored.with("seen")), d.get_temp::<egui::Vec2>(stored.with("room"))));
 +            let measure = seen.is_none_or(|p| p.saturating_add(1) != pass) || last != Some(room);
-+            ui.ctx().data_mut(|d| {
++            // The size the card has grown to since it was measured (see below).
++            let grow_id = stored.with("grow");
++            let grow = ui.ctx().data_mut(|d| {
 +                d.insert_temp(stored.with("seen"), pass);
 +                d.insert_temp(stored.with("room"), room);
++                if measure {
++                    d.remove::<egui::Vec2>(grow_id);
++                }
++                d.get_temp::<egui::Vec2>(grow_id)
 +            });
 +            let mut region = ui.available_rect_before_wrap();
 +            let mut builder = egui::UiBuilder::new();
@@ -45,13 +51,45 @@ index 4f5aaa7..44b0cb5 100644
 +                region = Rect::from_min_size(region.min, room);
 +                builder = builder.sizing_pass();
 +            }
-+            ui.scope_builder(egui::UiBuilder::new().max_rect(region), |ui| {
-+                egui::ScrollArea::both().id_salt(stored.with("scroll")).max_width(room.x).max_height(room.y).show(ui, |ui| body(ui, builder)).inner
-+            })
-+            .inner
++            let mut scroll = egui::ScrollArea::both().id_salt(stored.with("scroll")).max_width(room.x).max_height(room.y);
++            if let Some(size) = grow {
++                scroll = scroll.min_scrolled_width(size.x).min_scrolled_height(size.y);
++            }
++            let out = ui.scope_builder(egui::UiBuilder::new().max_rect(region), |ui| scroll.show(ui, |ui| body(ui, builder))).inner;
++            if !measure {
++                // The measure comes out short (a sizing pass lays rows out at their smallest), and
++                // between measures the card could only keep its size or shrink, while more can come
++                // into it: another dialog (they all share one modal), a tab, an error line. So when
++                // the contents need more than the card gives them, the card grows to them on the
++                // next frame, up to the room there is. It grows only to what contents laid out in
++                // it take, so it never overshoots and comes to rest; contents that take all the
++                // height they get (a list that scrolls by itself) get more each frame until they
++                // have what they want.
++                let (view, content) = (out.inner_rect.size(), out.content_size);
++                let short = |view: f32, content: f32, room: f32| content > view + 0.5 && view + 0.5 < room;
++                if short(view.x, content.x, room.x) || short(view.y, content.y, room.y) {
++                    let size = content.min(room).max(grow.unwrap_or(egui::Vec2::ZERO));
++                    ui.ctx().data_mut(|d| d.insert_temp(grow_id, size));
++                    ui.ctx().request_repaint();
++                }
++            }
++            out.inner
 +        } else {
 +            body(ui, egui::UiBuilder::new())
 +        };
          // The frame's stroke sits outside this content rect; the stored card is the fill.
          let card = ui.min_rect().expand2(egui::vec2(f32::from(DIALOG_PAD_X), f32::from(DIALOG_PAD_Y)));
-         ui.ctx().data_mut(|d| d.insert_temp(stored.with("card"), card));
+-        ui.ctx().data_mut(|d| d.insert_temp(stored.with("card"), card));
++        let before = ui.ctx().data_mut(|d| {
++            let before = d.get_temp::<Rect>(stored.with("card"));
++            d.insert_temp(stored.with("card"), card);
++            before
++        });
++        // The modal is placed by the size its card had, so a card that grew or shrank is centred
++        // on the next frame. Ask for that frame: nothing else may draw one before the next input.
++        if small && before.is_some_and(|b| (b.size() - card.size()).abs().max_elem() > 0.5) {
++            ui.ctx().request_repaint();
++        }
+         inner
+     })
+ }

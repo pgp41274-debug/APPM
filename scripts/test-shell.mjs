@@ -338,7 +338,47 @@ try {
   check('window.open links go to Android (new tab and _self)', links.length === 2, JSON.stringify(links));
   check('PdfCraft stays loaded after a _self link', app.url().includes('/app/pdfcraft/index.html'));
 
-  // 8. Print: PdfCraft's own Print button sends its print sheets to Android's print framework
+  // 8. Dialogs. On a phone a dialog's card fits what it shows, also when that grows while the
+  // dialog is open: Properties opened on its short Security tab and switched to Description gets
+  // the card Description opens with, and then keeps still.
+  const command = async (name) => {
+    await focus();
+    await page.keyboard.press('Control+k');
+    await sleep(600);
+    await page.keyboard.type(name, { delay: 20 });
+    await sleep(600);
+    await page.keyboard.press('Enter');
+    await sleep(1500);
+  };
+  // The card, in points: all the pure white left, as the backdrop dims the rest of the screen.
+  const cardOn = async (file) => {
+    const shot = decodePng(await page.screenshot({ path: path.join(shots, file) }));
+    const scale = shot.width / await page.evaluate(() => innerWidth);
+    const b = largestPatch(shot, 0, (r, g, bl) => r > 250 && g > 250 && bl > 250);
+    return b && { x: b.x0 / scale, y: b.y0 / scale, w: (b.x1 - b.x0 + 1) / scale, h: (b.y1 - b.y0 + 1) / scale };
+  };
+  await command('Document properties');
+  const described = await cardOn('2b-properties-description.png');
+  await page.keyboard.press('Escape');
+  await sleep(800);
+  await command('Security properties');
+  const secured = await cardOn('2c-properties-security.png');
+  // The tabs run along the top of the card, Description first.
+  if (secured) await page.mouse.click(secured.x + 60, secured.y + 75);
+  await sleep(1500);
+  const switched = await cardOn('2d-properties-security-then-description.png');
+  // More frames (the pointer moving over the backdrop) for a card that is still on the move.
+  for (let i = 0; i < 20; i++) { await page.mouse.move(4 + (i % 2), 4); await sleep(50); }
+  const settled = await cardOn('2e-properties-settled.png');
+  const size = (c) => c && `${c.w.toFixed(0)} x ${c.h.toFixed(0)}`;
+  check('a dialog\'s card grows to fit what it shows (Properties: Security, then Description)',
+    described && secured && switched && settled && secured.h < described.h - 40 && Math.abs(switched.h - described.h) < 2
+      && ['x', 'y', 'w', 'h'].every((k) => Math.abs(settled[k] - switched[k]) < 1),
+    `Description ${size(described)} pt, Security ${size(secured)}, then Description ${size(switched)} and ${size(settled)} later`);
+  await page.keyboard.press('Escape');
+  await sleep(800);
+
+  // Print: PdfCraft's own Print button sends its print sheets to Android's print framework
   // instead of a no-op print(). Nothing stands in for PdfCraft: without its sheets this fails.
   await focus();
   await page.keyboard.press('Control+p');
