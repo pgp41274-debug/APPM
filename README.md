@@ -16,10 +16,11 @@ You need Android 10 or newer with a current **Android System WebView** (it updat
 
 - **Open a PDF**: tap **Open** in PdfCraft, choose PdfCraft under "Open with" in your Files app, or share a PDF to PdfCraft from any app. Shared files open in new tabs, even while PdfCraft is running.
 - **Save** (Ctrl+S, or the save icon) writes back to the original file when the app that opened it allowed writing. Otherwise the first Save puts a copy in `Downloads/PdfCraft/`, and later saves of that document update that copy. Every open document is tracked by its own ID, so a Save never lands on a different file that happens to share its name. A picture or text file you open becomes a new PDF, which is saved as a copy, never over the original file. A toast says where every save went.
+- Saving over a file never leaves it half-written. PdfCraft copies what the file held first and puts it back if the write fails; if Android closes the app in the middle of a save, the next start finishes it. A save that can't be written anywhere opens again in a new tab, so the work isn't lost.
 - **Save as** and **exports** (pages as images, CSV, extracted files and so on) open Android's "save to" picker. If you cancel a Save As, a copy is still kept in `Downloads/PdfCraft/`, so no work is lost.
 - **Print** opens Android's print dialog: printers on your network, or **Save as PDF**.
 - **Links** in PdfCraft (Help, release notes, credits) open in your browser.
-- **Back** sends PdfCraft to the background with its documents still open, like Home does.
+- **Back** sends PdfCraft to the background with its documents still open, like Home does. Android may close a background app at any time, though, so save first.
 
 ### Tips for a phone screen
 
@@ -51,7 +52,7 @@ Android app (android/)                         assets/app/
 └──────────────────────────────┘
 ```
 
-- `MainActivity` serves the APK's assets at `https://appassets.androidplatform.net/app/` (with `application/wasm` for the module) and serves files handed in by other apps at `/incoming/<id>`. It also connects PdfCraft's Open to Android's document picker and handles "Open with" and share intents.
+- `MainActivity` serves the APK's assets at `https://appassets.androidplatform.net/app/` (with `application/wasm` for the module) and serves files handed in by other apps at `/incoming/<id>`. It also connects PdfCraft's Open to Android's document picker and handles "Open with" and share intents (`content://` only: a `file://` path would be read with the app's own rights). It handles every configuration change in place (rotation, Dark theme, wallpaper colours), because recreating it would close every open document. The launcher icon starts it through `LauncherActivity`, so that tapping the icon while a picker is open brings the picker back rather than closing it.
 - PdfCraft's browser build already has a **host bridge** for embedding (`apps/pdfcraft-web/src/main.rs`, `mod host`). Started with `?host=parent` in a same-origin frame, it posts `pdfcraft:ready`, `pdfcraft:save {name, saveAs, bytes, id, doc}`, `pdfcraft:closed {id, doc}` and `pdfcraft:dirty`, and accepts `pdfcraft:open {name, bytes, id}` (`id`, `doc` and `pdfcraft:closed` come from patch 0003). `shell.js` relays these to Java (`ShellBridge`) in the order PdfCraft sent them, with file bytes in base64 slices. `FileStore` picks where a save goes by the document's `id` (files Android handed in) or `doc` number (everything else), never by name alone. When a tab closes, or a file Android sent never becomes a document of its own, `pdfcraft:closed` lets go of the file its saves went to (once those saves are written), so that file opened again saves back to it.
 - `shell.js` also covers what a browser does but a WebView doesn't. Downloads of `blob:` URLs become exports. `window.open` links go to the browser. PdfCraft's print sheets (PNG pages in a hidden frame) go to `Printer`, which streams them into a PDF one strip at a time (`PrintPdfWriter`, about 16 MB of memory however long the document) for Android's `PrintManager`.
 - `patches/pdfcraft/` holds the only changes to PdfCraft. Below 720 points, dialogs (0001) and the command palette (0002) fit inside the screen and scroll instead of running off it; desktop sizes are unaffected. 0003 gives documents from the host an ID that comes back with every save, and tells the host when a document closes.
@@ -68,14 +69,14 @@ scripts/build-apk.sh     # installs the Android SDK into ~/android-sdk if needed
 
 `build-web.sh` clones PdfCraft and [craft-fonts](https://github.com/storytold/craft-fonts) at pinned revisions, applies `patches/pdfcraft/`, and builds with [trunk](https://trunkrs.dev). If the source build fails, it falls back to unpacking PdfCraft's official `pdfcraft-web-0.7.1.zip` release, which is the same code without these patches (CI sets `PDFCRAFT_NO_FALLBACK=1` so a release never ships without them). `scripts/build-web.sh --prebuilt` uses that zip directly. To follow a newer PdfCraft release, set `PDFCRAFT_VERSION` (and refresh the patches and the docking seed in `shell.js` if they no longer apply).
 
-`scripts/test-shell.mjs` runs PdfCraft inside the shell in Chromium (the engine of Android System WebView) at a Pixel 7's screen size and scale. It drives open, edit, save, save as, closing tabs, export, links and PdfCraft's own Print button against a stand-in for the Java bridge, and writes screenshots to `build/test-shots/`. `scripts/test-print-pdf.sh` checks the print PDF writer on a desktop JVM: structure, every pixel, where plain and turned sheets land (rendered with `pdftoppm`) and a 64-megapixel sheet in a 32 MB heap. `scripts/test-save-targets.sh` checks, also on a desktop JVM, which file each Save goes to (`SaveTargets`): picked files, "Open with" files, PDFs made from pictures, closed tabs.
+`scripts/test-android.mjs` runs the APK itself on an Android emulator (Android 16, with its own System WebView) and drives it over adb: start from the launcher, "Open with" a writable and a read-only PDF, edit and save (in place, and to `Downloads/PdfCraft`), Save As through Android's picker (and the launcher icon over it), the print dialog, rotation, Dark theme, a theme colour change, Android ending the app in the background, and a crashed page. It saves device screenshots and the logcat. `scripts/test-shell.mjs` runs PdfCraft inside the shell in Chromium (the engine of Android System WebView) at a Pixel 7's screen size and scale. It drives open, edit, save, save as, closing tabs, export, links and PdfCraft's own Print button against a stand-in for the Java bridge, and writes screenshots to `build/test-shots/`. `scripts/test-print-pdf.sh` checks the print PDF writer on a desktop JVM: structure, every pixel, where plain and turned sheets land (rendered with `pdftoppm`) and a 64-megapixel sheet in a 32 MB heap. `scripts/test-save-targets.sh` checks, also on a desktop JVM, which file each Save goes to (`SaveTargets`): picked files, "Open with" files, PDFs made from pictures, closed tabs.
 
 ```sh
 npm install --no-save playwright@1.56.1 && npx playwright install chromium
 node scripts/test-shell.mjs
 ```
 
-`.github/workflows/android.yml` runs the builds and the tests on every pull request and push to `main`. Pushes to `main` also publish the APK as a release.
+`.github/workflows/android.yml` runs the builds and all four test suites (the emulator one on a KVM-accelerated `ubuntu-latest` runner) on every pull request and push to `main`. A push to `main` publishes the APK as a release once every test has passed.
 
 ## Licences
 
