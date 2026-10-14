@@ -1,0 +1,61 @@
+--- a/crates/ui-egui/src/editing.rs
++++ b/crates/ui-egui/src/editing.rs
+@@ -1521,6 +1521,20 @@
+     }
+ 
+     #[test]
++    fn a_file_the_page_sends_comes_to_the_front() {
++        let (mut app, reports) = app();
++        app.open_bytes("picked.pdf", None, form()).unwrap();
++        app.open_bytes("other.pdf", None, form()).unwrap();
++        app.active = Some(0);
++        app.host_inbox.lock().unwrap().push(("sent.pdf".into(), sent("f1"), form()));
++        app.open_from_host();
++        assert_eq!(app.views.len(), 3);
++        assert_eq!(app.active, Some(2), "the file just sent is the one shown");
++        assert_eq!(app.host_ids.get(&app.views[2].id).map(String::as_str), Some("f1"));
++        assert!(taken(&reports).is_empty());
++    }
++
++    #[test]
+     fn an_unlocked_file_keeps_its_page_id_until_its_tab_closes() {
+         let (mut app, reports) = app();
+         app.open_bytes_with_focus("locked.pdf", None, locked_form(), true, sent("f1")).unwrap();
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -1077,6 +1077,19 @@
+         Ok(())
+     }
+ 
++    /// Open the files the embedding page sent ([`HostInbox`]), keeping the page's ids. Unlike the
++    /// startup `?file=` download, each comes to the front: a page sends a file when the user has
++    /// just chosen to open it there ("Open with", a share).
++    fn open_from_host(&mut self) {
++        let from_host = self.host_inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
++        for (name, host_id, bytes) in from_host {
++            self.startup_superseded = true;
++            if let Err(e) = self.open_bytes_with_focus(&name, None, bytes, true, host_id) {
++                self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e)]);
++            }
++        }
++    }
++
+     /// The document just opened after `opened` tabs, or else the one waiting behind the password
+     /// prompt, came from the embedding page's file `id` ([`HostInbox`]).
+     fn take_host_id(&mut self, opened: usize, id: String) {
+@@ -2551,14 +2564,7 @@
+                     self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e)]);
+                 }
+             }
+-            // Files from the embedding page open the same way, and keep the page's ids.
+-            let from_host = self.host_inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+-            for (name, host_id, bytes) in from_host {
+-                let activate = !self.startup_superseded;
+-                if let Err(e) = self.open_bytes_with_focus(&name, None, bytes, activate, host_id) {
+-                    self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e)]);
+-                }
+-            }
++            self.open_from_host();
+         }
+         let failed: Vec<(String, String)> = self.failed_inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+         for (name, e) in failed {
