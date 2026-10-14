@@ -1,8 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">PdfCraft</string>
-    <string name="kept_running">PdfCraft keeps running in the background with your unsaved changes.</string>
-    <string name="restarted">PdfCraft ran out of memory and was restarted.</string>
+    <string name="kept_running">PdfCraft is still open in the background, but Android may close it at any time. Save to keep your changes.</string>
+    <string name="restarted">PdfCraft stopped unexpectedly (usually from low memory) and was restarted.</string>
+    <string name="keeps_stopping">PdfCraft keeps stopping before it can start. Updating Android System WebView often fixes this.</string>
+    <string name="no_webview">PdfCraft runs in Android System WebView, which isn\'t available right now. It may be updating, or turned off in Settings.</string>
+    <string name="update_webview">Update Android System WebView</string>
+    <string name="try_again">Try again</string>
+    <string name="not_shared">Couldn\'t open %1$s: the app that sent it gave a file path, which PdfCraft isn\'t allowed to read. Share the file instead.</string>
     <string name="no_picker">No app on this device can pick files.</string>
     <string name="no_browser">No app can open %1$s</string>
     <string name="no_printing">Printing isn\'t available on this device.</string>
@@ -13,5 +18,7 @@
     <string name="saved_to">Saved to %1$s</string>
     <string name="saved_instead">Couldn\'t write the original file; saved to %1$s</string>
     <string name="save_failed">Couldn\'t save %1$s: %2$s</string>
+    <string name="save_failed_reopened">Couldn\'t save %1$s: %2$s. It is open again in a new tab, so nothing is lost.</string>
+    <string name="save_resumed">Finished a save that was interrupted: %1$s</string>
     <string name="save_lost">Android closed PdfCraft while you were choosing where to save, and that save was lost. Please save again.</string>
 </resources>

@@ -36,6 +36,7 @@ final class ShellBridge {
     @JavascriptInterface
     public void appReady() {
         files.newPage();
+        activity.ready();
     }
 
     /**
@@ -106,7 +107,7 @@ final class ShellBridge {
         activity.openExternalLater(url);
     }
 
-    /** Start a print job; PdfCraft's print sheets follow one {@link #printPage} at a time. */
+    /** Start a print job; PdfCraft's print sheets follow, one {@link #beginSheet} at a time. */
     @JavascriptInterface
     public String beginPrint(String jobName) {
         try {
@@ -117,17 +118,42 @@ final class ShellBridge {
         }
     }
 
-    /** One sheet: its size in points, whether its picture lies turned, and the PNG as base64. */
+    /** The next sheet: its size in points and whether its picture lies turned. */
     @JavascriptInterface
-    public boolean printPage(String id, double widthPt, double heightPt, boolean turned, String base64Png) {
+    public boolean beginSheet(String id, double widthPt, double heightPt, boolean turned) {
         try {
-            printer.addPage(id, widthPt, heightPt, turned, base64Png);
+            printer.beginSheet(id, widthPt, heightPt, turned);
             return true;
         } catch (IOException | IllegalArgumentException e) {
-            printer.abort(id);
-            activity.toast("Couldn't print: " + e.getMessage());
-            return false;
+            return printFailed(id, e);
         }
+    }
+
+    /** One base64 slice (a multiple of 4 characters) of the sheet's PNG. */
+    @JavascriptInterface
+    public boolean appendSheet(String id, String base64) {
+        try {
+            printer.appendSheet(id, base64);
+            return true;
+        } catch (IOException | IllegalArgumentException e) {
+            return printFailed(id, e);
+        }
+    }
+
+    @JavascriptInterface
+    public boolean endSheet(String id) {
+        try {
+            printer.endSheet(id);
+            return true;
+        } catch (IOException e) {
+            return printFailed(id, e);
+        }
+    }
+
+    private boolean printFailed(String id, Exception e) {
+        printer.abort(id);
+        activity.toast("Couldn't print: " + e.getMessage());
+        return false;
     }
 
     @JavascriptInterface

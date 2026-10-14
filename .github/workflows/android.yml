@@ -1,8 +1,9 @@
 name: Android APK
 
 # Builds PdfCraft's browser version from source (scripts/build-web.sh), tests the Android shell
-# around it in Chromium (scripts/test-shell.mjs), and packs both into a signed APK. Every run
-# uploads the APK as an artifact; a push to main also publishes it as a GitHub release, so the
+# around it in Chromium (scripts/test-shell.mjs), and packs both into a signed APK. Then the APK
+# runs on an Android emulator (scripts/test-android.mjs). Every run uploads the APK as an
+# artifact; a push to main whose tests all pass also publishes it as a GitHub release, so the
 # newest APK is always at https://github.com/<owner>/<repo>/releases/latest.
 
 on:
@@ -19,8 +20,6 @@ jobs:
   apk:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -104,8 +103,71 @@ jobs:
           path: build/test-shots/
           if-no-files-found: ignore
 
-      - name: Publish a release (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  # The APK on a real Android runtime: Android 16 (API 36, targetSdk) with its own System
+  # WebView. A google_apis image is a userdebug build, whose WebView lets the test attach to the
+  # release APK's page.
+  emulator:
+    needs: apk
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: PdfCraft-apk
+          path: dist
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The client only: it drives the app's own WebView, no browser download.
+      - name: Install Playwright
+        run: npm install --no-save --no-package-lock playwright@1.56.1
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Test the APK on an Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 3
+          ram-size: 4096M
+          disk-size: 6G
+          emulator-boot-timeout: 900
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -camera-front none
+          # One line: the action runs each line of `script` as its own `sh -c`.
+          script: node scripts/test-android.mjs "$(ls dist/*.apk | head -n 1)" build/emulator
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: emulator
+          path: build/emulator/
+          if-no-files-found: ignore
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [apk, emulator]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: PdfCraft-apk
+          path: dist
+
+      - name: Publish a release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: android-${{ github.run_number }}

@@ -16,8 +16,9 @@
   const APP_URL = '../pdfcraft/index.html?host=parent';
   // A slow phone compiles the 40 MB module for a while; only then say something is wrong.
   const STARTUP_TIMEOUT_MS = 45000;
-  // Base64 characters per bridge call: a multiple of 4, so every slice decodes on its own.
-  const SLICE = 512 * 1024;
+  // Bytes per bridge call, a multiple of 3 so every slice's base64 decodes on its own. A file
+  // is read and encoded a slice at a time: one big base64 string can cost the page its memory.
+  const SLICE = 384 * 1024;
 
   let ready = false;
   let lastError = '';
@@ -202,9 +203,8 @@
     const id = android.beginSave(String(name || 'document.pdf'), blob.type || '', saveAs, kind, which.id, which.doc);
     if (!id) return;
     try {
-      const data = await base64(blob);
-      for (let i = 0; i < data.length; i += SLICE) {
-        if (!android.appendChunk(id, data.slice(i, i + SLICE))) return;
+      for (let at = 0; at < blob.size; at += SLICE) {
+        if (!android.appendChunk(id, await base64(blob.slice(at, at + SLICE)))) return;
       }
       android.endSave(id);
     } catch (e) {
@@ -359,8 +359,11 @@
           const width = parseFloat(style.width) * 0.75;
           const height = parseFloat(style.height) * 0.75;
           const blob = blobs.get(img.src) || (await (await fetch(img.src)).blob());
-          const data = await base64(blob);
-          if (!android.printPage(id, width, height, sheet.classList.contains('turned'), data)) return;
+          if (!android.beginSheet(id, width, height, sheet.classList.contains('turned'))) return;
+          for (let at = 0; at < blob.size; at += SLICE) {
+            if (!android.appendSheet(id, await base64(blob.slice(at, at + SLICE)))) return;
+          }
+          if (!android.endSheet(id)) return;
         }
         android.endPrint(id);
       } catch (e) {

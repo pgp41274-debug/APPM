@@ -6,12 +6,18 @@ import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
+import android.content.res.Configuration;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Message;
 import android.os.Process;
+import android.print.PrintJob;
 import android.print.PrintManager;
+import android.provider.DocumentsContract;
 import android.util.Log;
+import android.util.TypedValue;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.ConsoleMessage;
@@ -25,7 +31,10 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.activity.ComponentActivity;
@@ -40,6 +49,8 @@ import androidx.core.os.BundleCompat;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
+import androidx.lifecycle.Lifecycle;
 import androidx.webkit.WebSettingsCompat;
 import androidx.webkit.WebViewAssetLoader;
 import androidx.webkit.WebViewCompat;
@@ -73,7 +84,10 @@ public final class MainActivity extends ComponentActivity {
     private static final String STATE_ASKING = "asking";
     private static final String STATE_SAVES = "saves";
 
+    /** Writes saves, one at a time and in order. */
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    /** Builds print PDFs, which can take minutes: never in front of a save. */
+    private final ExecutorService printing = Executors.newSingleThreadExecutor();
     private final ArrayDeque<FileStore.SaveJob> saves = new ArrayDeque<>();
 
     private FileStore files;
@@ -82,6 +96,10 @@ public final class MainActivity extends ComponentActivity {
     private FrameLayout root;
     private WebView web;
     private ValueCallback<Uri[]> chooser;
+    /** The page died while PdfCraft was out of sight: start it again when it is back. */
+    private boolean restartWhenShown;
+    /** Times the page died since PdfCraft last started; reset by {@link #ready}. */
+    private int deathsBeforeReady;
     /**
      * The save waiting on the "Save as" picker, if one is open. Kept in the instance state: if
      * Android ends the process while the picker is open, the answer comes to a new activity.
@@ -124,7 +142,6 @@ public final class MainActivity extends ComponentActivity {
             return WindowInsetsCompat.CONSUMED;
         });
         setContentView(root);
-        createWebView();
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
@@ -136,9 +153,44 @@ public final class MainActivity extends ComponentActivity {
             }
         });
 
-        handle(getIntent());
-        web.loadUrl(START);
+        // The intent that started the activity, unless it was handled before: Android hands a
+        // recreated activity the intent its task began with, whatever setIntent() said since.
+        if (state == null && (getIntent().getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) == 0) {
+            handle(getIntent());
+        }
+        startPdfCraft();
         nextSave();
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        if (restartWhenShown) {
+            restartWhenShown = false;
+            startPdfCraft();
+            toast(getString(R.string.restarted));
+        }
+    }
+
+    @Override
+    public void onConfigurationChanged(@NonNull Configuration config) {
+        super.onConfigurationChanged(config);
+        // Changes are handled here rather than by recreating the activity (that would lose every
+        // open document): follow a switch to or from Dark theme.
+        int surface = ContextCompat.getColor(this, R.color.surface);
+        root.setBackgroundColor(surface);
+        if (web != null) web.setBackgroundColor(surface);
+        boolean night = (config.uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+        WindowInsetsControllerCompat bars = WindowCompat.getInsetsController(getWindow(), root);
+        bars.setAppearanceLightStatusBars(!night);
+        bars.setAppearanceLightNavigationBars(!night);
+        setBarColors(surface);
+    }
+
+    @SuppressWarnings("deprecation") // The bars' colours still show before Android 15.
+    private void setBarColors(int color) {
+        getWindow().setStatusBarColor(color);
+        getWindow().setNavigationBarColor(color);
     }
 
     @Override
@@ -158,6 +210,12 @@ public final class MainActivity extends ComponentActivity {
      */
     private void restoreSaves(Bundle state) {
         List<File> keep = new ArrayList<>();
+        // Writes an ended process was in the middle of come first: they were made before any
+        // save still queued.
+        for (FileStore.SaveJob job : files.interruptedWrites()) {
+            saves.add(job);
+            keep.add(job.file);
+        }
         if (state != null) {
             asking = FileStore.SaveJob.fromBundle(state.getBundle(STATE_ASKING));
             if (asking != null) keep.add(asking.file);
@@ -165,7 +223,7 @@ public final class MainActivity extends ComponentActivity {
             if (queued != null) {
                 for (Bundle b : queued) {
                     FileStore.SaveJob job = FileStore.SaveJob.fromBundle(b);
-                    if (job == null) continue;
+                    if (job == null || keep.contains(job.file)) continue;
                     saves.add(job);
                     keep.add(job.file);
                 }
@@ -188,19 +246,62 @@ public final class MainActivity extends ComponentActivity {
             web = null;
         }
         io.shutdown();
+        printing.shutdown();
         super.onDestroy();
     }
 
     // ---- WebView ----
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private void createWebView() {
-        web = new WebView(this);
+    /** Load PdfCraft into a new WebView, or say why it can't run. */
+    private void startPdfCraft() {
+        root.removeAllViews();
+        try {
+            web = createWebView();
+        } catch (RuntimeException e) {
+            // No WebView to run in: none installed, turned off, or being updated right now.
+            Log.e(TAG, "can't create a WebView", e);
+            showProblem(getString(R.string.no_webview));
+            return;
+        }
         root.addView(web, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        web.setBackgroundColor(ContextCompat.getColor(this, R.color.surface));
-        web.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        web.loadUrl(START);
+    }
 
-        WebSettings s = web.getSettings();
+    /** Instead of PdfCraft: what went wrong, with a way to update the WebView and to try again. */
+    private void showProblem(String message) {
+        web = null;
+        root.removeAllViews();
+        int pad = Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 24, getResources().getDisplayMetrics()));
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        box.setPadding(pad, pad, pad, pad);
+        TextView text = new TextView(this);
+        text.setText(message);
+        text.setGravity(Gravity.CENTER);
+        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        box.addView(text);
+        Button update = new Button(this);
+        update.setText(R.string.update_webview);
+        update.setOnClickListener(v -> updateWebViewLater());
+        box.addView(update);
+        Button retry = new Button(this);
+        retry.setText(R.string.try_again);
+        retry.setOnClickListener(v -> {
+            deathsBeforeReady = 0;
+            startPdfCraft();
+        });
+        box.addView(retry);
+        root.addView(box, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private WebView createWebView() {
+        WebView view = new WebView(this);
+        view.setBackgroundColor(ContextCompat.getColor(this, R.color.surface));
+        view.setOverScrollMode(View.OVER_SCROLL_NEVER);
+
+        WebSettings s = view.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true); // PdfCraft keeps its preferences in localStorage.
         s.setAllowFileAccess(false);
@@ -213,7 +314,7 @@ public final class MainActivity extends ComponentActivity {
             WebSettingsCompat.setAlgorithmicDarkeningAllowed(s, false); // PdfCraft has its own dark theme.
         }
 
-        web.setWebViewClient(new WebViewClient() {
+        view.setWebViewClient(new WebViewClient() {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 Uri url = request.getUrl();
@@ -246,19 +347,34 @@ public final class MainActivity extends ComponentActivity {
                 // The page's process died (usually the system reclaiming memory). Start PdfCraft
                 // again instead of letting the whole app crash.
                 Log.w(TAG, "WebView renderer gone; crashed=" + detail.didCrash());
-                if (view == web) {
-                    root.removeView(web);
-                    web.destroy();
-                    dirty = false;
-                    createWebView();
-                    web.loadUrl(START);
+                if (view != web) return true;
+                root.removeView(web);
+                web.destroy();
+                web = null;
+                dirty = false;
+                // What the dead page was sending can't be finished, and a picker it opened must
+                // hand its files to the next page instead.
+                files.abortAll();
+                printer.abortAll();
+                if (chooser != null) {
+                    chooser.onReceiveValue(null);
+                    chooser = null;
+                }
+                if (++deathsBeforeReady > 2) {
+                    // It dies before it is even ready: starting it again won't help.
+                    showProblem(getString(R.string.keeps_stopping));
+                } else if (getLifecycle().getCurrentState().isAtLeast(Lifecycle.State.STARTED)) {
+                    startPdfCraft();
                     toast(getString(R.string.restarted));
+                } else {
+                    // In the background, under the memory pressure that likely ended it: wait.
+                    restartWhenShown = true;
                 }
                 return true;
             }
         });
 
-        web.setWebChromeClient(new WebChromeClient() {
+        view.setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
                 if (chooser != null) chooser.onReceiveValue(null);
@@ -307,7 +423,8 @@ public final class MainActivity extends ComponentActivity {
             }
         });
 
-        web.addJavascriptInterface(new ShellBridge(this, files, printer), "AndroidShell");
+        view.addJavascriptInterface(new ShellBridge(this, files, printer), "AndroidShell");
+        return view;
     }
 
     private static boolean isNavigation(WebResourceRequest request) {
@@ -394,8 +511,17 @@ public final class MainActivity extends ComponentActivity {
         }
         if (uris.isEmpty()) return;
         boolean canWrite = (intent.getFlags() & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) != 0;
-        for (Uri uri : uris) files.addIncoming(uri, canWrite && "content".equals(uri.getScheme()));
-        // Handled: don't open the files again if the activity is recreated.
+        for (Uri uri : uris) {
+            if (uri == null) continue;
+            // A file:// path would be read with PdfCraft's own rights: other apps' files are
+            // out of reach under scoped storage, and PdfCraft's private files must stay private.
+            if (!"content".equals(uri.getScheme())) {
+                toast(getString(R.string.not_shared, String.valueOf(uri.getLastPathSegment())));
+                continue;
+            }
+            Log.i(TAG, "incoming " + files.addIncoming(uri, canWrite) + ": " + uri);
+        }
+        // Handled: don't open the files again if the activity is recreated in this process.
         setIntent(new Intent(Intent.ACTION_MAIN));
         if (web != null) web.evaluateJavascript("window.shell && shell.incoming()", null);
     }
@@ -418,12 +544,14 @@ public final class MainActivity extends ComponentActivity {
         if (web != null) web.evaluateJavascript("window.shell && shell.incoming()", null);
     }
 
-    /** Keep read (and, where offered, write) access to a picked file; true if it is writable. */
+    /**
+     * Keep read (and, where offered, write) access to a picked file, so a save can still reach
+     * it after Android ends the app mid-write; true if a Save may overwrite it.
+     */
     private boolean keepAccess(Uri uri) {
         int rw = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
         try {
             getContentResolver().takePersistableUriPermission(uri, rw);
-            return true;
         } catch (SecurityException e) {
             try {
                 getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
@@ -431,8 +559,22 @@ public final class MainActivity extends ComponentActivity {
                 // Readable for now; that's enough to open it.
             }
         }
+        // The picker grants write access to every file it returns, read-only ones included:
+        // ask the file's provider too.
         return checkUriPermission(uri, Process.myPid(), Process.myUid(), Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-                == PackageManager.PERMISSION_GRANTED;
+                == PackageManager.PERMISSION_GRANTED && supportsWrite(uri);
+    }
+
+    private boolean supportsWrite(Uri uri) {
+        if (!DocumentsContract.isDocumentUri(this, uri)) return true;
+        try (Cursor c = getContentResolver().query(uri, new String[] {DocumentsContract.Document.COLUMN_FLAGS}, null, null, null)) {
+            if (c != null && c.moveToFirst() && !c.isNull(0)) {
+                return (c.getInt(0) & DocumentsContract.Document.FLAG_SUPPORTS_WRITE) != 0;
+            }
+        } catch (RuntimeException ignored) {
+            // Unknown: try, and fall back to a copy if the write fails.
+        }
+        return true;
     }
 
     /** The MIME types for an {@code <input accept>} list such as ".pdf" or "image/png,.jpg". */
@@ -484,7 +626,7 @@ public final class MainActivity extends ComponentActivity {
             return;
         }
         if (!job.saveAs && !job.isExport()) {
-            Uri target = files.targetFor(job.key, job.name);
+            Uri target = job.resume != null ? job.resume : files.targetFor(job.key, job.name);
             writing = true;
             io.execute(() -> {
                 String message = write(job, target);
@@ -547,19 +689,26 @@ public final class MainActivity extends ComponentActivity {
 
     /** Write a save to {@code target}, or to Downloads/PdfCraft when there's none or it fails. */
     private String write(FileStore.SaveJob job, Uri target) {
+        String message = writeOrCopy(job, target);
+        return job.resume != null ? getString(R.string.save_resumed, message) : message;
+    }
+
+    private String writeOrCopy(FileStore.SaveJob job, Uri target) {
+        boolean keep = false;
         try {
             if (target != null) {
                 try {
-                    files.writeTo(target, job.file);
+                    // Never leaves the file half-written: on failure it holds what it held.
+                    files.replace(target, job);
                     return getString(R.string.saved, files.displayName(target));
-                } catch (IOException | SecurityException | IllegalArgumentException e) {
+                } catch (IOException | RuntimeException e) {
                     Log.w(TAG, "can't write " + target, e);
                 }
             }
             Uri copy = files.saveToDownloads(job.name, job.mime, job.file);
             // Later saves of the document update this copy. A cancelled Save As leaves them
             // going where they went before, if anywhere.
-            if (!job.isExport()) {
+            if (!job.isExport() && job.key != null) {
                 if (target == null && job.saveAs) files.bindIfUnbound(job.key, copy);
                 else files.bind(job.key, copy);
             }
@@ -567,10 +716,19 @@ public final class MainActivity extends ComponentActivity {
             return target != null ? getString(R.string.saved_instead, where) : getString(R.string.saved_to, where);
         } catch (IOException | RuntimeException e) {
             Log.e(TAG, "save failed", e);
-            return getString(R.string.save_failed, job.name, String.valueOf(e.getMessage()));
+            String reason = String.valueOf(e.getMessage());
+            if (job.isExport()) return getString(R.string.save_failed, job.name, reason);
+            // PdfCraft counts the document as saved (and may have closed it already): open the
+            // bytes that couldn't be written in a new tab, so the work isn't lost.
+            keep = true;
+            runOnUiThread(() -> {
+                files.addIncoming(Uri.fromFile(job.file), job.name, false);
+                if (web != null) web.evaluateJavascript("window.shell && shell.incoming()", null);
+            });
+            return getString(R.string.save_failed_reopened, job.name, reason);
         } finally {
             //noinspection ResultOfMethodCallIgnored
-            job.file.delete();
+            if (!keep) job.file.delete();
         }
     }
 
@@ -578,18 +736,10 @@ public final class MainActivity extends ComponentActivity {
 
     /** All sheets of print job {@code id} arrived (from the bridge thread). */
     void print(Printer printer, String id) {
-        io.execute(() -> {
+        printing.execute(() -> {
             try {
                 Printer.Document document = printer.build(id);
-                runOnUiThread(() -> {
-                    PrintManager manager = (PrintManager) getSystemService(PRINT_SERVICE);
-                    if (manager == null) {
-                        Printer.deleteTree(document.dir);
-                        toast(getString(R.string.no_printing));
-                        return;
-                    }
-                    manager.print(document.name, Printer.adapter(document), null);
-                });
+                runOnUiThread(() -> showPrintDialog(document));
             } catch (IOException | RuntimeException e) {
                 Log.e(TAG, "print failed", e);
                 toast(getString(R.string.print_failed, String.valueOf(e.getMessage())));
@@ -597,10 +747,36 @@ public final class MainActivity extends ComponentActivity {
         });
     }
 
+    private void showPrintDialog(Printer.Document document) {
+        // Building can take a while: the activity may be on its way out by now.
+        if (isFinishing() || isDestroyed()) {
+            Printer.deleteTree(document.dir);
+            return;
+        }
+        PrintManager manager = (PrintManager) getSystemService(PRINT_SERVICE);
+        PrintJob job = null;
+        try {
+            if (manager != null) job = manager.print(document.name, Printer.adapter(document), null);
+        } catch (RuntimeException e) {
+            Log.e(TAG, "can't start printing", e);
+        }
+        if (job == null) {
+            // No print service on this device (print() then returns null), or it refused.
+            Printer.deleteTree(document.dir);
+            toast(getString(R.string.no_printing));
+        }
+    }
+
     // ---- small things ----
 
     void setDirty(boolean dirty) {
         this.dirty = dirty;
+    }
+
+    /** PdfCraft started in the page and is ready for files (from the bridge thread). */
+    void ready() {
+        Log.i(TAG, "PdfCraft ready");
+        runOnUiThread(() -> deathsBeforeReady = 0);
     }
 
     void openExternalLater(String url) {
@@ -630,6 +806,7 @@ public final class MainActivity extends ComponentActivity {
     }
 
     void toast(String message) {
+        Log.i(TAG, "toast: " + message);
         // The application's context: a save can finish after this activity is destroyed.
         runOnUiThread(() -> Toast.makeText(getApplicationContext(), message, Toast.LENGTH_LONG).show());
     }

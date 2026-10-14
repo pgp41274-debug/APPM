@@ -9,17 +9,28 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.PdfCraft">
 
+        <!-- The launcher icon. A separate activity: tapping the icon while a picker or the print
+             dialog is open then brings them back, where starting the singleTask MainActivity
+             would close them. -->
         <activity
-            android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|uiMode|density|fontScale|fontWeightAdjustment|colorMode|locale|layoutDirection|mcc|mnc|grammaticalGender"
+            android:name=".LauncherActivity"
             android:exported="true"
-            android:launchMode="singleTask"
-            android:windowSoftInputMode="adjustResize">
+            android:theme="@android:style/Theme.NoDisplay">
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+        </activity>
+
+        <!-- Every configuration change is handled in place: recreating the activity would close
+             every open document. assetsPaths is a wallpaper or theme colour change. -->
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|uiMode|density|fontScale|fontWeightAdjustment|colorMode|locale|layoutDirection|mcc|mnc|grammaticalGender|assetsPaths"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
 
             <!-- "Open with PdfCraft" from Files, Downloads, mail and chat apps. -->
             <intent-filter>
@@ -27,7 +38,6 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="content" />
-                <data android:scheme="file" />
                 <data android:mimeType="application/pdf" />
             </intent-filter>
 
@@ -37,7 +47,6 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="content" />
-                <data android:scheme="file" />
                 <data android:host="*" />
                 <data android:mimeType="application/octet-stream" />
                 <data android:pathPattern=".*\\.pdf" />

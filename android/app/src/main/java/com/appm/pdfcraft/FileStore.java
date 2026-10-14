@@ -11,12 +11,15 @@ import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.util.Base64;
+import android.util.Log;
 import android.webkit.MimeTypeMap;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -24,8 +27,11 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -70,14 +76,24 @@ final class FileStore {
         final String key;
         /** The bytes; null for a close. */
         final File file;
+        /**
+         * Where the bytes go, for a write an earlier process began and didn't finish
+         * ({@link #interruptedWrites}); null for every other job.
+         */
+        final Uri resume;
 
         SaveJob(String name, String mime, boolean saveAs, String kind, String key, File file) {
+            this(name, mime, saveAs, kind, key, file, null);
+        }
+
+        private SaveJob(String name, String mime, boolean saveAs, String kind, String key, File file, Uri resume) {
             this.name = name;
             this.mime = mime;
             this.saveAs = saveAs;
             this.kind = kind;
             this.key = key;
             this.file = file;
+            this.resume = resume;
         }
 
         boolean isExport() {
@@ -100,6 +116,7 @@ final class FileStore {
             b.putString("kind", kind);
             b.putString("key", key);
             b.putString("file", file.getPath());
+            if (resume != null) b.putString("resume", resume.toString());
             return b;
         }
 
@@ -109,8 +126,9 @@ final class FileStore {
             String name = b.getString("name");
             String path = b.getString("file");
             if (name == null || path == null || !new File(path).isFile()) return null;
+            String resume = b.getString("resume");
             return new SaveJob(name, b.getString("mime"), b.getBoolean("saveAs"), b.getString("kind"), b.getString("key"),
-                    new File(path));
+                    new File(path), resume == null ? null : Uri.parse(resume));
         }
     }
 
@@ -144,7 +162,11 @@ final class FileStore {
      * goes to PdfCraft with the file and comes back with every save of that document.
      */
     String addIncoming(Uri uri, boolean canWrite) {
-        String name = displayName(uri);
+        return addIncoming(uri, displayName(uri), canWrite);
+    }
+
+    /** {@link #addIncoming(Uri, boolean)} for a file whose name is known. */
+    String addIncoming(Uri uri, String name, boolean canWrite) {
         synchronized (this) {
             String id = "f" + ids.incrementAndGet();
             incoming.put(id, new Incoming(uri, name));
@@ -167,7 +189,7 @@ final class FileStore {
             if (in == null) continue;
             try {
                 list.put(new JSONObject().put("id", id).put("name", in.name));
-            } catch (org.json.JSONException ignored) {
+            } catch (JSONException ignored) {
                 // put() with a String key and value never throws.
             }
         }
@@ -287,7 +309,20 @@ final class FileStore {
         synchronized (this) {
             spool = spools.remove(id);
         }
-        if (spool == null) return;
+        if (spool != null) discard(spool);
+    }
+
+    /** The page died: the saves it was still sending will never be finished. */
+    void abortAll() {
+        List<Spool> all;
+        synchronized (this) {
+            all = new ArrayList<>(spools.values());
+            spools.clear();
+        }
+        for (Spool spool : all) discard(spool);
+    }
+
+    private static void discard(Spool spool) {
         try {
             spool.out.close();
         } catch (IOException ignored) {
@@ -318,11 +353,167 @@ final class FileStore {
         }
     }
 
-    /** Replace the contents of {@code uri} with {@code file}. */
-    void writeTo(Uri uri, File file) throws IOException {
-        try (InputStream in = new FileInputStream(file); OutputStream out = openForWrite(uri)) {
+    // ---- writing ----
+
+    /** Notes on writes in progress, and what each file held before; kept until the write is done. */
+    private File writingDir() {
+        return new File(context.getNoBackupFilesDir(), "writing");
+    }
+
+    /**
+     * Replace what {@code uri} holds with {@code job}'s bytes without risking either. What the
+     * file held is copied aside first and put back if the write fails; a note on disk lets the
+     * next process finish the write ({@link #interruptedWrites}) if this one ends in the middle.
+     * Throws, leaving {@code uri} as it was, if it can't be read or written.
+     */
+    void replace(Uri uri, SaveJob job) throws IOException {
+        File dir = writingDir();
+        if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("can't create " + dir);
+        String base = job.file.getName(); // Unique: the spool's temporary name.
+        File backup = new File(dir, base + ".bak");
+        File note = new File(dir, base + ".json");
+        // A write an earlier process didn't finish keeps the copy taken before it started: the
+        // file itself may be cut short now.
+        boolean resumed = backup.isFile();
+        if (!resumed) {
+            File part = new File(dir, base + ".bak.part");
+            try (InputStream in = resolver.openInputStream(uri)) {
+                if (in == null) throw new FileNotFoundException("can't read " + uri);
+                copy(in, part);
+            } catch (IOException | RuntimeException e) {
+                delete(part);
+                throw e;
+            }
+            if (!part.renameTo(backup)) throw new IOException("can't keep a copy of " + uri);
+        }
+        writeNote(note, uri, job);
+        OutputStream out;
+        try {
+            out = openForWrite(uri); // Empties the file.
+        } catch (IOException | RuntimeException e) {
+            // Not writable. Untouched, unless an earlier process had begun writing it.
+            if (resumed) keepCopy(beforeSaving(job.name), job.mime, backup);
+            delete(note, backup);
+            throw e;
+        }
+        try {
+            copy(job.file, out);
+        } catch (IOException | RuntimeException e) {
+            try {
+                writeTo(uri, backup);
+            } catch (IOException | RuntimeException again) {
+                // The file is cut short and can't be mended: keep what it held in Downloads.
+                e.addSuppressed(again);
+                keepCopy(beforeSaving(job.name), job.mime, backup);
+            }
+            delete(note, backup);
+            throw e;
+        }
+        delete(note, backup);
+    }
+
+    /**
+     * The writes ({@link #replace}) an earlier process began and didn't finish, as saves to write
+     * again: from the bytes it kept, or else putting back what the file held before. Once per
+     * process, before {@link #sweepSpools}, which must keep their files.
+     */
+    List<SaveJob> interruptedWrites() {
+        List<SaveJob> jobs = new ArrayList<>();
+        synchronized (FileStore.class) {
+            if (swept) return jobs;
+        }
+        File[] notes = writingDir().listFiles((dir, n) -> n.endsWith(".json"));
+        if (notes == null) return jobs;
+        for (File note : notes) {
+            String base = note.getName().substring(0, note.getName().length() - ".json".length());
+            File backup = new File(note.getParentFile(), base + ".bak");
+            try {
+                JSONObject o = new JSONObject(new String(readAll(note), StandardCharsets.UTF_8));
+                Uri uri = Uri.parse(o.getString("uri"));
+                File bytes = new File(o.getString("file"));
+                String name = o.getString("name");
+                String mime = o.optString("mime", "application/pdf");
+                if (!backup.isFile()) throw new IOException("no copy of " + uri);
+                if (!bytes.isFile()) {
+                    // The new bytes are gone (the cache was cleared): the file gets its old ones back.
+                    File parent = bytes.getParentFile();
+                    if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("can't create " + parent);
+                    if (!backup.renameTo(bytes)) throw new IOException("can't restore " + uri);
+                }
+                jobs.add(new SaveJob(name, mime, false, "save", null, bytes, uri));
+            } catch (IOException | JSONException | RuntimeException e) {
+                delete(note, backup);
+            }
+        }
+        return jobs;
+    }
+
+    private void writeNote(File note, Uri uri, SaveJob job) throws IOException {
+        String json;
+        try {
+            json = new JSONObject()
+                    .put("uri", uri.toString())
+                    .put("file", job.file.getPath())
+                    .put("name", job.name)
+                    .put("mime", job.mime)
+                    .toString();
+        } catch (JSONException e) {
+            throw new IOException(e);
+        }
+        File part = new File(note.getPath() + ".part");
+        try (OutputStream out = new FileOutputStream(part)) {
+            out.write(json.getBytes(StandardCharsets.UTF_8));
+            ((FileOutputStream) out).getFD().sync();
+        }
+        if (!part.renameTo(note)) throw new IOException("can't write " + note);
+    }
+
+    private static void delete(File... files) {
+        //noinspection ResultOfMethodCallIgnored
+        for (File f : files) f.delete();
+    }
+
+    private static byte[] readAll(File file) throws IOException {
+        try (InputStream in = new FileInputStream(file)) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            for (int n; (n = in.read(buffer)) > 0; ) out.write(buffer, 0, n);
+            return out.toByteArray();
+        }
+    }
+
+    private static void copy(InputStream in, File to) throws IOException {
+        try (OutputStream out = new FileOutputStream(to)) {
             byte[] buffer = new byte[1 << 16];
             for (int n; (n = in.read(buffer)) > 0; ) out.write(buffer, 0, n);
+        }
+    }
+
+    /** Keep {@code file} in Downloads/PdfCraft as {@code name}, if at all possible. */
+    private void keepCopy(String name, String mime, File file) {
+        try {
+            saveToDownloads(name, mime, file);
+        } catch (IOException | RuntimeException e) {
+            Log.e("PdfCraft", "can't keep " + name, e);
+        }
+    }
+
+    /** "Report.pdf" becomes "Report (before saving).pdf". */
+    static String beforeSaving(String name) {
+        int dot = name.lastIndexOf('.');
+        return dot > 0 ? name.substring(0, dot) + " (before saving)" + name.substring(dot) : name + " (before saving)";
+    }
+
+    /** Copy {@code file} over the contents of {@code uri}. */
+    private void writeTo(Uri uri, File file) throws IOException {
+        copy(file, openForWrite(uri));
+    }
+
+    /** Copy {@code file} to {@code out}, and close it. */
+    private static void copy(File file, OutputStream out) throws IOException {
+        try (OutputStream o = out; InputStream in = new FileInputStream(file)) {
+            byte[] buffer = new byte[1 << 16];
+            for (int n; (n = in.read(buffer)) > 0; ) o.write(buffer, 0, n);
         }
     }
 
@@ -359,13 +550,13 @@ final class FileStore {
 
     /** Write {@code file} to Downloads/PdfCraft/{@code name}; returns the new file's URI. */
     Uri saveToDownloads(String name, String mime, File file) throws IOException {
-        ContentValues values = new ContentValues();
-        values.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
-        values.put(MediaStore.MediaColumns.MIME_TYPE, mime);
-        values.put(MediaStore.MediaColumns.RELATIVE_PATH, DOWNLOADS_FOLDER);
-        values.put(MediaStore.MediaColumns.IS_PENDING, 1);
-        Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-        if (uri == null) throw new IOException("Downloads refused the file");
+        Uri uri;
+        try {
+            uri = newDownload(name, mime);
+        } catch (IOException | IllegalStateException e) {
+            // Android numbers a taken name only so far ("x (31).pdf") and then refuses it.
+            uri = newDownload(stamped(name), mime);
+        }
         try {
             writeTo(uri, file);
         } catch (IOException | RuntimeException e) {
@@ -376,6 +567,24 @@ final class FileStore {
         done.put(MediaStore.MediaColumns.IS_PENDING, 0);
         resolver.update(uri, done, null, null);
         return uri;
+    }
+
+    private Uri newDownload(String name, String mime) throws IOException {
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+        values.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH, DOWNLOADS_FOLDER);
+        values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+        Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        if (uri == null) throw new IOException("Downloads refused the file");
+        return uri;
+    }
+
+    /** "Report.pdf" becomes "Report 2026-10-14 091500.pdf". */
+    static String stamped(String name) {
+        String time = new SimpleDateFormat("yyyy-MM-dd HHmmss", Locale.ROOT).format(new Date());
+        int dot = name.lastIndexOf('.');
+        return dot > 0 ? name.substring(0, dot) + " " + time + name.substring(dot) : name + " " + time;
     }
 
     /** The MIME type for {@code name}: from its extension, else {@code fallback}. */

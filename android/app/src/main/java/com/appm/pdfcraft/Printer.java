@@ -52,6 +52,8 @@ final class Printer {
         final String name;
         final File dir;
         final List<Page> pages = new ArrayList<>();
+        /** The PNG of the sheet arriving now, if one is. */
+        OutputStream sheet;
 
         Job(String name, File dir) {
             this.name = name;
@@ -100,18 +102,41 @@ final class Printer {
         return id;
     }
 
-    void addPage(String id, double widthPt, double heightPt, boolean turned, String base64Png) throws IOException {
+    /**
+     * The next sheet of job {@code id}: its size in points and whether its picture lies turned.
+     * Its PNG follows in {@link #appendSheet} slices, so no one call holds a whole sheet.
+     */
+    void beginSheet(String id, double widthPt, double heightPt, boolean turned) throws IOException {
+        Job job = job(id);
+        if (!(widthPt > 0 && heightPt > 0)) throw new IllegalArgumentException("bad sheet size");
+        if (job.sheet != null) throw new IOException("the sheet before isn't finished");
+        File png = new File(job.dir, job.pages.size() + ".png");
+        job.sheet = new BufferedOutputStream(new FileOutputStream(png), 1 << 16);
+        job.pages.add(new Page(widthPt, heightPt, turned, png));
+    }
+
+    /** One base64 slice (whole groups of 4 characters) of the sheet begun last. */
+    void appendSheet(String id, String base64) throws IOException {
+        Job job = job(id);
+        if (job.sheet == null) throw new IOException("no sheet begun");
+        job.sheet.write(Base64.decode(base64, Base64.DEFAULT));
+    }
+
+    void endSheet(String id) throws IOException {
+        Job job = job(id);
+        if (job.sheet == null) throw new IOException("no sheet begun");
+        OutputStream sheet = job.sheet;
+        job.sheet = null;
+        sheet.close();
+    }
+
+    private Job job(String id) throws IOException {
         Job job;
         synchronized (this) {
             job = jobs.get(id);
         }
         if (job == null) throw new IOException("unknown print job " + id);
-        if (!(widthPt > 0 && heightPt > 0)) throw new IllegalArgumentException("bad sheet size");
-        File png = new File(job.dir, job.pages.size() + ".png");
-        try (OutputStream out = new FileOutputStream(png)) {
-            out.write(Base64.decode(base64Png, Base64.DEFAULT));
-        }
-        job.pages.add(new Page(widthPt, heightPt, turned, png));
+        return job;
     }
 
     void abort(String id) {
@@ -119,7 +144,28 @@ final class Printer {
         synchronized (this) {
             job = jobs.remove(id);
         }
-        if (job != null) deleteTree(job.dir);
+        if (job != null) discard(job);
+    }
+
+    /** The page died: the print jobs it was still sending will never be finished. */
+    void abortAll() {
+        List<Job> all;
+        synchronized (this) {
+            all = new ArrayList<>(jobs.values());
+            jobs.clear();
+        }
+        for (Job job : all) discard(job);
+    }
+
+    private static void discard(Job job) {
+        if (job.sheet != null) {
+            try {
+                job.sheet.close();
+            } catch (IOException ignored) {
+                // Being thrown away anyway.
+            }
+        }
+        deleteTree(job.dir);
     }
 
     /** Write the sheets into a PDF, one at a time. Slow: call it off the UI thread. */
@@ -129,9 +175,9 @@ final class Printer {
             job = jobs.remove(id);
         }
         if (job == null) throw new IOException("unknown print job " + id);
-        if (job.pages.isEmpty()) {
-            deleteTree(job.dir);
-            throw new IOException("nothing to print");
+        if (job.pages.isEmpty() || job.sheet != null) {
+            discard(job);
+            throw new IOException(job.pages.isEmpty() ? "nothing to print" : "a sheet isn't finished");
         }
         File pdf = new File(job.dir, "print.pdf");
         try {
@@ -222,20 +268,24 @@ final class Printer {
             @Override
             public void onWrite(PageRange[] pages, ParcelFileDescriptor destination, CancellationSignal cancel,
                     WriteResultCallback callback) {
-                try (InputStream in = new FileInputStream(document.pdf);
-                        OutputStream out = new FileOutputStream(destination.getFileDescriptor())) {
-                    byte[] buffer = new byte[1 << 16];
-                    for (int n; (n = in.read(buffer)) > 0; ) {
-                        if (cancel.isCanceled()) {
-                            callback.onWriteCancelled();
-                            return;
+                // The PDF can be hundreds of MB, and the print dialog asks again after each change of
+                // printer or paper: copy it off the main thread (the callbacks take any thread).
+                new Thread(() -> {
+                    try (InputStream in = new FileInputStream(document.pdf);
+                            OutputStream out = new FileOutputStream(destination.getFileDescriptor())) {
+                        byte[] buffer = new byte[1 << 16];
+                        for (int n; (n = in.read(buffer)) > 0; ) {
+                            if (cancel.isCanceled()) {
+                                callback.onWriteCancelled();
+                                return;
+                            }
+                            out.write(buffer, 0, n);
                         }
-                        out.write(buffer, 0, n);
+                        callback.onWriteFinished(new PageRange[] {PageRange.ALL_PAGES});
+                    } catch (IOException e) {
+                        callback.onWriteFailed(e.getMessage());
                     }
-                    callback.onWriteFinished(new PageRange[] {PageRange.ALL_PAGES});
-                } catch (IOException e) {
-                    callback.onWriteFailed(e.getMessage());
-                }
+                }, "PdfCraft print").start();
             }
 
             @Override

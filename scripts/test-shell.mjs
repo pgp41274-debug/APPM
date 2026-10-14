@@ -80,7 +80,14 @@ const mockBridge = () => {
     setDirty(d) { window.__calls.push(['setDirty', d]); },
     openExternal(u) { window.__calls.push(['openExternal', u]); },
     beginPrint(name) { window.__print = { name, pages: [], done: false }; return 'p1'; },
-    printPage(id, w, h, turned, data) { window.__print.pages.push({ w, h, turned, png: data.startsWith('iVBORw0KGgo') }); return true; },
+    beginSheet(id, w, h, turned) { window.__print.pages.push({ w, h, turned, data: '' }); return true; },
+    appendSheet(id, b64) { window.__print.pages.at(-1).data += b64; return true; },
+    endSheet(id) {
+      const p = window.__print.pages.at(-1);
+      p.png = p.data.startsWith('iVBORw0KGgo') && p.data.length > 100;
+      delete p.data;
+      return true;
+    },
     abortPrint(id) { window.__calls.push(['abortPrint', id]); },
     endPrint(id) { window.__print.done = true; },
     toast(m) { window.__calls.push(['toast', m]); },
