@@ -172,7 +172,12 @@ async function waitReady(ms = 300000) {
 async function listen() {
   await page.evaluate(() => {
     window.__seen = [];
-    window.addEventListener('message', (e) => e.data && typeof e.data.type === 'string' && window.__seen.push(e.data.type));
+    window.__dirty = null;
+    window.addEventListener('message', (e) => {
+      if (!e.data || typeof e.data.type !== 'string') return;
+      window.__seen.push(e.data.type);
+      if (e.data.type === 'pdfcraft:dirty') window.__dirty = !!e.data.dirty;
+    });
     window.__marker = window.__marker || Math.random().toString(36).slice(2);
   });
   await app.evaluate(() => {
@@ -191,11 +196,24 @@ async function focus() {
 async function palette(command) {
   await focus();
   await page.keyboard.press('Control+k');
-  await sleep(800);
-  await page.keyboard.type(command, { delay: 30 });
-  await sleep(800);
+  // The palette's search field brings up the on-screen keyboard, which resizes the page.
+  await sleep(2000);
+  await page.keyboard.type(command, { delay: 50 });
+  await sleep(1500);
   await page.keyboard.press('Enter');
   await sleep(2000);
+}
+
+/** Make an edit PdfCraft reports as unsaved work, trying again if a keystroke went astray. */
+async function edit() {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await page.evaluate(() => { window.__dirty = null; });
+    await palette('Rotate pages clockwise');
+    if (await until(() => page.evaluate(() => window.__dirty === true), 10000)) return true;
+    await page.keyboard.press('Escape');
+    await sleep(1000);
+  }
+  return false;
 }
 
 async function opened(name, ms = 30000) {
@@ -285,7 +303,7 @@ async function main() {
   check('a PDF opened with PdfCraft from another app opens in it', rw && /^f\d+$/.test(rw.id), JSON.stringify(rw));
   await sleep(1500);
   screenshot('2-opened.png');
-  await palette('Rotate pages clockwise');
+  check('an edit is reported as unsaved work', await edit());
   mark = logMark();
   await focus();
   await page.keyboard.press('Control+s');
@@ -301,7 +319,7 @@ async function main() {
   sh(`am start -W -a android.intent.action.VIEW -t application/pdf -d ${roUri} --grant-read-uri-permission -n ${MAIN}`);
   check('a read-only PDF opens too', await opened('ci-ro.pdf'));
   await sleep(1500);
-  await palette('Rotate pages clockwise');
+  check('... and can be edited', await edit());
   mark = logMark();
   await focus();
   await page.keyboard.press('Control+s');
