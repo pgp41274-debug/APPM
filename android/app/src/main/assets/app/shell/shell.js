@@ -2,7 +2,8 @@
 //
 // PdfCraft runs in the iframe with `?host=parent`, so it talks to this page by postMessage
 // (apps/pdfcraft-web/src/main.rs, `mod host` in PdfCraft): it posts pdfcraft:ready,
-// pdfcraft:save, pdfcraft:closed and pdfcraft:dirty, and takes pdfcraft:open. This page relays
+// pdfcraft:save, pdfcraft:closed, pdfcraft:dirty and pdfcraft:fullScreen, and takes pdfcraft:open
+// and pdfcraft:leaveFullScreen. This page relays
 // those to Android (`window.AndroidShell`, ShellBridge.java), and takes over the things a
 // browser does that a WebView doesn't: downloading blob: URLs, window.open() and window.print().
 (() => {
@@ -58,6 +59,8 @@
   function start() {
     const attempt = ++starts;
     ready = false;
+    // A PdfCraft starting over is not in Full screen mode.
+    if (android) android.setFullScreen(false);
     lastError = '';
     errorBox.hidden = true;
     splash.hidden = false;
@@ -168,6 +171,9 @@
         break;
       case 'pdfcraft:dirty':
         if (android) android.setDirty(!!msg.dirty);
+        break;
+      case 'pdfcraft:fullScreen':
+        if (android) android.setFullScreen(!!msg.on);
         break;
       case 'pdfcraft:failed':
         clearTimeout(watchdog);
@@ -407,7 +413,12 @@
     }
   }
 
-  window.shell = { incoming };
+  /** Android's Back in Full screen mode: leave it, as Esc does. */
+  function leaveFullScreen() {
+    if (frame.contentWindow) frame.contentWindow.postMessage({ type: 'pdfcraft:leaveFullScreen' }, origin);
+  }
+
+  window.shell = { incoming, leaveFullScreen };
   seedPhoneDefaults();
   start();
 })();

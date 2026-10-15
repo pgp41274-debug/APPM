@@ -70,6 +70,32 @@ function screenshot(name) {
   const r = adb(['exec-out', 'screencap', '-p'], { binary: true });
   if (r.code === 0 && r.out.length) fs.writeFileSync(path.join(out, name), r.out);
 }
+/** The screen's pixels, as RGBA rows (screencap's raw format). */
+function screenPixels() {
+  const r = adb(['exec-out', 'screencap'], { binary: true });
+  if (r.code !== 0 || r.out.length < 16) return null;
+  const width = r.out.readUInt32LE(0);
+  const height = r.out.readUInt32LE(4);
+  const header = r.out.length - width * height * 4;
+  return header >= 12 ? { width, height, rgba: r.out.subarray(header) } : null;
+}
+/** How far up (pixels) the column band [x0, x1) of `a` moved in `b`: the shift that lines them up. */
+function shiftUp(a, b, x0, x1, y0, y1) {
+  const diff = (shift) => {
+    let sum = 0;
+    let n = 0;
+    for (let y = y0; y + shift < y1; y += 3) {
+      for (let x = x0; x < x1; x += 6) {
+        sum += Math.abs(a.rgba[((y + shift) * a.width + x) * 4] - b.rgba[(y * b.width + x) * 4]);
+        n++;
+      }
+    }
+    return n ? sum / n : Infinity;
+  };
+  let best = 0;
+  for (let shift = 0; shift < (y1 - y0) * 0.9; shift += 3) if (diff(shift) < diff(best)) best = shift;
+  return { shift: best, unmoved: diff(0), fit: diff(best) };
+}
 const sha = (file) => (sh(`sha256sum ${file} 2>/dev/null`).split(/\s+/)[0] || '');
 const head = (file) => sh(`head -c 5 ${file} 2>/dev/null`);
 
@@ -108,16 +134,21 @@ function check(name, ok, detail = '') {
 }
 
 /** A small one-page PDF with `text` on it. */
-function makePdf(text) {
+function makePdf(text, pages = 1) {
+  // Objects: catalog, pages, font, then a page and its contents for each page.
+  const kids = Array.from({ length: pages }, (_, n) => `${4 + 2 * n} 0 R`).join(' ');
   const objs = [
     '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
-    null,
+    `<< /Type /Pages /Kids [${kids}] /Count ${pages} >>`,
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
   ];
-  const stream = `BT /F1 36 Tf 72 680 Td (${text}) Tj ET`;
-  objs[3] = `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`;
+  for (let n = 0; n < pages; n++) {
+    // A long document gets a line every 60 points, so a scrolled screen looks different.
+    const lines = pages === 1 ? `(${text}) Tj` : Array.from({ length: 11 }, (_, l) => `(${text} ${n + 1}.${l + 1}) Tj 0 -60 Td`).join(' ');
+    const stream = `BT /F1 36 Tf 72 680 Td ${lines} ET`;
+    objs.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents ${5 + 2 * n} 0 R /Resources << /Font << /F1 3 0 R >> >> >>`);
+    objs.push(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);
+  }
   let pdf = '%PDF-1.4\n';
   const offsets = [];
   objs.forEach((o, i) => {
@@ -132,9 +163,9 @@ function makePdf(text) {
 }
 
 /** Push a PDF to Download/ and return its MediaStore URI. */
-async function pushPdf(name, text) {
+async function pushPdf(name, text, pages = 1) {
   const local = path.join(out, name);
-  fs.writeFileSync(local, makePdf(text));
+  fs.writeFileSync(local, makePdf(text, pages));
   adb(['push', local, `${DL}/${name}`]);
   const id = await mediaId(name);
   if (!id) throw new Error(`MediaStore never listed ${name}`);
@@ -428,6 +459,43 @@ async function main() {
     themed ? 'the change reached the activity in place' : 'no configuration change reached the activity');
   sh('settings delete secure theme_customization_overlay_packages');
   await sleep(2000);
+
+  // 6b. Touch: a finger swiped up a long document scrolls it, and Full screen mode hides the
+  //     system bars until Back.
+  {
+    const longUri = await pushPdf('ci-long.pdf', 'Line', 8);
+    sh(`am start -W -a android.intent.action.VIEW -t application/pdf -d ${longUri} --grant-read-uri-permission -n ${MAIN}`);
+    check('a long PDF opens', await opened('ci-long.pdf'));
+    await sleep(3000);
+    const shot = screenPixels();
+    if (shot) {
+      const [x0, x1] = [Math.round(shot.width * 0.2), Math.round(shot.width * 0.7)];
+      const [y0, y1] = [Math.round(shot.height * 0.3), Math.round(shot.height * 0.85)];
+      sh(`input swipe ${Math.round(shot.width * 0.45)} ${Math.round(shot.height * 0.75)} ${Math.round(shot.width * 0.45)} ${Math.round(shot.height * 0.45)} 500`);
+      await sleep(3000); // The glide settles.
+      const moved = shiftUp(shot, screenPixels() || shot, x0, x1, y0, y1);
+      const swiped = Math.round(shot.height * 0.3);
+      check('a finger swiped up the page scrolls it', moved.unmoved > 1 && moved.shift >= swiped * 0.7,
+        `moved ${moved.shift} of ${swiped} px swiped (unmoved diff ${moved.unmoved.toFixed(1)}, best ${moved.fit.toFixed(1)})`);
+      screenshot('6b-swiped.png');
+    }
+    const clock = () => uiNodes().some((n) => /com\.android\.systemui:id\/clock$/.test(n.id));
+    const clockBefore = clock();
+    mark = logMark();
+    await palette('Full screen mode');
+    const full = await waitLog(/full screen true/, mark, 15000);
+    await sleep(1500);
+    const hidden = !(await until(() => clock(), 3000, 1000));
+    screenshot('6c-full-screen.png');
+    check('Full screen mode hides Android\'s status and navigation bars', full && clockBefore && hidden,
+      `${full ? 'reported' : 'not reported'}; clock ${clockBefore ? 'shown' : 'not found'} before, ${hidden ? 'hidden' : 'still shown'} after`);
+    mark = logMark();
+    sh('input keyevent KEYCODE_BACK');
+    const left = await waitLog(/full screen false/, mark, 15000);
+    const back = await until(() => clock(), 10000, 1000);
+    check('Back leaves Full screen mode and keeps PdfCraft open', left && back && /pdfcraft/.test(top()),
+      `${left ? 'left' : 'not left'}; clock ${back ? 'back' : 'missing'}; top ${top()}`);
+  }
 
   // 7. Android ends PdfCraft in the background: it starts again cleanly, and the file that started
   //    it is not opened a second time.

@@ -9,6 +9,7 @@ import android.content.res.AssetManager;
 import android.content.res.Configuration;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Message;
 import android.os.Process;
@@ -20,6 +21,7 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.webkit.ConsoleMessage;
 import android.webkit.JsResult;
 import android.webkit.MimeTypeMap;
@@ -109,6 +111,8 @@ public final class MainActivity extends ComponentActivity {
     /** A save is being written: the next job waits, as it may depend on where this one goes. */
     private boolean writing;
     private volatile boolean dirty;
+    /** PdfCraft shows the page alone (its Full screen mode): the system bars are hidden. */
+    private boolean fullScreen;
 
     private final ActivityResultLauncher<String[]> openOne = registerForActivityResult(
             new ActivityResultContracts.OpenDocument(), uri -> chosen(uri == null ? null : new Uri[] {uri}));
@@ -136,7 +140,10 @@ public final class MainActivity extends ComponentActivity {
         root = new FrameLayout(this);
         root.setBackgroundColor(ContextCompat.getColor(this, R.color.surface));
         ViewCompat.setOnApplyWindowInsetsListener(root, (v, insets) -> {
-            Insets i = insets.getInsets(WindowInsetsCompat.Type.systemBars()
+            // In Full screen mode the page takes the whole screen, cutouts too; bars swiped in
+            // for a moment lie over it.
+            Insets i = insets.getInsets(fullScreen ? WindowInsetsCompat.Type.ime()
+                    : WindowInsetsCompat.Type.systemBars()
                     | WindowInsetsCompat.Type.displayCutout()
                     | WindowInsetsCompat.Type.ime());
             v.setPadding(i.left, i.top, i.right, i.bottom);
@@ -147,6 +154,11 @@ public final class MainActivity extends ComponentActivity {
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
+                // Back first leaves Full screen mode, as Esc does on a computer.
+                if (fullScreen && web != null) {
+                    web.evaluateJavascript("window.shell && shell.leaveFullScreen()", null);
+                    return;
+                }
                 // Back leaves PdfCraft running with its documents open, as Home does: finishing
                 // the activity would throw away every open tab.
                 if (dirty) toast(getString(R.string.kept_running));
@@ -362,6 +374,7 @@ public final class MainActivity extends ComponentActivity {
                 web.destroy();
                 web = null;
                 dirty = false;
+                showFullScreen(false);
                 // What the dead page was sending can't be finished, and a picker it opened must
                 // hand its files to the next page instead.
                 files.abortAll();
@@ -817,6 +830,35 @@ public final class MainActivity extends ComponentActivity {
 
     void setDirty(boolean dirty) {
         this.dirty = dirty;
+    }
+
+    /** PdfCraft entered or left Full screen mode (from the bridge thread). */
+    void setFullScreen(boolean on) {
+        runOnUiThread(() -> showFullScreen(on));
+    }
+
+    /**
+     * Hide the status and navigation bars while PdfCraft shows the page alone. A swipe from an
+     * edge shows them for a moment; Back leaves Full screen mode. The browser build can't do this
+     * itself: eframe ignores its full-screen request on the web.
+     */
+    private void showFullScreen(boolean on) {
+        if (fullScreen == on || isDestroyed()) return;
+        fullScreen = on;
+        WindowManager.LayoutParams attrs = getWindow().getAttributes();
+        attrs.layoutInDisplayCutoutMode = !on ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+                : Build.VERSION.SDK_INT >= Build.VERSION_CODES.R ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        getWindow().setAttributes(attrs);
+        WindowInsetsControllerCompat bars = WindowCompat.getInsetsController(getWindow(), root);
+        if (on) {
+            bars.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            bars.hide(WindowInsetsCompat.Type.systemBars());
+        } else {
+            bars.show(WindowInsetsCompat.Type.systemBars());
+        }
+        Log.i(TAG, "full screen " + on);
+        ViewCompat.requestApplyInsets(root);
     }
 
     /** PdfCraft started in the page and is ready for files (from the bridge thread). */

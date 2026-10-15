@@ -101,6 +101,12 @@ final class ShellBridge {
         activity.setDirty(dirty);
     }
 
+    /** PdfCraft entered or left Full screen mode: hide or show the system bars. */
+    @JavascriptInterface
+    public void setFullScreen(boolean on) {
+        activity.setFullScreen(on);
+    }
+
     /** Open a web link in the browser. */
     @JavascriptInterface
     public void openExternal(String url) {

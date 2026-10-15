@@ -78,6 +78,7 @@ const mockBridge = () => {
     abortSave(id) { window.__calls.push(['abortSave', id]); },
     closed(id, doc) { window.__calls.push(['closed', id, doc]); },
     setDirty(d) { window.__calls.push(['setDirty', d]); },
+    setFullScreen(on) { window.__calls.push(['setFullScreen', on]); },
     openExternal(u) { window.__calls.push(['openExternal', u]); },
     beginPrint(name) { window.__print = { name, pages: [], done: false }; return 'p1'; },
     beginSheet(id, w, h, turned) { window.__print.pages.push({ w, h, turned, data: '' }); return true; },
@@ -532,6 +533,76 @@ try {
         shown.error && /WebGL 2/.test(shown.text) && shown.info.includes('test: no GPU yet') && seconds > 5,
         `${seconds.toFixed(1)} s, ${warned.length} warnings; ${shown.text} / ${shown.info.split('\n').pop()}`);
     }
+    await ctx.close();
+  }
+
+  // 9e. Touch, in a PdfCraft of its own with the 12-page showcase open: a finger dragged up the
+  // page scrolls it (with the Select tool, not a text selection), and Full screen mode reaches
+  // Android, which takes it back with Back.
+  {
+    const ctx = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+    await ctx.addInitScript(mockBridge);
+    incoming.set('f1', showcase); // /incoming/ hands a file out once.
+    const p = await ctx.newPage();
+    await p.goto(`${base}/app/shell/index.html`);
+    await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+    await p.waitForFunction(() => window.__opened.some((o) => o.id === 'f1'), null, { timeout: 30000 });
+    await sleep(3000);
+    const tbox = await p.frameLocator('#app').locator('canvas').boundingBox();
+    const x = tbox.x + tbox.width * 0.45;
+    // The page view's middle band, in screen pixels.
+    const band = async () => decodePng(await p.screenshot({ clip: { x: x - 60, y: tbox.y + tbox.height * 0.3, width: 120, height: tbox.height * 0.45 } }));
+    const before = await band();
+    const cdp = await ctx.newCDPSession(p);
+    const touch = (type, y) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [{ x, y }] });
+    const y0 = tbox.y + tbox.height * 0.75;
+    const travel = tbox.height * 0.4;
+    await touch('touchStart', y0);
+    for (let k = 1; k <= 20; k++) {
+      await touch('touchMove', y0 - (travel * k) / 20);
+      await sleep(16);
+    }
+    await touch('touchEnd', 0);
+    // Under software rendering each touch event waits for a ~200 ms frame, so this drag is far
+    // too slow to glide; the glide is covered by PdfCraft's own tests (canvas::touch_tests).
+    await sleep(2500);
+    const after = await band();
+    // How far the band moved up: the shift that best lines the two shots up.
+    const rowDiff = (shift) => {
+      let sum = 0;
+      let n = 0;
+      for (let y = 0; y + shift < before.height; y += 2) {
+        for (let xx = 0; xx < before.width; xx += 4) {
+          const a = ((y + shift) * before.width + xx) * 3;
+          const b = (y * after.width + xx) * 3;
+          sum += Math.abs(before.rgb[a] - after.rgb[b]);
+          n++;
+        }
+      }
+      return n ? sum / n : Infinity;
+    };
+    let best = 0;
+    for (let shift = 0; shift < before.height * 0.9; shift += 2) if (rowDiff(shift) < rowDiff(best)) best = shift;
+    const css = best / PHONE.scale;
+    const stillThere = rowDiff(0) < 0.5;
+    check('a finger dragged up the page scrolls it (Select tool)', !stillThere && css >= travel * 0.8,
+      `moved ${css.toFixed(0)} of ${travel.toFixed(0)} px dragged; unmoved diff ${rowDiff(0).toFixed(1)}, best ${rowDiff(best).toFixed(1)}`);
+    await p.screenshot({ path: path.join(shots, '8-touch-scrolled.png') });
+
+    await p.mouse.click(x, tbox.y + tbox.height * 0.6);
+    await p.keyboard.press('Control+k');
+    await sleep(600);
+    await p.keyboard.type('Full screen mode', { delay: 20 });
+    await sleep(600);
+    await p.keyboard.press('Enter');
+    await sleep(1500);
+    const on = await p.evaluate(() => window.__calls.filter((c) => c[0] === 'setFullScreen').map((c) => c[1]));
+    check('Full screen mode reaches Android (setFullScreen)', on.at(-1) === true, JSON.stringify(on));
+    await p.screenshot({ path: path.join(shots, '9-full-screen.png') });
+    await p.evaluate(() => window.shell.leaveFullScreen());
+    await sleep(1500);
+    const off = await p.evaluate(() => window.__calls.filter((c) => c[0] === 'setFullScreen').map((c) => c[1]));
+    check('Android\'s Back leaves Full screen mode', off.at(-1) === false && off.length === on.length + 1, JSON.stringify(off));
     await ctx.close();
   }
 } finally {
