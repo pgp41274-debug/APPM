@@ -458,15 +458,24 @@ async function main() {
   device = (await android.devices())[0];
   await attach();
   const again = await waitReady();
-  check('it starts again from the launcher', !again && (await waitLog(/PdfCraft ready/, mark, 10000)), again || '');
+  let retried = '';
+  if (again) {
+    // Whether the error lasts: Try again starts PdfCraft over in the same page and process.
+    await page.evaluate(() => document.getElementById('retry').click());
+    retried = (await waitReady()) ? '; Try again failed too' : '; Try again then worked';
+  }
+  check('it starts again from the launcher', !again && (await waitLog(/PdfCraft ready/, mark, 10000)),
+    again ? `${again} (${ours(mark).filter((l) => /WebGL/.test(l)).join(' | ')})${retried}` : '');
   await sleep(3000);
   check('... without opening the file that first started it again', !ours(mark).some((l) => /incoming f\d+: /.test(l)),
     ours(mark).filter((l) => /incoming/.test(l)).join(' | '));
-  await listen();
 
   // 8. The page's process dies (as when Android reclaims its memory): PdfCraft starts again in
   //    the same activity.
-  {
+  if (!app) {
+    check('when the page\'s process dies, PdfCraft starts again in the same app', false, 'not run: PdfCraft is not running');
+  } else {
+    await listen();
     const appPid = pidOf();
     mark = logMark();
     const cdp = await page.context().newCDPSession(page);

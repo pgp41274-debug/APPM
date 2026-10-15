@@ -19,10 +19,13 @@
   // Bytes per bridge call, a multiple of 3 so every slice's base64 decodes on its own. A file
   // is read and encoded a slice at a time: one big base64 string can cost the page its memory.
   const SLICE = 384 * 1024;
+  // Pauses between WebGL 2 checks at start-up, about 6 s in all before PdfCraft gives up.
+  const WEBGL_RETRY_MS = [250, 500, 750, 1000, 1500, 2000];
 
   let ready = false;
   let lastError = '';
   let watchdog = 0;
+  let starts = 0;
   let opening = Promise.resolve();
   let handing = Promise.resolve();
 
@@ -53,35 +56,59 @@
   }
 
   function start() {
+    const attempt = ++starts;
     ready = false;
     lastError = '';
     errorBox.hidden = true;
     splash.hidden = false;
-    if (!hasWebGL2()) {
-      fail("This phone's WebView can't draw with WebGL 2, which PdfCraft needs. Updating Android System WebView usually fixes it.");
-      return;
+    clearTimeout(watchdog);
+    probeWebGL2(attempt, 0);
+  }
+
+  /**
+   * WebGL can be missing for a moment in a WebView that has only just started (seen once on
+   * the emulator, a second after Android started PdfCraft again): ask again for a few seconds
+   * before saying this WebView can't run PdfCraft.
+   */
+  function probeWebGL2(attempt, tries) {
+    if (attempt !== starts) return; // Try again was pressed meanwhile.
+    const problem = webGL2Problem();
+    if (problem === null) {
+      load();
+    } else if (tries < WEBGL_RETRY_MS.length) {
+      console.warn(`WebGL 2 is not available yet (${problem}); asking again`);
+      setTimeout(() => probeWebGL2(attempt, tries + 1), WEBGL_RETRY_MS[tries]);
+    } else {
+      fail("This phone's WebView can't draw with WebGL 2, which PdfCraft needs. Updating Android System WebView usually fixes it.",
+        false, problem);
     }
+  }
+
+  function load() {
     frame.src = 'about:blank';
     frame.src = APP_URL;
-    clearTimeout(watchdog);
     watchdog = setTimeout(() => {
       if (!ready) fail(lastError || 'PdfCraft is taking unusually long to start.', true);
     }, STARTUP_TIMEOUT_MS);
   }
 
-  function hasWebGL2() {
+  /** Returns null when a WebGL 2 context can be made, or why it can't. */
+  function webGL2Problem() {
+    const canvas = document.createElement('canvas');
+    let reason = '';
+    canvas.addEventListener('webglcontextcreationerror', (e) => { reason = e.statusMessage || ''; });
     try {
-      const gl = document.createElement('canvas').getContext('webgl2');
-      if (!gl) return false;
+      const gl = canvas.getContext('webgl2');
+      if (!gl) return reason || 'no context';
       const lose = gl.getExtension('WEBGL_lose_context');
       if (lose) lose.loseContext();
-      return true;
+      return null;
     } catch (e) {
-      return false;
+      return String((e && e.message) || e);
     }
   }
 
-  function fail(message, stillLoading) {
+  function fail(message, stillLoading, detail) {
     document.getElementById('error-text').textContent = message;
     let info = navigator.userAgent;
     if (android) {
@@ -92,6 +119,10 @@
         // Keep the user agent.
       }
     }
+    if (detail) {
+      info += `\n${detail}`;
+      console.error(`${message} (${detail})`);
+    }
     document.getElementById('error-info').textContent = info;
     document.getElementById('wait').hidden = !stillLoading;
     document.getElementById('update').hidden = !android;
@@ -99,7 +130,7 @@
     errorBox.hidden = false;
   }
 
-  document.getElementById('retry').addEventListener('click', start);
+  document.getElementById('retry').addEventListener('click', () => start());
   document.getElementById('wait').addEventListener('click', () => {
     errorBox.hidden = true;
     splash.hidden = ready;

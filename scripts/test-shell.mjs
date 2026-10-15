@@ -493,6 +493,47 @@ try {
   check('no page errors', serious.length === 0, serious.slice(0, 5).join(' | '));
   const dpr = await app.evaluate(() => ({ dpr: devicePixelRatio, canvas: document.querySelector('canvas').width, css: innerWidth }));
   check('the canvas is drawn at the device resolution', Math.abs(dpr.canvas - dpr.css * dpr.dpr) < 2, JSON.stringify(dpr));
+
+  // 9d. WebGL 2 missing for a moment at start-up (a WebView that has only just started) is no
+  // error; missing for good is, with the reason Chromium gave on the error screen.
+  for (const misses of [2, 99]) {
+    const ctx = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+    await ctx.addInitScript(mockBridge);
+    await ctx.addInitScript((n) => {
+      if (window.top !== window) return; // Only the shell's check: PdfCraft's own context stays real.
+      const real = HTMLCanvasElement.prototype.getContext;
+      let left = n;
+      HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
+        if (type === 'webgl2' && left > 0) {
+          left--;
+          this.dispatchEvent(Object.assign(new Event('webglcontextcreationerror'), { statusMessage: 'test: no GPU yet' }));
+          return null;
+        }
+        return real.call(this, type, ...rest);
+      };
+    }, misses);
+    const p = await ctx.newPage();
+    const warned = [];
+    p.on('console', (m) => { if (/WebGL 2 is not available yet/.test(m.text())) warned.push(m.text()); });
+    const t0 = performance.now();
+    await p.goto(`${base}/app/shell/index.html`);
+    await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+    const seconds = (performance.now() - t0) / 1000;
+    const shown = await p.evaluate(() => ({
+      error: !document.getElementById('error').hidden,
+      text: document.getElementById('error-text').textContent,
+      info: document.getElementById('error-info').textContent,
+    }));
+    if (misses === 2) {
+      check('WebGL 2 missing for a moment at start-up is no error', !shown.error && warned.length === 2,
+        `${warned.length} warnings; ${shown.error ? shown.text : 'started'}`);
+    } else {
+      check('WebGL 2 missing for good shows the error, with the reason, after a few seconds',
+        shown.error && /WebGL 2/.test(shown.text) && shown.info.includes('test: no GPU yet') && seconds > 5,
+        `${seconds.toFixed(1)} s, ${warned.length} warnings; ${shown.text} / ${shown.info.split('\n').pop()}`);
+    }
+    await ctx.close();
+  }
 } finally {
   await browser.close();
 }
