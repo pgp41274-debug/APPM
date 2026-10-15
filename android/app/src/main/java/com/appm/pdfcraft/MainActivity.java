@@ -154,13 +154,21 @@ public final class MainActivity extends ComponentActivity {
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
-                // Back first leaves Full screen mode, as Esc does on a computer.
-                if (fullScreen && web != null) {
-                    web.evaluateJavascript("window.shell && shell.leaveFullScreen()", null);
+                if (web == null) {
+                    leave();
                     return;
                 }
-                // Back leaves PdfCraft running with its documents open, as Home does: finishing
-                // the activity would throw away every open tab.
+                // The page closes what is open first (a menu, a tool strip, full screen, a
+                // panel); only when nothing is does Back leave PdfCraft.
+                web.evaluateJavascript("(function(){var s=window.shell;if(s&&s.back)return s.back();"
+                        + "if(s&&" + fullScreen + "){s.leaveFullScreen();return true;}return false;})()", result -> {
+                    if (!"true".equals(result)) leave();
+                });
+            }
+
+            /** Back leaves PdfCraft running with its documents open, as Home does: finishing
+             *  the activity would throw away every open tab. */
+            private void leave() {
                 if (dirty) toast(getString(R.string.kept_running));
                 moveTaskToBack(true);
             }

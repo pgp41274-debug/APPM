@@ -335,6 +335,15 @@ async function main() {
   check('a PDF opened with PdfCraft from another app opens in it', rw && /^f\d+$/.test(rw.id), JSON.stringify(rw));
   await sleep(1500);
   screenshot('2-opened.png');
+  // A phone draws PdfCraft's controls itself (phone.js), around the page PdfCraft draws.
+  const phoneUi = await page.evaluate(() => {
+    const shown = (id) => { const e = document.getElementById(id); return !!e && !e.hidden && e.getBoundingClientRect().height > 0; };
+    return { phone: document.body.classList.contains('phone'), top: shown('topbar'), bottom: shown('bottombar'),
+      items: [...document.querySelectorAll('#bottombar .cat span')].map((x) => x.textContent).join('|'),
+      frame: Math.round(document.getElementById('app').getBoundingClientRect().height), height: window.innerHeight };
+  }).catch((e) => ({ error: String(e) }));
+  check('the phone controls show around the page (top bar, bottom bar)', phoneUi.phone && phoneUi.top && phoneUi.bottom
+    && phoneUi.items === 'Edit PDF|Comment|Highlight|Draw|Fill & Sign|More tools' && phoneUi.frame > phoneUi.height * 0.7, JSON.stringify(phoneUi));
   check('an edit is reported as unsaved work', await edit());
   mark = logMark();
   await focus();

@@ -59,6 +59,8 @@ fetch() { # fetch <url> <dir> <ref>
   fi
   git -C "$dir" fetch -q --depth 1 origin "$ref"
   git -C "$dir" checkout -q --force FETCH_HEAD
+  # Files a patch added last time would stop it applying again (ignored build output stays).
+  git -C "$dir" clean -fdq
 }
 
 from_source() {

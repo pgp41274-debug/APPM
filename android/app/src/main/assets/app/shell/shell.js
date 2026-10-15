@@ -14,7 +14,10 @@
   const splash = document.getElementById('splash');
   const errorBox = document.getElementById('error');
   const origin = location.origin;
-  const APP_URL = '../pdfcraft/index.html?host=parent';
+  // A phone draws PdfCraft's controls itself (phone.js), as phone PDF apps lay them out; a
+  // tablet has room for PdfCraft's own.
+  const PHONE = Math.min(screen.width, screen.height) < 600;
+  const APP_URL = `../pdfcraft/index.html?host=parent${PHONE ? '&chrome=host' : ''}`;
   // A slow phone compiles the 40 MB module for a while; only then say something is wrong.
   const STARTUP_TIMEOUT_MS = 45000;
   // Bytes per bridge call, a multiple of 3 so every slice's base64 decodes on its own. A file
@@ -418,7 +421,7 @@
     if (frame.contentWindow) frame.contentWindow.postMessage({ type: 'pdfcraft:leaveFullScreen' }, origin);
   }
 
-  window.shell = { incoming, leaveFullScreen };
+  window.shell = { incoming, leaveFullScreen, phone: PHONE };
   seedPhoneDefaults();
   start();
 })();

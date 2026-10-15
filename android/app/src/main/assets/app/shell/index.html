@@ -13,7 +13,7 @@
     html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg);
       font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
     #app { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; display: block; background: var(--bg); }
-    .overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    .overlay { position: fixed; inset: 0; z-index: 30; display: flex; flex-direction: column; align-items: center;
       justify-content: center; gap: 16px; padding: 24px; box-sizing: border-box; background: var(--bg); text-align: center; }
     .overlay[hidden] { display: none; }
     #splash img { width: 96px; height: 96px; }
@@ -32,6 +32,7 @@
     button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
     button[hidden] { display: none; }
   </style>
+  <link rel="stylesheet" href="phone.css">
 </head>
 <body>
   <iframe id="app" title="PdfCraft" allow="clipboard-read; clipboard-write; fullscreen"></iframe>
@@ -56,5 +57,6 @@
   </div>
 
   <script src="shell.js"></script>
+  <script src="phone.js"></script>
 </body>
 </html>

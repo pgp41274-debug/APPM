@@ -1,0 +1,511 @@
+--- a/apps/pdfcraft-web/src/main.rs
++++ b/apps/pdfcraft-web/src/main.rs
+@@ -66,7 +66,14 @@
+                         {
+                             app.comment_prefs.author = author.chars().take(200).collect();
+                         }
+-                        bridge.listen(app.host_inbox.clone(), app.host_leave_full_screen.clone(), cc.egui_ctx.clone());
++                        // `&chrome=host`: the page draws the controls (a phone's toolbars).
++                        if query_param("chrome").as_deref() == Some("host") {
++                            app.host_chrome = true;
++                            // No panel left open from last time: on a phone it covers the page.
++                            app.right = None;
++                            app.host_state = Some(bridge.state_fn());
++                        }
++                        bridge.listen(app.host_inbox.clone(), app.host_leave_full_screen.clone(), app.host_requests.clone(), cc.egui_ctx.clone());
+                         app.host_save = Some(bridge.save_fn());
+                         app.host_dirty = Some(bridge.dirty_fn());
+                         app.host_closed = Some(bridge.closed_fn());
+@@ -142,6 +149,15 @@
+ /// - `pdfcraft:fullScreen` (to the parent): `{ on }` whenever Full screen mode (the page alone)
+ ///   starts or ends; the browser build can't take the screen itself, the parent can.
+ /// - `pdfcraft:leaveFullScreen` (from the parent): leave Full screen mode, as Esc does.
++///
++/// With `&chrome=host` the parent draws the controls (a phone's toolbars) and PdfCraft only the
++/// page, its dialogs and the open panel:
++/// - `pdfcraft:state` (to the parent): `{ state }`, a JSON string of what the controls show
++///   (documents, page, tool, panel, Undo/Redo), whenever it changes.
++/// - `pdfcraft:command` (from the parent): `{ id }`, run a command as a menu would.
++/// - `pdfcraft:select`: back to the Select tool. `pdfcraft:panel`: `{ name }` shows a panel,
++///   no name closes it. `pdfcraft:activate`: `{ doc }` brings a tab to the front.
++///   `pdfcraft:gotoPage`: `{ page }` (1-based).
+ /// - `pdfcraft:failed` (to the parent): `{ error }` when the app couldn't start.
+ ///
+ /// Only the parent window on the app's own origin is heard or answered.
+@@ -195,6 +211,7 @@
+             &self,
+             inbox: pdfcraft_ui_egui::HostInbox,
+             leave_full_screen: std::sync::Arc<std::sync::atomic::AtomicBool>,
++            requests: pdfcraft_ui_egui::HostRequests,
+             ctx: egui::Context,
+         ) {
+             let parent = self.parent.clone();
+@@ -211,7 +228,25 @@
+                         ctx.request_repaint();
+                         return;
+                     }
+-                    _ => return,
++                    Some(kind) => {
++                        use pdfcraft_ui_egui::HostRequest;
++                        let request = match kind {
++                            "pdfcraft:command" => string(&data, "id").map(HostRequest::Command),
++                            "pdfcraft:select" => Some(HostRequest::Select),
++                            "pdfcraft:panel" => Some(HostRequest::Panel(string(&data, "name").filter(|n| !n.is_empty()))),
++                            "pdfcraft:activate" => number(&data, "doc").map(|d| HostRequest::Activate(d as u64)),
++                            "pdfcraft:gotoPage" => number(&data, "page").map(|p| HostRequest::GotoPage(p as usize)),
++                            _ => None,
++                        };
++                        if let Some(request) = request
++                            && let Ok(mut q) = requests.lock()
++                        {
++                            q.push(request);
++                            ctx.request_repaint();
++                        }
++                        return;
++                    }
++                    None => return,
+                 }
+                 let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "document.pdf".to_string());
+                 let id = string(&data, "id").filter(|i| !i.is_empty());
+@@ -265,6 +300,19 @@
+             })
+         }
+ 
++        pub fn state_fn(&self) -> pdfcraft_ui_egui::HostStateFn {
++            let bridge = self.clone();
++            let mut last = String::new();
++            Box::new(move |state: &str| {
++                if state != last {
++                    last = state.to_string();
++                    if let Some(m) = message(&[("type", "pdfcraft:state".into()), ("state", state.into())]) {
++                        let _ = bridge.post(&m, None);
++                    }
++                }
++            })
++        }
++
+         pub fn full_screen_fn(&self) -> pdfcraft_ui_egui::HostFullScreenFn {
+             let bridge = self.clone();
+             let mut last = false;
+@@ -300,6 +348,11 @@
+         Some(m)
+     }
+ 
++    /// A whole, non-negative number (a document or page number).
++    fn number(data: &JsValue, key: &str) -> Option<f64> {
++        js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?.as_f64().filter(|n| n.is_finite() && *n >= 0.0 && n.fract() == 0.0)
++    }
++
+     fn string(data: &JsValue, key: &str) -> Option<String> {
+         js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?.as_string()
+     }
+--- a/crates/ui-egui/src/canvas.rs
++++ b/crates/ui-egui/src/canvas.rs
+@@ -360,6 +360,9 @@
+     last_press_pos: Option<Pos2>,
+     last_queue: Vec<RenderRequest>,
+     viewport_w: f32,
++    /// Room kept beside the pages for the floating quick-action bar ([`SIDE`]); little on a
++    /// phone whose controls the host draws, which has no such bar.
++    pub(crate) side: f32,
+     viewport_h: f32,
+     page_count: usize,
+     /// Page heights in points (view space), for mapping text positions to scroll offsets.
+@@ -627,6 +630,7 @@
+             last_press_pos: None,
+             last_queue: Vec::new(),
+             viewport_w: 800.0,
++            side: SIDE,
+             viewport_h: 600.0,
+             page_count: info.pages.len(),
+             page_heights: info.pages.iter().map(|p| p.height).collect(),
+@@ -1047,7 +1051,7 @@
+         let point = |x: Option<f32>, y: Option<f32>| p.dest_fraction(x, y, self.rotation);
+         // The window's top-left as far as pages go: its left edge is the gutter that keeps them
+         // clear of the floating quick-action bar, so `left` 0 shows the page's edge beside it.
+-        let corner = vec2(SIDE, 0.0);
++        let corner = vec2(self.side, 0.0);
+         let (fx, fy, rel) = match dest {
+             DestView::Top => return,
+             DestView::Xyz { left, top, zoom } => {
+@@ -1682,7 +1686,7 @@
+         } else {
+             (max_w, largest(|s| s.1))
+         };
+-        let avail_w = (self.viewport_w - 2.0 * SIDE).max(100.0);
++        let avail_w = (self.viewport_w - 2.0 * self.side).max(100.0);
+         let per_row = if self.layout == PageLayout::TwoUp { 2.0 } else { 1.0 };
+         match self.fit {
+             Fit::Width => self.zoom = (avail_w - GAP * (per_row - 1.0)) / (w * PT * per_row),
+@@ -1704,7 +1708,7 @@
+         let shown = info.pages.iter().enumerate().filter(|&(i, _)| single.is_none_or(|c| c == i));
+         let max_w = shown.map(|(_, p)| self.display_size(p).0).fold(0.0, f32::max);
+         let per_row = if self.layout == PageLayout::TwoUp { 2.0 } else { 1.0 };
+-        (max_w * self.zoom * PT * per_row + 2.0 * SIDE).max(avail_w)
++        (max_w * self.zoom * PT * per_row + 2.0 * self.side).max(avail_w)
+     }
+ 
+     /// Page rects in content coordinates (origin at the scroll content's top-left).
+@@ -1717,7 +1721,7 @@
+                 for p in &info.pages {
+                     let (w, h) = self.display_size(p);
+                     let size = vec2(w * s, h * s);
+-                    rects.push(Rect::from_min_size(pos2(((content_w - size.x) / 2.0).max(SIDE), y), size));
++                    rects.push(Rect::from_min_size(pos2(((content_w - size.x) / 2.0).max(self.side), y), size));
+                     y += size.y + GAP;
+                 }
+             }
+@@ -1732,7 +1736,8 @@
+                     let sizes: Vec<Vec2> = pair.iter().map(|p| self.display_size(p)).map(|(w, h)| vec2(w * s, h * s)).collect();
+                     let row_w: f32 = sizes.iter().map(|v| v.x).sum::<f32>() + GAP * (sizes.len() as f32 - 1.0);
+                     let row_h = sizes.iter().map(|v| v.y).fold(0.0, f32::max);
+-                    let mut x = if self.cover && ri == 0 { (content_w / 2.0 + GAP / 2.0).max(SIDE) } else { ((content_w - row_w) / 2.0).max(SIDE) };
++                    let mut x =
++                        if self.cover && ri == 0 { (content_w / 2.0 + GAP / 2.0).max(self.side) } else { ((content_w - row_w) / 2.0).max(self.side) };
+                     for size in sizes {
+                         rects.push(Rect::from_min_size(pos2(x, y + (row_h - size.y) / 2.0), size));
+                         x += size.x + GAP;
+@@ -3448,7 +3453,9 @@
+     if let Some((name, action)) = app.views[index].forms.button.take() {
+         run_button(app, index, &name, action);
+     }
+-    quick_bar(app, avail, ui);
++    if !app.host_chrome {
++        quick_bar(app, avail, ui);
++    }
+     if let Some((source, file, destination)) = remote_open {
+         app.open_remote_link(source, file, destination);
+     }
+@@ -5365,13 +5372,13 @@
+ }
+ 
+ #[cfg(test)]
+-mod touch_tests {
++pub(crate) mod touch_tests {
+     use crate::PdfCraftApp;
+     use egui::{Event, PointerButton, TouchDeviceId, TouchId, TouchPhase, pos2};
+     use egui_kittest::Harness;
+ 
+     /// A PDF of `pages` Letter pages, each with a line of text.
+-    fn long_pdf(pages: usize) -> Vec<u8> {
++    pub(crate) fn long_pdf(pages: usize) -> Vec<u8> {
+         let mut objs = vec![
+             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+             format!("<< /Type /Pages /Kids [{}] /Count {pages} >>", (0..pages).map(|n| format!("{} 0 R", 4 + 2 * n)).collect::<Vec<_>>().join(" ")),
+--- a/crates/ui-egui/src/commands.rs
++++ b/crates/ui-egui/src/commands.rs
+@@ -274,7 +274,8 @@
+                 self.comment_prefs.group_tool[tool.group()] = tool;
+                 self.quick_tool = crate::QuickTool::Comment(tool);
+                 // Acrobat opens the Comments panel with the commenting tools, unless the user closed it.
+-                if self.right.is_none() && !self.comments_panel_closed {
++                // Not on a phone (the page draws the controls): the panel would cover the page.
++                if self.right.is_none() && !self.comments_panel_closed && !self.host_chrome {
+                     self.choose_right_panel(Some(RightPanel::Comments));
+                 }
+                 // A text selection made before picking a markup tool is marked right away.
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -81,6 +81,7 @@
+ pub mod folders_ui;
+ pub mod forms_ui;
+ mod home;
++mod host_chrome;
+ mod icon_data;
+ pub mod icons;
+ pub mod last_session;
+@@ -408,6 +409,29 @@
+ /// `ViewportCommand::Fullscreen` on the web).
+ pub type HostFullScreenFn = Box<dyn FnMut(bool)>;
+ 
++/// What a page that draws PdfCraft's controls itself (`?chrome=host`, see
++/// [`PdfCraftApp::host_chrome`]) asks for. Run at the start of the next frame.
++#[derive(Clone, Debug, PartialEq)]
++pub enum HostRequest {
++    /// Run a command by its id (`pdfcraft_engine::commands`), as a menu or the palette would.
++    Command(String),
++    /// Back to the Select tool (the page scrolls with a finger).
++    Select,
++    /// Show a panel (`"Comments"`, `"Bookmarks"`, `"Pages"`, ...) or, with `None`, close it.
++    Panel(Option<String>),
++    /// Bring the tab of this document number to the front.
++    Activate(u64),
++    /// Go to this page (1-based).
++    GotoPage(usize),
++}
++
++/// Requests from the embedding page, filled by the web bridge.
++pub type HostRequests = std::sync::Arc<std::sync::Mutex<Vec<HostRequest>>>;
++
++/// Told every frame what a page drawing its own controls needs (`?chrome=host`), as JSON:
++/// the open documents, the page, the tool, the open panel, and whether Undo and Redo apply.
++pub type HostStateFn = Box<dyn FnMut(&str)>;
++
+ pub struct PasswordPrompt {
+     pub name: String,
+     pub path: Option<String>,
+@@ -577,6 +601,14 @@
+     pub host_full_screen: Option<HostFullScreenFn>,
+     /// Set by the embedding page to leave Full screen mode (its Back button, on Android).
+     pub host_leave_full_screen: std::sync::Arc<std::sync::atomic::AtomicBool>,
++    /// The embedding page draws the controls (a phone's toolbars): PdfCraft shows the page, its
++    /// dialogs and, as a sheet from the bottom, the open panel; never its own tab strip,
++    /// toolbars, tool strip or rail.
++    pub host_chrome: bool,
++    /// What that page asked for (see [`HostRequest`]).
++    pub host_requests: HostRequests,
++    /// Reports what that page needs to draw its controls (see [`HostStateFn`]).
++    pub host_state: Option<HostStateFn>,
+     /// Files the embedding page sent (web, see [`HostInbox`]).
+     pub host_inbox: HostInbox,
+     /// The embedding page's id for each document opened from a file it sent ([`HostInbox`]).
+@@ -894,6 +926,9 @@
+             host_closed: None,
+             host_full_screen: None,
+             host_leave_full_screen: Default::default(),
++            host_chrome: false,
++            host_requests: Default::default(),
++            host_state: None,
+             host_inbox: Default::default(),
+             host_ids: Default::default(),
+             close_request: None,
+@@ -2620,6 +2655,13 @@
+         if let Some(report) = self.host_full_screen.as_mut() {
+             report(page_alone);
+         }
++        self.host_requests_tick();
++        if self.host_state.is_some() {
++            let state = self.host_state_json().to_string();
++            if let Some(report) = self.host_state.as_mut() {
++                report(&state);
++            }
++        }
+         self.poll_updates();
+         self.poll_print();
+         // Shortcuts deferred last frame: the text field has taken that frame's typing since.
+@@ -2693,6 +2735,10 @@
+             self.finish_render_frame(&ctx);
+             return;
+         }
++        if self.host_chrome {
++            self.host_chrome_ui(ui, &ctx);
++            return;
++        }
+         chrome::tab_strip(self, ui);
+         chrome::mode_bar(self, ui);
+         if self.active.is_some() {
+--- /dev/null
++++ b/crates/ui-egui/src/host_chrome.rs
+@@ -0,0 +1,212 @@
++//! A page that draws PdfCraft's controls itself (`?chrome=host`): a phone's toolbars, built by
++//! the embedding page around the canvas. PdfCraft shows the page, its dialogs, the command
++//! palette and, as a sheet from the bottom, the open panel. The page drives PdfCraft with
++//! [`HostRequest`]s and draws its controls from the state [`PdfCraftApp::host_state_json`]
++//! reports every frame.
++
++use crate::{HostRequest, PdfCraftApp, QuickTool, RightPanel, canvas, combine_ui, dialogs, palette, panels, theme, widgets};
++
++/// Room beside the pages when the host draws the controls (points).
++const HOST_SIDE: f32 = 8.0;
++
++/// The panels a host can open, by the names [`PdfCraftApp::host_state_json`] reports.
++const PANELS: [RightPanel; 7] = [
++    RightPanel::Comments,
++    RightPanel::Bookmarks,
++    RightPanel::Pages,
++    RightPanel::Fields,
++    RightPanel::Layers,
++    RightPanel::Attachments,
++    RightPanel::Signatures,
++];
++
++fn panel_named(name: &str) -> Option<RightPanel> {
++    PANELS.into_iter().find(|p| format!("{p:?}") == name)
++}
++
++/// The active tool as the command that picks it (`comment.highlight`, `sign.fill.text`, ...), so
++/// a host marks the button that ran it; `select` and `hand` for the two that have none.
++pub(crate) fn tool_id(tool: QuickTool) -> String {
++    match tool {
++        QuickTool::Select => "select".to_string(),
++        QuickTool::Hand => "hand".to_string(),
++        QuickTool::Comment(t) => t.command().to_string(),
++        QuickTool::Fill(f) => f.command().to_string(),
++        QuickTool::Field(f) => f.command().to_string(),
++        QuickTool::Measure(m) => format!("measure.{}", m.name()),
++        QuickTool::Crop => "page.crop".to_string(),
++        QuickTool::Redact => "redact.mark".to_string(),
++        QuickTool::AddText => "edit.text".to_string(),
++        QuickTool::EditText => "edit.edit_text".to_string(),
++        QuickTool::Link => "edit.link".to_string(),
++        QuickTool::MarqueeZoom => "view.marquee_zoom".to_string(),
++        QuickTool::Snapshot => "edit.snapshot".to_string(),
++        QuickTool::ColumnSelect => "edit.column_select".to_string(),
++        QuickTool::Stamp(_) | QuickTool::CustomStamp(_) => "comment.stamp".to_string(),
++        QuickTool::EnhanceCamera => "ocr.enhance_camera".to_string(),
++        QuickTool::SignArea { certify: false } => "sign.digital".to_string(),
++        QuickTool::SignArea { certify: true } => "sign.certify".to_string(),
++    }
++}
++
++impl PdfCraftApp {
++    /// Carry out what the host asked for since the last frame.
++    pub(crate) fn host_requests_tick(&mut self) {
++        let requests = self.host_requests.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
++        for request in requests {
++            match request {
++                HostRequest::Command(id) => self.run_command(&id),
++                HostRequest::Select => self.quick_tool = QuickTool::Select,
++                HostRequest::Panel(name) => {
++                    let panel = name.as_deref().and_then(panel_named);
++                    // A name PdfCraft doesn't know closes nothing and opens nothing.
++                    if name.is_none() || panel.is_some() {
++                        self.choose_right_panel(panel);
++                    }
++                }
++                HostRequest::Activate(doc) => {
++                    if let Some(i) = self.views.iter().position(|v| v.id.0 == doc) {
++                        self.active = Some(i);
++                    }
++                }
++                HostRequest::GotoPage(page) => {
++                    if let Some(i) = self.active
++                        && let Some(pages) = self.session.get(self.views[i].id).map(|d| d.info.pages.len())
++                        && pages > 0
++                    {
++                        self.views[i].goto = Some((page.clamp(1, pages) - 1, 0.0));
++                    }
++                }
++            }
++        }
++    }
++
++    /// What a host needs to draw its controls (see [`crate::HostStateFn`]).
++    pub(crate) fn host_state_json(&self) -> serde_json::Value {
++        use serde_json::json;
++        let docs: Vec<serde_json::Value> = self
++            .views
++            .iter()
++            .enumerate()
++            .filter_map(|(i, v)| {
++                let doc = self.session.get(v.id)?;
++                // The file's name, as phone apps show it; `title` is what the PDF asks a window to show.
++                Some(json!({ "doc": v.id.0, "name": doc.name, "title": doc.display_name(), "dirty": self.has_unsaved_work(i) }))
++            })
++            .collect();
++        let active = self.active.and_then(|i| self.views.get(i));
++        let pages = active.and_then(|v| self.session.get(v.id)).map_or(0, |d| d.info.pages.len());
++        let enabled = |id: &str| pdfcraft_engine::commands::command(id).is_some_and(|c| self.command_enabled(c));
++        json!({
++            "docs": docs,
++            "active": active.map(|v| v.id.0),
++            "page": active.map_or(0, |v| v.current.saturating_add(1).min(pages)),
++            "pages": pages,
++            "zoom": active.map_or(0, |v| (v.zoom * 100.0).round() as i64),
++            "continuous": active.is_some_and(|v| v.continuous),
++            "tool": tool_id(self.quick_tool),
++            "panel": self.right.filter(|p| PANELS.contains(p)).map(|p| format!("{p:?}")),
++            "undo": enabled("edit.undo"),
++            "redo": enabled("edit.redo"),
++            "save": enabled("file.save"),
++            "fullScreen": self.full_screen,
++            "busy": self.dialog.is_some() || self.palette_open,
++        })
++    }
++
++    /// The frame when the host draws the controls: the open panel as a sheet from the bottom,
++    /// the page above it, and what PdfCraft draws over the page.
++    pub(crate) fn host_chrome_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
++        let t = theme::Tokens::get(ctx);
++        // No floating quick-action bar to keep the pages clear of: a phone's width is the page's.
++        for view in &mut self.views {
++            view.side = HOST_SIDE;
++        }
++        if self.active.is_some() && self.right.is_some_and(|p| PANELS.contains(&p)) {
++            let height = ui.max_rect().height();
++            egui::Panel::bottom("host_panel")
++                .resizable(true)
++                .default_size(height * 0.45)
++                .size_range(120.0..=(height * 0.85).max(120.0))
++                .frame(egui::Frame::NONE.fill(t.panel).stroke(egui::Stroke::new(1.0, t.divider)))
++                .show(ui, |ui| panels::right_panel(self, ui));
++        }
++        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.pasteboard)).show(ui, |ui| match self.active {
++            Some(index) => canvas::document_area(self, index, ui),
++            None if self.combine_showing() => combine_ui::page(self, ui),
++            // The host shows its own start screen.
++            None => {}
++        });
++        self.process_pending_edits();
++        palette::show(self, ctx);
++        dialogs::show(self, ctx);
++        self.show_progress(ctx);
++        widgets::toast(self, ctx);
++        self.finish_render_frame(ctx);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use crate::{HostRequest, PdfCraftApp};
++    use egui_kittest::{Harness, kittest::Queryable};
++
++    fn phone(pages: usize) -> Harness<'static, PdfCraftApp> {
++        let mut h = Harness::builder().with_size(egui::vec2(412.0, 800.0)).build_eframe(move |_| {
++            let mut app = PdfCraftApp::new();
++            app.set_option("language", "en").unwrap();
++            app.host_chrome = true;
++            app.open_bytes("long.pdf", None, crate::canvas::touch_tests::long_pdf(pages)).unwrap();
++            app
++        });
++        h.run_steps(8);
++        h
++    }
++
++    fn ask(h: &mut Harness<'static, PdfCraftApp>, request: HostRequest) {
++        h.state().host_requests.lock().unwrap().push(request);
++        h.run_steps(4);
++    }
++
++    fn state(h: &Harness<'static, PdfCraftApp>) -> serde_json::Value {
++        h.state().host_state_json()
++    }
++
++    #[test]
++    fn the_host_draws_the_controls_and_pdfcraft_only_the_page() {
++        let h = phone(3);
++        // None of PdfCraft's own chrome: the tab strip's Open, the rail, the tool strip.
++        assert!(h.query_by_label("Open").is_none());
++        assert!(h.query_by_label("Comments").is_none());
++        assert!(h.query_by_label_contains("Zoom in").is_none());
++        let s = state(&h);
++        assert_eq!(s["pages"], 3);
++        assert_eq!(s["page"], 1);
++        assert_eq!(s["tool"], "select");
++        assert_eq!(s["docs"][0]["name"], "long.pdf");
++        assert_eq!(s["docs"][0]["doc"], s["active"]);
++        assert_eq!(s["undo"], false);
++    }
++
++    #[test]
++    fn host_requests_pick_tools_open_panels_and_turn_pages() {
++        let mut h = phone(3);
++        ask(&mut h, HostRequest::Command("comment.highlight".into()));
++        assert_eq!(state(&h)["tool"], "comment.highlight");
++        // Picking a comment tool on a phone opens no panel over the page.
++        assert!(state(&h)["panel"].is_null());
++        ask(&mut h, HostRequest::Select);
++        assert_eq!(state(&h)["tool"], "select");
++        ask(&mut h, HostRequest::Panel(Some("Pages".into())));
++        assert_eq!(state(&h)["panel"], "Pages");
++        ask(&mut h, HostRequest::Panel(Some("Nonsense".into())));
++        assert_eq!(state(&h)["panel"], "Pages");
++        ask(&mut h, HostRequest::Panel(None));
++        assert!(state(&h)["panel"].is_null());
++        ask(&mut h, HostRequest::GotoPage(3));
++        h.run_steps(8);
++        assert_eq!(state(&h)["page"], 3);
++        ask(&mut h, HostRequest::Command("page.rotate".into()));
++        assert_eq!(state(&h)["undo"], true);
++    }
++}

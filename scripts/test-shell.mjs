@@ -61,6 +61,11 @@ const mockBridge = () => {
     return;
   }
   window.__calls = [];
+  // What PdfCraft reports for a phone's controls (pdfcraft:state), latest first.
+  window.__state = null;
+  window.addEventListener('message', (e) => {
+    if (e.data && e.data.type === 'pdfcraft:state') window.__state = JSON.parse(e.data.state);
+  });
   window.__pending = [{ id: 'f1', name: 'showcase.pdf' }];
   window.__opened = [];
   window.__saves = [];
@@ -603,6 +608,118 @@ try {
     await sleep(1500);
     const off = await p.evaluate(() => window.__calls.filter((c) => c[0] === 'setFullScreen').map((c) => c[1]));
     check('Android\'s Back leaves Full screen mode', off.at(-1) === false && off.length === on.length + 1, JSON.stringify(off));
+    await ctx.close();
+  }
+
+  // 9f. The phone's controls (phone.js), laid out as phone PDF apps lay them out: PdfCraft draws
+  // the page; the page around it draws the controls from pdfcraft:state and drives PdfCraft.
+  {
+    const ctx = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+    await ctx.addInitScript(mockBridge);
+    incoming.set('f1', showcase);
+    const p = await ctx.newPage();
+    await p.goto(`${base}/app/shell/index.html`);
+    await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+    await p.waitForFunction(() => window.__state && window.__state.pages === 12, null, { timeout: 30000 }).catch(() => {});
+    const st = () => p.evaluate(() => window.__state);
+    const settle = (fn, ms = 8000) => p.waitForFunction(fn, null, { timeout: ms }).then(() => true, () => false);
+    const sheetRow = (text) => p.evaluate((t) => {
+      const r = [...document.querySelectorAll('#sheet .row, #sheet .action')].find((x) => x.textContent.trim() === t);
+      if (r) r.click();
+      return !!r;
+    }, text);
+    const app2 = p.frames().find((f) => f.url().includes('/app/pdfcraft/'));
+    check('a phone runs PdfCraft with the controls drawn around it (&chrome=host)', app2 && app2.url().includes('chrome=host'));
+    check('a file opened from Android shows at once (not the home screen)', await settle(() => !document.body.classList.contains('home')));
+    const frameBox = await p.locator('#app').boundingBox();
+    check('the page gets the room between the bars', frameBox.height > 700, `${frameBox.height.toFixed(0)} px tall`);
+    check('the bottom bar: Edit PDF, Comment, Highlight, Draw, Fill & Sign, More tools',
+      await p.evaluate(() => [...document.querySelectorAll('#bottombar .cat span')].map((x) => x.textContent).join('|')) === 'Edit PDF|Comment|Highlight|Draw|Fill & Sign|More tools');
+    await p.screenshot({ path: path.join(shots, 'phone-1-reading.png') });
+
+    // Highlight turns the tool on and shows Highlight, Underline, Strike out; ✓ goes back to Select.
+    await p.tap('#bottombar [data-item="highlight"]');
+    const picked = await settle(() => window.__state.tool === 'comment.highlight');
+    const marked = await p.evaluate(() => !!document.querySelector('#strip-tools [data-cmd="comment.highlight"].on'));
+    check('Highlight turns the tool on, and its strip shows it', picked && marked && !(await st()).panel,
+      JSON.stringify({ tool: (await st()).tool, marked, panel: (await st()).panel }));
+    await p.tap('#strip-tools [data-cmd="comment.underline"]');
+    check('... Underline in the strip switches to it', await settle(() => window.__state.tool === 'comment.underline'));
+    await p.screenshot({ path: path.join(shots, 'phone-2-highlight-tools.png') });
+    await p.tap('#strip-done');
+    check('✓ goes back to the Select tool and the bottom bar', await settle(() => window.__state.tool === 'select')
+      && await p.evaluate(() => !document.getElementById('bottombar').hidden));
+
+    // ⋮: the file's menu; Go to page… 7.
+    await p.tap('#more');
+    await settle(() => !document.getElementById('sheet').hidden);
+    const rows = await p.evaluate(() => [...document.querySelectorAll('#sheet .row .label')].map((r) => r.textContent));
+    const head = await p.evaluate(() => document.querySelector('#sheet .sheet-title').textContent);
+    check('⋮ shows the file\'s name and its menu', head === 'showcase.pdf'
+      && ['View settings', 'Pages', 'Bookmarks', 'Comment list', 'Go to page', 'Print', 'Close file'].every((r) => rows.includes(r)),
+    `${head}: ${rows.join(' | ')}`);
+    await p.screenshot({ path: path.join(shots, 'phone-3-file-menu.png') });
+    await sheetRow('Go to page');
+    await settle(() => !!document.querySelector('.goto input'));
+    await p.fill('.goto input', '7');
+    await p.keyboard.press('Enter');
+    const turned = await settle(() => window.__state.page === 7);
+    check('Go to page 7 turns to page 7, and the page number shows it', turned
+      && await settle(() => document.getElementById('pagepill').textContent === '7 / 12', 3000), `page ${(await st()).page}`);
+
+    // A tap on the page hides the bars; another brings them back.
+    const tapPage = async () => {
+      const b = await p.locator('#app').boundingBox();
+      await p.touchscreen.tap(b.x + b.width * 0.4, b.y + b.height * 0.5);
+    };
+    await tapPage();
+    const hid = await settle(() => document.body.classList.contains('immersive'), 4000);
+    await p.screenshot({ path: path.join(shots, 'phone-4-bars-hidden.png') });
+    await sleep(600);
+    await tapPage();
+    const back = await settle(() => !document.body.classList.contains('immersive'), 4000);
+    check('a tap on the page hides the bars, another brings them back', hid && back, JSON.stringify({ hid, back }));
+
+    // ⋮ ▸ Pages opens the thumbnails over the page; its bar closes them.
+    await p.tap('#more');
+    await settle(() => !document.getElementById('sheet').hidden);
+    await sheetRow('Pages');
+    const opened2 = await settle(() => window.__state.panel === 'Pages');
+    const bar = await p.evaluate(() => !document.getElementById('panelbar').hidden);
+    await p.screenshot({ path: path.join(shots, 'phone-5-pages.png') });
+    await p.tap('#panelbar button');
+    check('⋮ ▸ Pages opens the thumbnails over the page, and its bar closes them',
+      opened2 && bar && await settle(() => !window.__state.panel), JSON.stringify({ opened2, bar }));
+
+    // More tools: a grid; Rotate pages, then Undo.
+    await p.tap('#bottombar [data-item="tools"]');
+    await settle(() => !document.getElementById('sheet').hidden);
+    const tiles = await p.evaluate(() => [...document.querySelectorAll('#sheet .grid .action')].map((t) => t.textContent));
+    check('More tools shows the tools as a grid', ['Organize pages', 'Export PDF', 'Compress PDF', 'Set password', 'Rotate pages'].every((t) => tiles.includes(t)),
+      tiles.join(' | '));
+    await p.screenshot({ path: path.join(shots, 'phone-6-more-tools.png') });
+    await sheetRow('Rotate pages');
+    const canUndo = await settle(() => window.__state.undo === true);
+    const undoOn = await p.evaluate(() => !document.getElementById('undo').disabled);
+    await p.tap('#undo');
+    check('More tools ▸ Rotate pages makes Undo available, and Undo undoes it', canUndo && undoOn && await settle(() => window.__state.undo === false),
+      JSON.stringify({ canUndo, undoOn }));
+
+    // Android's Back: the menu first, then the file goes to the home screen, then Android.
+    await p.tap('#more');
+    await settle(() => !document.getElementById('sheet').hidden);
+    const b1 = await p.evaluate(() => window.shell.back());
+    const b2 = await p.evaluate(() => window.shell.back());
+    const atHome = await p.evaluate(() => document.body.classList.contains('home'));
+    const b3 = await p.evaluate(() => window.shell.back());
+    check('Back closes the menu, then shows the home screen, then leaves the rest to Android',
+      b1 === true && b2 === true && atHome && b3 === false, JSON.stringify({ b1, b2, atHome, b3 }));
+    const files = await p.evaluate(() => [...document.querySelectorAll('#home .file-name')].map((r) => r.textContent));
+    check('the home screen lists the open file', files.length === 1 && files[0] === 'showcase.pdf', JSON.stringify(files));
+    await p.waitForTimeout(500); // the tiles' icons load when home first shows
+    await p.screenshot({ path: path.join(shots, 'phone-7-home.png') });
+    await p.tap('#home .file-open');
+    check('... and a tap on it shows it again', await settle(() => !document.body.classList.contains('home')));
     await ctx.close();
   }
 } finally {
