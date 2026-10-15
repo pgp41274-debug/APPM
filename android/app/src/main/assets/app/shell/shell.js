@@ -167,6 +167,10 @@
           doc: Number.isInteger(msg.doc) ? String(msg.doc) : '',
         });
         break;
+      case 'pdfcraft:share':
+        // Share (phone.js): the document as Save would write it, for Android's share sheet.
+        hand(msg.name, new Blob([msg.bytes], { type: 'application/pdf' }), false, 'share');
+        break;
       case 'pdfcraft:closed':
         // A tab closed (or a file Android sent never became a document): Android lets go of
         // the file it saved to, once the saves sent before this are written.
@@ -421,7 +425,13 @@
     if (frame.contentWindow) frame.contentWindow.postMessage({ type: 'pdfcraft:leaveFullScreen' }, origin);
   }
 
-  window.shell = { incoming, leaveFullScreen, phone: PHONE };
+  /** Put text on the clipboard: Android's, or the browser's outside the app. */
+  function copyText(text) {
+    if (android && android.copyText) android.copyText(String(text));
+    else if (navigator.clipboard) navigator.clipboard.writeText(String(text)).catch(() => {});
+  }
+
+  window.shell = { incoming, leaveFullScreen, copyText, phone: PHONE };
   seedPhoneDefaults();
   start();
 })();

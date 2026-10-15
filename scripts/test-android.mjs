@@ -143,8 +143,11 @@ function makePdf(text, pages = 1) {
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
   ];
   for (let n = 0; n < pages; n++) {
-    // A long document gets a line every 60 points, so a scrolled screen looks different.
-    const lines = pages === 1 ? `(${text}) Tj` : Array.from({ length: 11 }, (_, l) => `(${text} ${n + 1}.${l + 1}) Tj 0 -60 Td`).join(' ');
+    // A long document gets a line every 60 points, so a scrolled screen looks different. Each
+    // line has its own length: evenly spaced lines alike would let a shift of a line or two
+    // look as good a match as the real one.
+    const tail = (l) => '#'.repeat((l * 5 + n * 3) % 9);
+    const lines = pages === 1 ? `(${text}) Tj` : Array.from({ length: 11 }, (_, l) => `(${text} ${n + 1}.${l + 1} ${tail(l)}) Tj 0 -60 Td`).join(' ');
     const stream = `BT /F1 36 Tf 72 680 Td ${lines} ET`;
     objs.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents ${5 + 2 * n} 0 R /Resources << /Font << /F1 3 0 R >> >> >>`);
     objs.push(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);

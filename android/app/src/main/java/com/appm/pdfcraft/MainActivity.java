@@ -2,6 +2,8 @@ package com.appm.pdfcraft;
 
 import android.annotation.SuppressLint;
 import android.content.ActivityNotFoundException;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -45,6 +47,7 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
 import androidx.core.content.IntentCompat;
 import androidx.core.graphics.Insets;
 import androidx.core.os.BundleCompat;
@@ -897,6 +900,53 @@ public final class MainActivity extends ComponentActivity {
                 startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=" + pkg)));
             } catch (ActivityNotFoundException e) {
                 openExternal(Uri.parse("https://play.google.com/store/apps/details?id=" + pkg));
+            }
+        });
+    }
+
+    /**
+     * Offer {@code job}'s bytes to other apps through the share sheet: a read-only copy in the
+     * cache (an earlier share's copy is deleted), named as the document is.
+     */
+    void share(FileStore.SaveJob job) {
+        runOnUiThread(() -> {
+            File dir = new File(getCacheDir(), "shared");
+            File[] old = dir.listFiles();
+            if (old != null) {
+                for (File f : old) {
+                    //noinspection ResultOfMethodCallIgnored
+                    f.delete();
+                }
+            }
+            File copy = new File(dir, job.name.toLowerCase(Locale.ROOT).endsWith(".pdf") ? job.name : job.name + ".pdf");
+            if ((!dir.isDirectory() && !dir.mkdirs()) || !job.file.renameTo(copy)) {
+                //noinspection ResultOfMethodCallIgnored
+                job.file.delete();
+                toast("Couldn't share " + job.name);
+                return;
+            }
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".share", copy);
+            Intent send = new Intent(Intent.ACTION_SEND)
+                    .setType("application/pdf")
+                    .putExtra(Intent.EXTRA_STREAM, uri)
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            send.setClipData(ClipData.newRawUri(copy.getName(), uri));
+            try {
+                startActivity(Intent.createChooser(send, null));
+            } catch (ActivityNotFoundException e) {
+                toast("No app to share " + copy.getName() + " with");
+            }
+        });
+    }
+
+    void copyText(String text) {
+        runOnUiThread(() -> {
+            ClipboardManager clipboard = getSystemService(ClipboardManager.class);
+            if (clipboard == null) return;
+            clipboard.setPrimaryClip(ClipData.newPlainText("PDF text", text));
+            // Android 13 and later show what was copied themselves.
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                Toast.makeText(getApplicationContext(), "Copied", Toast.LENGTH_SHORT).show();
             }
         });
     }

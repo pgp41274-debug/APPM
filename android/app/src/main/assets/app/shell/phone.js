@@ -2,15 +2,17 @@
 //
 // PdfCraft runs with `&chrome=host` (shell.js) and draws only the page, its dialogs and the
 // open panel; this page draws the controls around it, from the state PdfCraft reports
-// (pdfcraft:state), and drives it with pdfcraft:command, :select, :panel, :activate and
-// :gotoPage (apps/pdfcraft-web/src/main.rs in PdfCraft, patch 0007).
+// (pdfcraft:state), and drives it with the host messages of apps/pdfcraft-web/src/main.rs in
+// PdfCraft (patches 0007 and 0008).
 //
-//   home:   what to do (open, create) and the open files
-//   top:    ← home · Undo · Find · ⋮ (the file: view settings, panels, print, save, ...)
-//   bottom: Edit PDF ▾ · Comment ▾ · Highlight ▾ · Draw · Fill & Sign ▾ · More tools
-//           a ▾ item shows its tools in a strip, with ✓ to finish; More tools is a grid
-//   page:   a tap hides the bars and another brings them back; the page number shows a while
-//           after the page changes, and goes to a page when tapped
+//   home:    what to do (open, create) and the open files
+//   reading: top    ← home · Undo (Redo) · Search · Share · ⋮ (the file: view settings, panels, ...)
+//            bottom Edit PDF · Comment · Highlight · Draw · Fill & Sign · More tools
+//            a tap on the page hides the bars; a finger held on a word selects it, with handles
+//            to widen it and a card of what to do with it
+//   a mode:  Edit PDF, Comment, Highlight, Draw or Fill & Sign: ✓ (done) at the top left, the
+//            mode's tools along the bottom with its colour (and thickness), a hint on the page
+//   search:  the top bar turns into the search box
 (() => {
   'use strict';
 
@@ -22,50 +24,81 @@
 
   // ---- what the controls do ----
 
-  // A tool (`cmd`) stays on until Done or another tool; `panel` opens PdfCraft's panel of that
-  // name over the page. `pick`: the tool the item turns on as it opens its strip.
-  const BOTTOM = [
-    { id: 'edit', label: 'Edit PDF', icon: 'file-pen-line', more: true, tools: [
-      { cmd: 'edit.edit_text', label: 'Edit text', icon: 'file-pen-line' },
+  // A mode's tools. `cmd` picks a tool (it stays on until another tool or Done), `run` does
+  // something once, `toggle` switches a view on and off.
+  const SHAPES = ['comment.square', 'comment.circle', 'comment.line', 'comment.arrow', 'comment.ink'];
+  const MODES = {
+    edit: { label: 'Edit PDF', enter: 'edit.edit_text', named: true, tools: [
+      { toggle: 'page.organize', on: (s) => s.organize, label: 'Organize pages', icon: 'files' },
       { cmd: 'edit.text', label: 'Add text', icon: 'type' },
-      { cmd: 'edit.image', label: 'Add image', icon: 'image-plus' },
-      { cmd: 'edit.link', label: 'Link', icon: 'link' },
-      { cmd: 'page.crop', label: 'Crop', icon: 'crop' },
-      { cmd: 'redact.mark', label: 'Redact', icon: 'square-dashed' },
-      { cmd: 'edit.watermark', label: 'Watermark', icon: 'droplet' },
-      { cmd: 'edit.header_footer', label: 'Header', icon: 'heading' },
+      { run: 'edit.image', label: 'Add image', icon: 'image-plus' },
     ] },
-    { id: 'comment', label: 'Comment', icon: 'message-square-plus', more: true, tools: [
-      { cmd: 'comment.note', label: 'Note', icon: 'sticky-note' },
-      { cmd: 'comment.freetext', label: 'Text', icon: 'type' },
+    comment: { label: 'Comment', enter: 'comment.note', tools: [
+      { cmd: 'comment.note', label: 'Sticky note', icon: 'message-square' },
+      { cmd: 'comment.freetext', label: 'Text box', icon: 'type' },
       { cmd: 'comment.square', label: 'Rectangle', icon: 'square' },
       { cmd: 'comment.circle', label: 'Oval', icon: 'circle' },
       { cmd: 'comment.line', label: 'Line', icon: 'minus' },
       { cmd: 'comment.arrow', label: 'Arrow', icon: 'arrow-up-right' },
       { cmd: 'comment.stamp', label: 'Stamp', icon: 'stamp' },
-      { panel: 'Comments', label: 'All comments', icon: 'messages-square' },
     ] },
-    { id: 'highlight', label: 'Highlight', icon: 'highlighter', more: true, pick: 'comment.highlight', tools: [
+    highlight: { label: 'Highlight', enter: 'comment.highlight', tools: [
       { cmd: 'comment.highlight', label: 'Highlight', icon: 'highlighter' },
       { cmd: 'comment.underline', label: 'Underline', icon: 'underline' },
       { cmd: 'comment.strikeout', label: 'Strike out', icon: 'strikethrough' },
     ] },
-    { id: 'draw', label: 'Draw', icon: 'pencil', pick: 'comment.ink', tools: [
-      { cmd: 'comment.ink', label: 'Draw', icon: 'pencil' },
+    draw: { label: 'Draw', enter: 'comment.ink', tools: [
+      { cmd: 'comment.ink', label: 'Pen', icon: 'pencil' },
       { cmd: 'comment.eraser', label: 'Eraser', icon: 'eraser' },
     ] },
-    { id: 'sign', label: 'Fill & Sign', icon: 'signature', more: true, tools: [
-      { cmd: 'sign.fill.signature', label: 'Sign', icon: 'signature' },
+    sign: { label: 'Fill & Sign', enter: 'sign.fill.text', tools: [
       { cmd: 'sign.fill.text', label: 'Text', icon: 'type' },
-      { cmd: 'sign.fill.check', label: 'Check', icon: 'check' },
       { cmd: 'sign.fill.cross', label: 'Cross', icon: 'x' },
+      { cmd: 'sign.fill.check', label: 'Check', icon: 'check' },
       { cmd: 'sign.fill.dot', label: 'Dot', icon: 'circle-dot' },
+      { cmd: 'sign.fill.line', label: 'Line', icon: 'minus' },
       { cmd: 'sign.fill.date', label: 'Date', icon: 'clock' },
+      { cmd: 'sign.fill.signature', label: 'Sign', icon: 'signature', gap: true },
       { cmd: 'sign.fill.initials', label: 'Initials', icon: 'pen-tool' },
-      { panel: 'Fields', label: 'Form fields', icon: 'text-cursor-input' },
     ] },
-    { id: 'tools', label: 'More tools', icon: 'layout-grid', run: () => toolsSheet() },
+  };
+
+  const BOTTOM = [
+    { mode: 'edit', icon: 'file-pen-line' },
+    { mode: 'comment', icon: 'message-square-plus' },
+    { mode: 'highlight', icon: 'highlighter' },
+    { mode: 'draw', icon: 'pencil' },
+    { mode: 'sign', icon: 'signature' },
+    { label: 'More tools', icon: 'layout-grid', run: () => toolsSheet() },
   ];
+
+  // Shown on the page as a tool comes on.
+  const HINTS = {
+    'comment.highlight': 'Drag over text to highlight',
+    'comment.underline': 'Drag over text to underline',
+    'comment.strikeout': 'Drag over text to strike it out',
+    'comment.ink': 'Drag to draw and use two fingers to scroll',
+    'comment.eraser': 'Drag over a drawing to erase it',
+    'comment.note': 'Tap to pin your comment',
+    'comment.freetext': 'Tap where the text goes',
+    'comment.square': 'Drag to draw a rectangle',
+    'comment.circle': 'Drag to draw an oval',
+    'comment.line': 'Drag to draw a line',
+    'comment.arrow': 'Drag to draw an arrow',
+    'comment.stamp': 'Tap to place the stamp',
+    'sign.fill.text': 'Tap where the text goes',
+    'sign.fill.cross': 'Tap to place a cross',
+    'sign.fill.check': 'Tap to place a check mark',
+    'sign.fill.dot': 'Tap to place a dot',
+    'sign.fill.line': 'Drag to draw a line',
+    'sign.fill.date': 'Tap to add the date',
+    'sign.fill.signature': 'Tap where you sign',
+    'sign.fill.initials': 'Tap where your initials go',
+    'edit.edit_text': 'Tap text or an image to edit it',
+    'edit.text': 'Tap where the new text goes',
+  };
+
+  const SWATCHES = ['#000000', '#e53935', '#fb8c00', '#ffd400', '#43a047', '#1e88e5', '#8e24aa', '#ec407a'];
 
   // More tools: a grid of tiles, each tinted with its own colour.
   const TILES = [
@@ -83,7 +116,8 @@
     { label: 'Number pages', icon: 'hash', cmd: 'page.number', hue: 60 },
     { label: 'Create PDF', icon: 'image-plus', cmd: 'create.images', hue: 350 },
     { label: 'Redact', icon: 'square-dashed', cmd: 'redact.mark', hue: 300 },
-    { label: 'Watermark', icon: 'droplet', cmd: 'edit.watermark', hue: 200 },
+    { label: 'Add a link', icon: 'link', cmd: 'edit.link', hue: 200 },
+    { label: 'Watermark', icon: 'droplet', cmd: 'edit.watermark', hue: 175 },
     { label: 'All commands', icon: 'search', cmd: 'view.palette', hue: 270 },
   ];
 
@@ -95,24 +129,25 @@
     { label: 'Web page (HTML)', icon: 'file-text', cmd: 'export.html' },
   ];
 
-  const VIEW = [
-    { label: 'Continuous scrolling', icon: 'rows-3', cmd: 'view.continuous', on: (s) => s.continuous },
-    { label: 'Single page', icon: 'file-text', cmd: 'view.layout.single' },
-    { label: 'Two pages side by side', icon: 'columns-2', cmd: 'view.layout.two_up' },
-    { label: 'Fit width', icon: 'arrow-left-right', cmd: 'view.fit_width_scrolling' },
-    { label: 'Fit page', icon: 'minimize-2', cmd: 'view.fit_one_page' },
-    { label: 'Full screen', icon: 'maximize', cmd: 'view.full_screen' },
-  ];
-
   const PANEL_NAMES = { Comments: 'Comments', Bookmarks: 'Bookmarks', Pages: 'Pages', Fields: 'Form fields',
     Layers: 'Layers', Attachments: 'Attachments', Signatures: 'Signatures' };
 
+  const COMPOSER_HINTS = { note: 'Add a comment', textbox: 'Type text', callout: 'Type text', insert: 'Text to insert',
+    replace: 'Replacement text', edit: 'Edit comment' };
+
   let state = null;
-  let strip = null; // the bottom item whose tools show in the strip
+  let mode = null; // the mode whose tools show along the bottom
+  let modeTool = null; // the tool last picked in it
+  let searching = false;
   let immersive = false;
   let home = true; // the home screen, over the open files
   let lastPage = 0;
+  let lastTool = 'select';
   let pillTimer = 0;
+  let hintTimer = 0;
+  let repickAt = 0;
+  let dragging = null; // the selection handle being dragged
+  let toldUneditable = false; // Edit PDF said this file's text can't be edited
 
   // ---- talking to PdfCraft ----
 
@@ -135,7 +170,8 @@
   // A PdfCraft starting over (Try again, a crashed page) reports afresh.
   frame.addEventListener('load', () => {
     state = null;
-    closeStrip(false);
+    endMode(false);
+    closeSearch(false);
     closeSheet();
     setImmersive(false);
     watchTaps();
@@ -159,23 +195,65 @@
     i.style.setProperty('--icon', `url("../icons/${name}.svg")`);
     return i;
   };
+  const iconButton = (id, label, name, onclick) => el('button', { class: 'icon-btn', id, 'aria-label': label, title: label, onclick }, icon(name));
 
-  const undoBtn = el('button', { class: 'icon-btn', id: 'undo', 'aria-label': 'Undo', onclick: () => command('edit.undo') }, icon('undo-2'));
-  const topbar = el('header', { id: 'topbar', class: 'pbar' },
-    el('button', { class: 'icon-btn', id: 'back', 'aria-label': 'Home', onclick: () => showHome(true) }, icon('chevron-left')),
+  // Reading: ← home, then what applies to the whole file.
+  const undoBtn = iconButton('undo', 'Undo', 'undo-2', () => command('edit.undo'));
+  const redoBtn = iconButton('redo', 'Redo', 'redo-2', () => command('edit.redo'));
+  const topbar = el('header', { id: 'topbar', class: 'pbar topbar' },
+    iconButton('back', 'Home', 'chevron-left', () => showHome(true)),
     el('div', { class: 'spacer' }),
-    undoBtn,
-    el('button', { class: 'icon-btn', id: 'find', 'aria-label': 'Find', onclick: () => command('edit.find') }, icon('search')),
-    el('button', { class: 'icon-btn', id: 'more', 'aria-label': 'More', onclick: () => fileSheet() }, icon('ellipsis-vertical')));
+    undoBtn, redoBtn,
+    iconButton('find', 'Search', 'search', () => openSearch()),
+    iconButton('share', 'Share', 'share-2', () => post('pdfcraft:share')),
+    iconButton('more', 'More', 'ellipsis-vertical', () => fileSheet()));
+
+  // A mode: ✓ ends it; Undo and Redo stay at hand.
+  const modeTitle = el('span', { class: 'mode-title' });
+  const modeUndo = iconButton('mode-undo', 'Undo', 'undo-2', () => command('edit.undo'));
+  const modeRedo = iconButton('mode-redo', 'Redo', 'redo-2', () => command('edit.redo'));
+  const modebar = el('header', { id: 'modebar', class: 'pbar topbar', hidden: true },
+    iconButton('done', 'Done', 'check', () => endMode()),
+    modeTitle, el('div', { class: 'spacer' }), modeUndo, modeRedo);
+
+  // Search: the box, how many matches, and the way between them.
+  const findInput = el('input', { id: 'find-input', type: 'search', placeholder: 'Find in document', 'aria-label': 'Find in document',
+    enterkeyhint: 'search', autocomplete: 'off', spellcheck: 'false' });
+  const findCount = el('span', { id: 'find-count', 'aria-live': 'polite' });
+  const searchbar = el('header', { id: 'searchbar', class: 'pbar topbar', hidden: true },
+    iconButton('find-close', 'Close search', 'chevron-left', () => closeSearch()),
+    findInput, findCount,
+    iconButton('find-clear', 'Clear', 'x', () => { findInput.value = ''; post('pdfcraft:find', { query: '' }); findInput.focus(); }),
+    iconButton('find-prev', 'Previous match', 'chevron-up', () => post('pdfcraft:findStep', { forward: false })),
+    iconButton('find-next', 'Next match', 'chevron-down', () => post('pdfcraft:findStep', { forward: true })));
+  let findTimer = 0;
+  findInput.addEventListener('input', () => {
+    clearTimeout(findTimer);
+    findTimer = setTimeout(() => post('pdfcraft:find', { query: findInput.value }), 250);
+  });
+  findInput.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    clearTimeout(findTimer);
+    if (state && state.find && state.find.query === findInput.value) post('pdfcraft:findStep', { forward: !e.shiftKey });
+    else post('pdfcraft:find', { query: findInput.value });
+  });
 
   const bottombar = el('nav', { id: 'bottombar', class: 'pbar' },
-    ...BOTTOM.map((b) => el('button', { class: `cat${b.more ? ' more' : ''}`, 'data-item': b.id, onclick: () => pressBottom(b) },
-      icon(b.icon), el('span', {}, b.label))));
+    ...BOTTOM.map((b) => {
+      const m = b.mode && MODES[b.mode];
+      return el('button', { class: 'cat', 'data-item': b.mode || 'tools', onclick: () => (m ? startMode(b.mode) : b.run()) },
+        icon(b.icon), el('span', {}, m ? m.label : b.label));
+    }));
 
-  const stripTools = el('div', { id: 'strip-tools' });
-  const toolstrip = el('div', { id: 'toolstrip', class: 'pbar', hidden: true },
-    el('button', { id: 'strip-done', 'aria-label': 'Done', onclick: () => closeStrip() }, icon('check')),
-    stripTools);
+  // A mode's tools, then its colour and thickness.
+  const modeTools = el('div', { id: 'mode-tools' });
+  const widthBtn = el('button', { class: 'tool-btn', id: 'width', 'aria-label': 'Thickness', title: 'Thickness', onclick: () => styleSheet() },
+    el('span', { class: 'width-lines' }, el('i'), el('i'), el('i')));
+  const colorBtn = el('button', { class: 'tool-btn', id: 'color', 'aria-label': 'Colour', title: 'Colour', onclick: () => styleSheet() },
+    el('span', { class: 'dot' }));
+  const styleTools = el('div', { id: 'style-tools' }, el('span', { class: 'divider' }), widthBtn, colorBtn);
+  const toolbar = el('nav', { id: 'toolbar', class: 'pbar', hidden: true }, modeTools, styleTools);
 
   const panelName = el('span', {});
   const panelbar = el('div', { id: 'panelbar', class: 'pbar', hidden: true },
@@ -183,6 +261,42 @@
     el('button', { class: 'icon-btn', 'aria-label': 'Close', onclick: () => panel(null) }, icon('chevron-down')));
 
   const pill = el('button', { id: 'pagepill', hidden: true, onclick: () => gotoSheet() });
+  const hint = el('div', { id: 'hint', role: 'status', hidden: true });
+
+  // The comment being written: PdfCraft pinned it, this box writes it.
+  const composerText = el('textarea', { id: 'composer-text', rows: '1', 'aria-label': 'Comment' });
+  const composerSend = iconButton('composer-send', 'Post', 'send', () => finishComposer(true));
+  const composer = el('div', { id: 'composer', hidden: true },
+    iconButton('composer-cancel', 'Cancel', 'x', () => finishComposer(false)),
+    composerText, composerSend);
+  composerText.addEventListener('input', () => {
+    post('pdfcraft:composerText', { text: composerText.value });
+    composerSend.disabled = !composerText.value.trim() && composer.dataset.kind !== 'edit';
+    composerText.style.height = 'auto';
+    composerText.style.height = `${Math.min(composerText.scrollHeight, 140)}px`;
+  });
+
+  // A text selection: a handle at each end, and a card of what to do with it.
+  const selCard = el('div', { id: 'selcard', role: 'menu', hidden: true },
+    el('div', { class: 'sel-icons' },
+      selButton('sel-note', 'Comment', 'message-square', 'note'),
+      selButton('sel-highlight', 'Highlight', 'highlighter', 'highlight'),
+      selButton('sel-underline', 'Underline', 'underline', 'underline'),
+      selButton('sel-strikeout', 'Strike out', 'strikethrough', 'strikeout')),
+    el('button', { class: 'sel-row', id: 'sel-edit', role: 'menuitem', onclick: () => {
+      post('pdfcraft:selection', { action: 'clear' });
+      startMode('edit');
+    } }, icon('file-pen-line'), el('span', {}, 'Edit text')),
+    el('button', { class: 'sel-row', id: 'sel-copy', role: 'menuitem', onclick: () => {
+      if (state && state.selection) shell.copyText(state.selection.text);
+      post('pdfcraft:selection', { action: 'clear' });
+      showHint('Copied');
+    } }, icon('copy'), el('span', {}, 'Copy text')));
+  const handles = [el('div', { class: 'handle start', id: 'handle-start', hidden: true }), el('div', { class: 'handle end', id: 'handle-end', hidden: true })];
+
+  function selButton(id, label, name, act) {
+    return el('button', { class: 'icon-btn', id, role: 'menuitem', 'aria-label': label, title: label, onclick: () => post('pdfcraft:selection', { action: act }) }, icon(name));
+  }
 
   // Home: what to do, then the open files.
   const homeFiles = el('div', { id: 'home-files' });
@@ -208,7 +322,8 @@
   const scrim = el('div', { id: 'scrim', hidden: true, onclick: () => closeSheet() });
   const sheet = el('div', { id: 'sheet', role: 'dialog', 'aria-modal': 'true', hidden: true });
 
-  document.body.append(topbar, bottombar, toolstrip, panelbar, pill, homeScreen, scrim, sheet);
+  document.body.append(topbar, modebar, searchbar, bottombar, toolbar, panelbar, pill, hint, composer, selCard, ...handles,
+    homeScreen, scrim, sheet);
   body.classList.add('phone', 'home');
 
   // ---- drawing PdfCraft's state ----
@@ -216,36 +331,46 @@
   function render(s) {
     const firstDoc = (!state || !state.active) && s.active;
     const switched = state && state.active !== s.active;
+    const before = state;
     state = s;
     const doc = s.docs.find((d) => d.doc === s.active);
     // A file that opens (from Android, the picker, a new PDF) is shown at once.
     if (firstDoc || (switched && s.active)) home = false;
     if (!doc) home = true;
+    if (home || switched) {
+      endMode(false);
+      closeSearch(false);
+      setImmersive(false);
+    }
     body.classList.toggle('home', home);
     body.classList.toggle('full-screen', !!s.fullScreen);
     body.classList.toggle('busy', !!s.busy);
-    undoBtn.disabled = !s.undo;
+    undoBtn.disabled = modeUndo.disabled = !s.undo;
+    redoBtn.hidden = modeRedo.hidden = !s.redo;
     renderHome(s);
-    if (home) {
-      closeStrip(false);
-      setImmersive(false);
-    }
     const open = doc && s.panel ? PANEL_NAMES[s.panel] || s.panel : '';
     panelName.textContent = open;
     panelbar.hidden = home || !open;
-    bottombar.hidden = home || !!open || !!strip;
-    toolstrip.hidden = home || !!open || !strip;
-    if (strip) markTools();
-    for (const b of bottombar.children) {
-      const item = BOTTOM.find((x) => x.id === b.dataset.item);
-      b.classList.toggle('on', !!item && !!item.tools && item.tools.some((t) => t.cmd && t.cmd === s.tool));
-    }
+    bottombar.hidden = home || !!open || !!mode;
+    toolbar.hidden = home || !!open || !mode;
+    topbar.hidden = home || !!mode || searching;
+    modebar.hidden = home || !mode;
+    searchbar.hidden = home || !searching || !!mode;
+    if (mode) renderMode(s);
+    if (searching) renderFind(s);
+    renderComposer(s, before);
+    renderSelection(s);
     if (doc && s.page !== lastPage) {
       lastPage = s.page;
       showPill();
     }
     if (!doc) pill.hidden = true;
+    if (s.tool !== lastTool) {
+      lastTool = s.tool;
+      if (mode && HINTS[s.tool]) showHint(HINTS[s.tool]);
+    }
     if (sheet.dataset.kind === 'file') fileSheet(true);
+    if (sheet.dataset.kind === 'view') viewSheet(true);
   }
 
   function renderHome(s) {
@@ -268,10 +393,9 @@
     if (!on && !(state && state.active)) return;
     home = on;
     closeSheet();
-    closeStrip();
+    endMode();
+    closeSearch();
     body.classList.toggle('home', home);
-    bottombar.hidden = home || !!(state && state.panel);
-    panelbar.hidden = home || !(state && state.panel);
     if (state) render(state);
   }
 
@@ -283,39 +407,203 @@
     pillTimer = setTimeout(() => { pill.hidden = true; }, 2000);
   }
 
-  // ---- the bottom bar and its strips ----
-
-  function pressBottom(item) {
-    if (item.run) return item.run();
-    if (strip === item) return closeStrip();
-    if (item.pick) command(item.pick);
-    openStrip(item);
+  function showHint(text) {
+    hint.textContent = text;
+    hint.hidden = false;
+    hint.classList.remove('out');
+    clearTimeout(hintTimer);
+    hintTimer = setTimeout(() => {
+      hint.classList.add('out');
+      hintTimer = setTimeout(() => { hint.hidden = true; }, 300);
+    }, 2200);
   }
 
-  function openStrip(item) {
-    strip = item;
-    stripTools.replaceChildren(...item.tools.map((t) => el('button', {
-      class: 'tool', 'data-cmd': t.cmd || '', 'data-panel': t.panel || '',
-      onclick: () => (t.panel ? panel(t.panel) : command(t.cmd)),
-    }, icon(t.icon), el('span', {}, t.label))));
-    stripTools.scrollLeft = 0;
-    bottombar.hidden = true;
-    toolstrip.hidden = false;
-    markTools();
+  // ---- modes ----
+
+  function startMode(name) {
+    const m = MODES[name];
+    if (!m || !state || !state.active) return;
+    closeSearch();
+    closeSheet();
+    setImmersive(false);
+    mode = name;
+    modeTool = m.enter;
+    toldUneditable = false;
+    body.classList.add('mode');
+    modeTitle.textContent = m.named ? m.label : '';
+    modeTools.classList.toggle('named', !!m.named);
+    modeTools.replaceChildren(...m.tools.map((t) => {
+      const b = el('button', { class: `tool-btn${t.gap ? ' gap' : ''}`, 'data-cmd': t.cmd || t.toggle || '', 'aria-label': t.label, title: t.label,
+        onclick: () => pickTool(t) }, icon(t.icon), m.named ? el('span', {}, t.label) : null);
+      return b;
+    }));
+    command(m.enter);
+    if (state) render(state);
   }
 
-  /** Back to the bottom bar, and to the Select tool so a finger scrolls the page again. */
-  function closeStrip(select = true) {
-    if (!strip) return false;
-    strip = null;
-    toolstrip.hidden = true;
-    bottombar.hidden = home || !state || !state.active || !!state.panel;
-    if (select) post('pdfcraft:select');
+  function pickTool(t) {
+    if (t.toggle) return command(t.toggle);
+    if (t.run) return command(t.run);
+    // Edit PDF goes back to editing text once its text is placed; other modes keep the tool.
+    if (!MODES[mode].named) modeTool = t.cmd;
+    command(t.cmd);
+  }
+
+  /** Done: back to reading, and to the Select tool so a finger scrolls the page again. */
+  function endMode(select = true) {
+    if (!mode) return false;
+    mode = null;
+    modeTool = null;
+    body.classList.remove('mode');
+    clearTimeout(hintTimer);
+    hint.hidden = true;
+    if (select) {
+      if (state && state.organize) command('page.organize');
+      post('pdfcraft:select');
+    }
+    if (state) render(state);
     return true;
   }
 
-  function markTools() {
-    for (const b of stripTools.children) b.classList.toggle('on', !!state && b.dataset.cmd !== '' && b.dataset.cmd === state.tool);
+  function renderMode(s) {
+    const m = MODES[mode];
+    for (const b of modeTools.children) {
+      const t = m.tools.find((x) => (x.cmd || x.toggle || '') === b.dataset.cmd);
+      b.classList.toggle('on', !!t && (t.toggle ? !!t.on(s) : t.cmd === s.tool));
+    }
+    // A comment tool that finished its comment hands back Select: the mode keeps its tool.
+    if (s.tool === 'select' && modeTool && !s.composer && !s.busy && Date.now() - repickAt > 1000) {
+      repickAt = Date.now();
+      command(modeTool);
+    }
+    // Text PdfCraft can't edit (in many PDFs made by browsers and office apps): say so, once.
+    if (mode === 'edit' && s.editable === 0 && !toldUneditable) {
+      toldUneditable = true;
+      showHint('The text on these pages can\'t be edited. You can still add text and images.');
+    }
+    const styled = !!s.style && s.tool !== 'comment.eraser';
+    styleTools.hidden = !styled;
+    widthBtn.hidden = !styled || !SHAPES.includes(s.tool);
+    if (styled) {
+      colorBtn.querySelector('.dot').style.background = s.style.color;
+      colorBtn.querySelector('.dot').style.opacity = String(Math.max(0.35, s.style.opacity));
+      widthBtn.style.setProperty('--w', `${Math.max(1, Math.min(6, s.style.width))}px`);
+    }
+  }
+
+  // ---- search ----
+
+  function openSearch() {
+    if (!state || !state.active) return;
+    endMode();
+    closeSheet();
+    searching = true;
+    findInput.value = (state.find && state.find.query) || '';
+    render(state);
+    setTimeout(() => { findInput.focus(); findInput.select(); }, 50);
+  }
+
+  function closeSearch(tell = true) {
+    if (!searching) return false;
+    searching = false;
+    clearTimeout(findTimer);
+    findInput.blur();
+    if (tell) post('pdfcraft:findClose');
+    if (state) render(state);
+    return true;
+  }
+
+  function renderFind(s) {
+    const f = s.find;
+    const n = f && f.query ? f.matches : 0;
+    findCount.textContent = !f || !f.query ? '' : n ? `${f.current || 0}/${n}` : 'No results';
+    document.getElementById('find-prev').disabled = document.getElementById('find-next').disabled = n < 2;
+    document.getElementById('find-clear').hidden = !findInput.value;
+  }
+
+  // ---- writing a comment ----
+
+  function renderComposer(s, before) {
+    const c = s.composer;
+    if (!c) {
+      if (!composer.hidden) {
+        composer.hidden = true;
+        composerText.blur();
+      }
+      return;
+    }
+    if (composer.hidden || !before || !before.composer) {
+      composer.dataset.kind = c.kind;
+      composerText.placeholder = COMPOSER_HINTS[c.kind] || 'Add a comment';
+      composerText.value = c.text || '';
+      composerText.style.height = 'auto';
+      composerSend.disabled = !composerText.value.trim() && c.kind !== 'edit';
+      composer.hidden = false;
+      setTimeout(() => composerText.focus(), 50);
+    }
+  }
+
+  function finishComposer(postIt) {
+    if (composer.hidden) return false;
+    if (postIt) post('pdfcraft:composerText', { text: composerText.value });
+    post('pdfcraft:composerDone', { post: postIt });
+    composer.hidden = true;
+    composerText.blur();
+    return true;
+  }
+
+  // ---- a text selection ----
+
+  function renderSelection(s) {
+    const sel = s.selection;
+    const f = frame.getBoundingClientRect();
+    const shown = !!sel && !home && !mode && !s.busy && sheet.hidden && composer.hidden
+      && sel.y + sel.h > 0 && sel.y < f.height && sel.x + sel.w > 0 && sel.x < f.width;
+    for (const h of handles) h.hidden = !shown;
+    selCard.hidden = !shown || !!dragging;
+    if (!shown) return;
+    const [sx, sy] = sel.start;
+    const [ex, ey] = sel.end;
+    handles[0].style.transform = `translate(${f.left + sx - 22}px, ${f.top + sy}px)`;
+    handles[1].style.transform = `translate(${f.left + ex}px, ${f.top + ey}px)`;
+    if (dragging) return;
+    // Above the words when there is room under the top bar, otherwise below the handles.
+    const cardW = Math.min(300, window.innerWidth - 24);
+    selCard.style.width = `${cardW}px`;
+    const cardH = selCard.offsetHeight || 220;
+    const top = f.top + sel.y;
+    const bottom = f.top + sel.y + sel.h;
+    const topLimit = (topbar.hidden ? 0 : topbar.getBoundingClientRect().bottom) + 8;
+    let y = top - cardH - 12;
+    if (y < topLimit) y = Math.min(bottom + 34, window.innerHeight - cardH - 8);
+    const x = Math.max(12, Math.min(window.innerWidth - cardW - 12, f.left + sel.x + sel.w / 2 - cardW / 2));
+    selCard.style.transform = `translate(${x}px, ${y}px)`;
+  }
+
+  // A handle follows the finger: the text nearest the point above the finger, where the line is.
+  for (const [i, h] of handles.entries()) {
+    let frameRect = null;
+    let queued = null;
+    h.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      h.setPointerCapture(e.pointerId);
+      dragging = h;
+      frameRect = frame.getBoundingClientRect();
+      selCard.hidden = true;
+    });
+    h.addEventListener('pointermove', (e) => {
+      if (dragging !== h) return;
+      const at = { end: i === 1, x: e.clientX - frameRect.left, y: e.clientY - frameRect.top - 26 };
+      if (!queued) requestAnimationFrame(() => { post('pdfcraft:selectionHandle', queued); queued = null; });
+      queued = at;
+    });
+    const drop = () => {
+      if (dragging !== h) return;
+      dragging = null;
+      if (state) renderSelection(state);
+    };
+    h.addEventListener('pointerup', drop);
+    h.addEventListener('pointercancel', drop);
   }
 
   // ---- sheets ----
@@ -323,6 +611,8 @@
   function openSheet(kind, content) {
     sheet.dataset.kind = kind;
     sheet.replaceChildren(el('div', { class: 'grabber' }), ...content);
+    selCard.hidden = true;
+    for (const h of handles) h.hidden = true;
     if (sheet.hidden) {
       scrim.hidden = false;
       sheet.hidden = false;
@@ -340,14 +630,17 @@
     sheet.classList.remove('open');
     scrim.hidden = true;
     sheet.hidden = true;
+    if (state) renderSelection(state);
     return true;
   }
 
   const row = (label, iconName, onclick, extra = {}) => el('button', {
-    class: 'row', disabled: extra.disabled, onclick,
+    class: 'row', disabled: extra.disabled, onclick, role: extra.toggle !== undefined ? 'switch' : null,
+    'aria-checked': extra.toggle !== undefined ? String(!!extra.toggle) : null,
   }, icon(iconName), el('span', { class: 'label' }, label),
   extra.tick ? el('span', { class: 'tick' }, icon('check')) : null,
-  extra.next ? el('span', { class: 'next' }, icon('chevron-right')) : null);
+  extra.next ? el('span', { class: 'next' }, icon('chevron-right')) : null,
+  extra.toggle !== undefined ? el('span', { class: `switch${extra.toggle ? ' on' : ''}` }) : null);
 
   /** Run a command from a sheet: the sheet goes first. */
   const then = (fn) => () => { closeSheet(); fn(); };
@@ -371,19 +664,61 @@
         row('Add bookmark', 'bookmark', then(() => command('bookmark.add'))),
         row('Save', 'save', then(() => command('file.save')), { disabled: !s.save }),
         row('Save a copy', 'file-down', then(() => command('file.save_as'))),
+        row('Share', 'share-2', then(() => post('pdfcraft:share'))),
         row('Print', 'printer', then(() => command('print.dialog'))),
         row('Document properties', 'info', then(() => command('file.properties'))),
         row('Close file', 'file-x', then(() => command('file.close')))),
     ]);
   }
 
-  function viewSheet() {
+  function viewSheet(refresh = false) {
+    if (refresh && sheet.dataset.kind !== 'view') return;
     const s = state || {};
     openSheet('view', [
       el('div', { class: 'sheet-head' }, el('button', { class: 'icon-btn back', 'aria-label': 'Back', onclick: () => fileSheet() }, icon('chevron-left')),
         el('div', { class: 'sheet-title' }, 'View settings')),
-      el('div', { class: 'list' }, ...VIEW.map((v) => row(v.label, v.icon, then(() => command(v.cmd)), { tick: v.on && v.on(s) }))),
+      el('div', { class: 'list' },
+        row('Continuous', 'rows-3', () => { if (!s.continuous) command('view.continuous'); }, { tick: !!s.continuous }),
+        row('Single page', 'file-text', () => { if (s.continuous) command('view.continuous'); command('view.layout.single'); }, { tick: !s.continuous }),
+        row('Two pages side by side', 'columns-2', then(() => command('view.layout.two_up'))),
+        el('div', { class: 'sep' }),
+        row('Night mode', 'moon', () => post('pdfcraft:night', { on: !s.night }), { toggle: !!s.night }),
+        el('div', { class: 'sep' }),
+        row('Fit width', 'arrow-left-right', then(() => command('view.fit_width_scrolling'))),
+        row('Fit page', 'minimize-2', then(() => command('view.fit_one_page'))),
+        row('Full screen', 'maximize', then(() => command('view.full_screen')))),
     ]);
+  }
+
+  /** The current tool's colour, opacity and (for pens and shapes) thickness. */
+  function styleSheet() {
+    const s = state;
+    if (!s || !s.style) return;
+    const send = (fields) => post('pdfcraft:style', fields);
+    const swatches = el('div', { class: 'swatches' }, ...SWATCHES.map((c) => {
+      const b = el('button', { class: 'swatch', 'aria-label': `Colour ${c}`, style: `background:${c}`, onclick: () => {
+        for (const x of swatches.children) x.classList.toggle('on', x === b);
+        send({ color: c });
+      } });
+      b.classList.toggle('on', c === s.style.color);
+      return b;
+    }));
+    const slider = (label, min, max, step, value, unit, onvalue) => {
+      const out = el('span', { class: 'value' }, `${value}${unit}`);
+      const input = el('input', { type: 'range', min: String(min), max: String(max), step: String(step), value: String(value), 'aria-label': label });
+      input.addEventListener('input', () => {
+        out.textContent = `${input.value}${unit}`;
+        onvalue(Number(input.value));
+      });
+      return el('label', { class: 'slider' }, el('span', { class: 'label' }, label), input, out);
+    };
+    const content = [
+      el('div', { class: 'sheet-head' }, el('div', { class: 'sheet-title' }, 'Colour')),
+      swatches,
+      slider('Opacity', 10, 100, 5, Math.round(s.style.opacity * 100), '%', (v) => send({ opacity: v / 100 })),
+    ];
+    if (SHAPES.includes(s.tool)) content.push(slider('Thickness', 0.5, 12, 0.5, s.style.width, ' pt', (v) => send({ width: v })));
+    openSheet('style', content);
   }
 
   function toolsSheet() {
@@ -447,15 +782,17 @@
     doc.addEventListener('pointerdown', (e) => {
       fingers++;
       clearTimeout(pending); // a second tap: a double tap selects a word instead
-      // A finger's tap only: a mouse (a keyboard and mouse on a big screen) never hides the bars.
-      down = fingers === 1 && e.pointerType === 'touch' ? { x: e.clientX, y: e.clientY, t: e.timeStamp } : null;
+      // A finger's tap only, and only while reading: a tap that clears a selection, or one
+      // that places a comment, keeps the bars.
+      const reading = state && state.active && !home && !mode && !searching && state.tool === 'select' && !state.busy
+        && !state.selection && !state.composer && sheet.hidden && !state.panel && !state.fullScreen;
+      down = fingers === 1 && e.pointerType === 'touch' && reading ? { x: e.clientX, y: e.clientY, t: e.timeStamp } : null;
     }, true);
     const up = (e) => {
       fingers = Math.max(0, fingers - 1);
       const d = down;
       down = null;
-      if (!d || e.type !== 'pointerup' || home || !state || !state.active || state.tool !== 'select' || state.busy || strip
-        || !sheet.hidden || state.panel || state.fullScreen) return;
+      if (!d || e.type !== 'pointerup') return;
       if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 12 || e.timeStamp - d.t > 350) return;
       pending = setTimeout(() => setImmersive(!immersive), 320);
     };
@@ -469,6 +806,12 @@
   /** Close what is open, innermost first; false when there is nothing (Android goes back). */
   shell.back = () => {
     if (closeSheet()) return true;
+    if (finishComposer(false)) return true;
+    if (state && state.selection) {
+      post('pdfcraft:selection', { action: 'clear' });
+      return true;
+    }
+    if (closeSearch()) return true;
     if (state && state.fullScreen) {
       shell.leaveFullScreen();
       return true;
@@ -477,7 +820,7 @@
       panel(null);
       return true;
     }
-    if (closeStrip()) return true;
+    if (endMode()) return true;
     if (immersive) {
       setImmersive(false);
       return true;

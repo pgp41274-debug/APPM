@@ -67,11 +67,16 @@ final class ShellBridge {
         }
     }
 
-    /** All slices sent: write the file where it belongs. */
+    /** All slices sent: write the file where it belongs, or share it (kind "share"). */
     @JavascriptInterface
     public boolean endSave(String id) {
         try {
-            activity.onSave(files.end(id));
+            FileStore.SaveJob job = files.end(id);
+            if ("share".equals(job.kind)) {
+                activity.share(job);
+            } else {
+                activity.onSave(job);
+            }
             return true;
         } catch (IOException e) {
             files.abort(id);
@@ -93,6 +98,12 @@ final class ShellBridge {
     @JavascriptInterface
     public void closed(String id, String doc) {
         activity.onSave(files.closed(id, doc));
+    }
+
+    /** Put text on the clipboard (Copy text on a selection). */
+    @JavascriptInterface
+    public void copyText(String text) {
+        activity.copyText(text);
     }
 
     /** PdfCraft has (or no longer has) unsaved work. */

@@ -97,6 +97,7 @@ const mockBridge = () => {
     abortPrint(id) { window.__calls.push(['abortPrint', id]); },
     endPrint(id) { window.__print.done = true; },
     toast(m) { window.__calls.push(['toast', m]); },
+    copyText(t) { window.__calls.push(['copyText', t]); },
     info() { return JSON.stringify({ app: 'test', android: '-', device: 'Playwright', webview: navigator.userAgent }); },
     updateWebView() {},
   };
@@ -108,6 +109,30 @@ function check(name, ok, detail = '') {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`);
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** A one-page PDF of plain Helvetica lines: text PdfCraft's Edit text can edit. */
+function plainPdf(lines) {
+  const text = lines.map((l) => `(${l}) Tj 0 -40 Td`).join(' ');
+  const stream = `BT /F1 24 Tf 72 700 Td ${text} ET`;
+  const objs = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [4 0 R] /Count 1 >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 3 0 R >> >> >>',
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [];
+  objs.forEach((o, i) => {
+    offsets.push(pdf.length);
+    pdf += `${i + 1} 0 obj\n${o}\nendobj\n`;
+  });
+  const xref = pdf.length;
+  pdf += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+  for (const o of offsets) pdf += `${String(o).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(pdf, 'latin1');
+}
 
 // ---- reading screenshots (8-bit RGB or RGBA PNGs, as Chromium writes them) ----
 function decodePng(png) {
@@ -637,18 +662,140 @@ try {
       await p.evaluate(() => [...document.querySelectorAll('#bottombar .cat span')].map((x) => x.textContent).join('|')) === 'Edit PDF|Comment|Highlight|Draw|Fill & Sign|More tools');
     await p.screenshot({ path: path.join(shots, 'phone-1-reading.png') });
 
-    // Highlight turns the tool on and shows Highlight, Underline, Strike out; ✓ goes back to Select.
+    const shown = (sel) => p.evaluate((q) => { const e = document.querySelector(q); return !!e && !e.hidden && e.getBoundingClientRect().height > 0; }, sel);
+    const cdp = await ctx.newCDPSession(p);
+    const hold = async (x, y, ms) => {
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+      await sleep(ms);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    };
+
+    // A finger held on a word selects it: handles at its ends, a card of what to do with it.
+    const fb = await p.locator('#app').boundingBox();
+    let selected = false;
+    for (const [fx, fy] of [[0.36, 0.37], [0.3, 0.33], [0.45, 0.4], [0.25, 0.42]]) {
+      await hold(fb.x + fb.width * fx, fb.y + fb.height * fy, 1500);
+      selected = await settle(() => !!(window.__state.selection && window.__state.selection.text), 4000);
+      if (selected) break;
+    }
+    const card = selected && await settle(() => !document.getElementById('selcard').hidden, 3000);
+    const handlesShown = await shown('#handle-start') && await shown('#handle-end');
+    check('a finger held on a word selects it, with handles and a card of actions', selected && card && handlesShown,
+      JSON.stringify({ selected, card, handlesShown, sel: (await st()).selection }));
+    await p.screenshot({ path: path.join(shots, 'phone-2-selection.png') });
+    await p.tap('#sel-highlight');
+    check('... Highlight on the card highlights the words', await settle(() => !window.__state.selection && window.__state.undo === true)
+      && await p.evaluate(() => document.getElementById('selcard').hidden));
+    await p.tap('#undo');
+    await settle(() => window.__state.undo === false);
+    for (const [fx, fy] of [[0.36, 0.37], [0.3, 0.33], [0.45, 0.4], [0.25, 0.42]]) {
+      await hold(fb.x + fb.width * fx, fb.y + fb.height * fy, 1500);
+      if (await settle(() => !!(window.__state.selection && window.__state.selection.text), 4000)) break;
+    }
+    const words = (await st()).selection && (await st()).selection.text;
+    await settle(() => !document.getElementById('selcard').hidden, 3000);
+    await p.tap('#sel-copy');
+    const copied = await p.evaluate(() => window.__calls.filter((c) => c[0] === 'copyText').map((c) => c[1]));
+    check('... Copy text puts the words on Android\'s clipboard', !!words && copied.at(-1) === words && await settle(() => !window.__state.selection),
+      JSON.stringify({ words, copied }));
+
+    // Highlight: ✓ at the top, the tools along the bottom, a hint, and the colour.
     await p.tap('#bottombar [data-item="highlight"]');
     const picked = await settle(() => window.__state.tool === 'comment.highlight');
-    const marked = await p.evaluate(() => !!document.querySelector('#strip-tools [data-cmd="comment.highlight"].on'));
-    check('Highlight turns the tool on, and its strip shows it', picked && marked && !(await st()).panel,
-      JSON.stringify({ tool: (await st()).tool, marked, panel: (await st()).panel }));
-    await p.tap('#strip-tools [data-cmd="comment.underline"]');
-    check('... Underline in the strip switches to it', await settle(() => window.__state.tool === 'comment.underline'));
-    await p.screenshot({ path: path.join(shots, 'phone-2-highlight-tools.png') });
-    await p.tap('#strip-done');
+    const modeShown = await shown('#modebar') && await shown('#toolbar') && !(await shown('#bottombar'));
+    const marked = await p.evaluate(() => !!document.querySelector('#mode-tools [data-cmd="comment.highlight"].on'));
+    const hintText = await p.evaluate(() => document.getElementById('hint').textContent);
+    check('Highlight: ✓ on top, its tools along the bottom, and a hint', picked && modeShown && marked && hintText === 'Drag over text to highlight'
+      && !(await st()).panel, JSON.stringify({ tool: (await st()).tool, modeShown, marked, hintText }));
+    await p.tap('#color');
+    await settle(() => document.getElementById('sheet').dataset.kind === 'style');
+    await sleep(600); // the sheet slides up
+    await p.screenshot({ path: path.join(shots, 'phone-3-highlight-colour.png') });
+    await p.tap('#sheet .swatch[aria-label="Colour #43a047"]');
+    check('... the colour sheet sets the highlighter\'s colour', await settle(() => window.__state.style && window.__state.style.color === '#43a047'),
+      JSON.stringify((await st()).style));
+    await p.evaluate(() => window.shell.back());
+    await p.tap('#mode-tools [data-cmd="comment.underline"]');
+    check('... Underline switches to it', await settle(() => window.__state.tool === 'comment.underline'));
+    await p.tap('#done');
     check('✓ goes back to the Select tool and the bottom bar', await settle(() => window.__state.tool === 'select')
-      && await p.evaluate(() => !document.getElementById('bottombar').hidden));
+      && await shown('#bottombar') && !(await shown('#modebar')));
+
+    // Draw: the pen with its thickness and colour.
+    await p.tap('#bottombar [data-item="draw"]');
+    const pen = await settle(() => window.__state.tool === 'comment.ink');
+    check('Draw picks the pen, with thickness and colour, and says two fingers scroll', pen && await shown('#width') && await shown('#color')
+      && await p.evaluate(() => document.getElementById('hint').textContent.includes('two fingers')));
+    await p.screenshot({ path: path.join(shots, 'phone-4-draw.png') });
+    await p.tap('#done');
+    await settle(() => window.__state.tool === 'select');
+
+    // Comment: a tap pins a note, the box at the bottom writes it.
+    await p.tap('#bottombar [data-item="comment"]');
+    await settle(() => window.__state.tool === 'comment.note');
+    await p.touchscreen.tap(fb.x + fb.width * 0.5, fb.y + fb.height * 0.6);
+    const composing = await settle(() => window.__state.composer && window.__state.composer.kind === 'note') && await shown('#composer');
+    await p.fill('#composer-text', 'Looks good');
+    await p.dispatchEvent('#composer-text', 'input');
+    await p.screenshot({ path: path.join(shots, 'phone-5-comment.png') });
+    await p.tap('#composer-send');
+    check('Comment: a tap pins a note and the box at the bottom posts it', composing
+      && await settle(() => !window.__state.composer && window.__state.undo === true) && !(await shown('#composer')),
+    JSON.stringify({ composing, state: (await st()).composer }));
+    await p.tap('#done');
+    await settle(() => window.__state.tool === 'select');
+    await p.tap('#undo');
+    await settle(() => window.__state.undo === false);
+
+    // Edit PDF: named, with Organize pages, Add text and Add image.
+    await p.tap('#bottombar [data-item="edit"]');
+    const editing = await settle(() => window.__state.tool === 'edit.edit_text');
+    const editTools = await p.evaluate(() => [...document.querySelectorAll('#mode-tools .tool-btn span')].map((x) => x.textContent).join('|'));
+    const title = await p.evaluate(() => document.querySelector('#modebar .mode-title').textContent);
+    // The text blocks are found on the next frames; under software rendering they take a while.
+    await sleep(6000);
+    await p.screenshot({ path: path.join(shots, 'phone-6-edit.png') });
+    check('Edit PDF edits text, with Organize pages, Add text and Add image', editing && title === 'Edit PDF'
+      && editTools === 'Organize pages|Add text|Add image', JSON.stringify({ tool: (await st()).tool, title, editTools }));
+    await p.tap('#done');
+    await settle(() => window.__state.tool === 'select');
+
+    // Search: the top bar turns into the search box.
+    await p.tap('#find');
+    await settle(() => !document.getElementById('searchbar').hidden);
+    await p.fill('#find-input', 'Showcase');
+    await p.dispatchEvent('#find-input', 'input');
+    const found = await settle(() => window.__state.find && window.__state.find.matches > 0, 15000);
+    const count = found && await settle(() => /^1\/\d+$/.test(document.getElementById('find-count').textContent), 3000);
+    await p.screenshot({ path: path.join(shots, 'phone-7-search.png') });
+    check('Search finds the words and counts the matches', found && count,
+      JSON.stringify({ find: (await st()).find, count: await p.evaluate(() => document.getElementById('find-count').textContent) }));
+    await p.tap('#find-close');
+    check('... ← closes the search', await settle(() => !window.__state.find) && await shown('#topbar'));
+
+    // Night mode, from ⋮ ▸ View settings.
+    await p.tap('#more');
+    await settle(() => !document.getElementById('sheet').hidden);
+    await sheetRow('View settings');
+    await settle(() => document.getElementById('sheet').dataset.kind === 'view');
+    await sheetRow('Night mode');
+    const night = await settle(() => window.__state.night === true);
+    const switchOn = await settle(() => !!document.querySelector('#sheet .switch.on'), 3000);
+    await p.evaluate(() => window.shell.back());
+    await sleep(1000);
+    await p.screenshot({ path: path.join(shots, 'phone-8-night.png') });
+    await p.tap('#more');
+    await settle(() => !document.getElementById('sheet').hidden);
+    await sheetRow('View settings');
+    await sheetRow('Night mode');
+    check('View settings ▸ Night mode turns the pages white on black, and back', night && switchOn && await settle(() => window.__state.night === false));
+    await p.evaluate(() => window.shell.back());
+
+    // Share hands the file to Android's share sheet.
+    await p.tap('#share');
+    const shared = await settle(() => window.__saves.some((s) => s.kind === 'share' && s.done), 15000);
+    const sharedPdf = shared && await p.evaluate(() => atob(window.__saves.find((s) => s.kind === 'share').data.slice(0, 12)).startsWith('%PDF-'));
+    check('Share hands the PDF to Android', shared && sharedPdf);
 
     // ⋮: the file's menu; Go to page… 7.
     await p.tap('#more');
@@ -656,9 +803,9 @@ try {
     const rows = await p.evaluate(() => [...document.querySelectorAll('#sheet .row .label')].map((r) => r.textContent));
     const head = await p.evaluate(() => document.querySelector('#sheet .sheet-title').textContent);
     check('⋮ shows the file\'s name and its menu', head === 'showcase.pdf'
-      && ['View settings', 'Pages', 'Bookmarks', 'Comment list', 'Go to page', 'Print', 'Close file'].every((r) => rows.includes(r)),
+      && ['View settings', 'Pages', 'Bookmarks', 'Comment list', 'Go to page', 'Share', 'Print', 'Close file'].every((r) => rows.includes(r)),
     `${head}: ${rows.join(' | ')}`);
-    await p.screenshot({ path: path.join(shots, 'phone-3-file-menu.png') });
+    await p.screenshot({ path: path.join(shots, 'phone-9-file-menu.png') });
     await sheetRow('Go to page');
     await settle(() => !!document.querySelector('.goto input'));
     await p.fill('.goto input', '7');
@@ -674,7 +821,7 @@ try {
     };
     await tapPage();
     const hid = await settle(() => document.body.classList.contains('immersive'), 4000);
-    await p.screenshot({ path: path.join(shots, 'phone-4-bars-hidden.png') });
+    await p.screenshot({ path: path.join(shots, 'phone-10-bars-hidden.png') });
     await sleep(600);
     await tapPage();
     const back = await settle(() => !document.body.classList.contains('immersive'), 4000);
@@ -686,7 +833,7 @@ try {
     await sheetRow('Pages');
     const opened2 = await settle(() => window.__state.panel === 'Pages');
     const bar = await p.evaluate(() => !document.getElementById('panelbar').hidden);
-    await p.screenshot({ path: path.join(shots, 'phone-5-pages.png') });
+    await p.screenshot({ path: path.join(shots, 'phone-11-pages.png') });
     await p.tap('#panelbar button');
     check('⋮ ▸ Pages opens the thumbnails over the page, and its bar closes them',
       opened2 && bar && await settle(() => !window.__state.panel), JSON.stringify({ opened2, bar }));
@@ -697,7 +844,7 @@ try {
     const tiles = await p.evaluate(() => [...document.querySelectorAll('#sheet .grid .action')].map((t) => t.textContent));
     check('More tools shows the tools as a grid', ['Organize pages', 'Export PDF', 'Compress PDF', 'Set password', 'Rotate pages'].every((t) => tiles.includes(t)),
       tiles.join(' | '));
-    await p.screenshot({ path: path.join(shots, 'phone-6-more-tools.png') });
+    await p.screenshot({ path: path.join(shots, 'phone-12-more-tools.png') });
     await sheetRow('Rotate pages');
     const canUndo = await settle(() => window.__state.undo === true);
     const undoOn = await p.evaluate(() => !document.getElementById('undo').disabled);
@@ -717,9 +864,40 @@ try {
     const files = await p.evaluate(() => [...document.querySelectorAll('#home .file-name')].map((r) => r.textContent));
     check('the home screen lists the open file', files.length === 1 && files[0] === 'showcase.pdf', JSON.stringify(files));
     await p.waitForTimeout(500); // the tiles' icons load when home first shows
-    await p.screenshot({ path: path.join(shots, 'phone-7-home.png') });
+    await p.screenshot({ path: path.join(shots, 'phone-13-home.png') });
     await p.tap('#home .file-open');
     check('... and a tap on it shows it again', await settle(() => !document.body.classList.contains('home')));
+
+    await ctx.close();
+  }
+
+  // 9g. Edit PDF outlines each paragraph PdfCraft can edit, dashed: a finger can't hover one.
+  {
+    const ctx = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+    await ctx.addInitScript(mockBridge);
+    incoming.set('f1', plainPdf(['A paragraph to edit', 'on two lines', '', 'And another one']));
+    const p = await ctx.newPage();
+    await p.goto(`${base}/app/shell/index.html`);
+    await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+    await p.waitForFunction(() => window.__state && window.__state.pages === 1, null, { timeout: 30000 }).catch(() => {});
+    await sleep(2000);
+    const area = await p.locator('#app').boundingBox();
+    const clip = { x: area.x, y: area.y, width: area.width, height: area.height * 0.4 };
+    const blues = (img) => {
+      let n = 0;
+      for (let i = 0; i < img.rgb.length; i += 3) if (img.rgb[i + 2] > 150 && img.rgb[i + 2] - img.rgb[i] > 60) n++;
+      return n;
+    };
+    const plain = blues(decodePng(await p.screenshot({ clip })));
+    await p.tap('#bottombar [data-item="edit"]');
+    const editing = await p.waitForFunction(() => window.__state.tool === 'edit.edit_text', null, { timeout: 8000 }).then(() => true, () => false);
+    await sleep(3000);
+    const outlined = blues(decodePng(await p.screenshot({ clip })));
+    await p.screenshot({ path: path.join(shots, 'phone-14-edit-outlines.png') });
+    const editable = await p.evaluate(() => window.__state.editable);
+    const toolNow = await p.evaluate(() => window.__state.tool);
+    check('Edit PDF outlines the paragraphs it can edit', editing && editable === 2 && outlined > plain + 200,
+      JSON.stringify({ editing, editable, toolNow, plain, outlined }));
     await ctx.close();
   }
 } finally {
