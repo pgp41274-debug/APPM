@@ -479,27 +479,24 @@ async function main() {
         `moved ${moved.shift} of ${swiped} px swiped (unmoved diff ${moved.unmoved.toFixed(1)}, best ${moved.fit.toFixed(1)})`);
       screenshot('6b-swiped.png');
     }
-    // Which system bars PdfCraft's window asks for (dumpsys window): it changes when they hide.
-    const bars = () => {
-      const block = sh('dumpsys window windows').split(/\n(?=\s*Window #)/).find((b) => /com\.appm\.pdfcraft\/com\.appm\.pdfcraft\.MainActivity\}/.test(b)) || '';
-      return (block.match(/[Rr]equestedVisibleTypes=(\S+)/) || [])[1] || '';
-    };
+    // The page's height: it takes the bars' room when they hide, and gives it back after.
+    const bars = () => page.evaluate(() => String(window.innerHeight)).catch(() => '');
     // Android explains full screen with a one-time hint that would take the Back below.
     sh('settings put secure immersive_mode_confirmations confirmed');
-    const barsBefore = bars();
+    const barsBefore = await bars();
     mark = logMark();
     await palette('Full screen mode');
     const full = await waitLog(/full screen true/, mark, 15000);
-    const barsFull = await until(() => { const b = bars(); return b && b !== barsBefore ? b : null; }, 5000, 1000);
+    const barsFull = await until(async () => { const b = await bars(); return b && +b > +barsBefore + 40 ? b : null; }, 5000, 1000);
     screenshot('6c-full-screen.png');
     check('Full screen mode hides Android\'s status and navigation bars', full && barsBefore && barsFull,
-      `${full ? 'reported' : 'not reported'}; bars asked for ${barsBefore || '(not in dumpsys)'} -> ${barsFull || 'unchanged'}`);
+      `${full ? 'reported' : 'not reported'}; page ${barsBefore || '?'} -> ${barsFull || 'no taller'} px tall`);
     mark = logMark();
     sh('input keyevent KEYCODE_BACK');
     const left = await waitLog(/full screen false/, mark, 15000);
-    const barsBack = await until(() => (bars() === barsBefore ? barsBefore : null), 5000, 1000);
+    const barsBack = await until(async () => ((await bars()) === barsBefore ? barsBefore : null), 5000, 1000);
     check('Back leaves Full screen mode and keeps PdfCraft open', left && barsBack && /pdfcraft/.test(top()),
-      `${left ? 'left' : 'not left'}; bars ${barsBack ? 'back' : `still ${bars()}`}; top ${top()}`);
+      `${left ? 'left' : 'not left'}; page ${barsBack ? 'back to' : 'not back to'} ${barsBefore} px; top ${top()}`);
   }
 
   // 7. Android ends PdfCraft in the background: it starts again cleanly, and the file that started
