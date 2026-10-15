@@ -1,0 +1,276 @@
+--- a/crates/ui-egui/src/chrome.rs
++++ b/crates/ui-egui/src/chrome.rs
+@@ -528,6 +528,82 @@
+         .frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(6, 8)).stroke(Stroke::new(1.0, t.divider)))
+         .show(ui, |ui| {
+             ui.spacing_mut().item_spacing.y = 4.0;
++            // Page navigation cluster at the bottom (as in Acrobat's rail), drawn first so the
++            // panel buttons know how much room is left above it. A short rail (a phone held
++            // sideways) leaves out the view buttons, which View and the command palette also have.
++            let full = ui.max_rect();
++            let compact = full.height() < 400.0;
++            let view = &mut app.views[index];
++            let mut page_display = None;
++            let nav = ui
++                .scope_builder(egui::UiBuilder::new().max_rect(full).layout(Layout::bottom_up(Align::Center)), |ui| {
++                    ui.spacing_mut().item_spacing.y = 2.0;
++                    let tip = crate::commands::key_tip(ui.ctx(), tl!("Zoom out ({key})"), crate::commands::ZOOM_OUT);
++                    if icons::button(ui, "zoom-out", 32.0, false, &tip).clicked() {
++                        view.zoom_step(false);
++                    }
++                    let tip = crate::commands::key_tip(ui.ctx(), tl!("Zoom in ({key})"), crate::commands::ZOOM_IN);
++                    if icons::button(ui, "zoom-in", 32.0, false, &tip).clicked() {
++                        view.zoom_step(true);
++                    }
++                    if !compact {
++                        // Between rotate and zoom, as in Acrobat. Its command runs once `view` is free.
++                        let tip = crate::i18n::fmt(tl!("Page display: {layout}"), &[("layout", tl!(view.layout.label()))]);
++                        let resp = icons::button(ui, view.layout.icon(), 32.0, false, &tip);
++                        page_display = egui::Popup::menu(&resp)
++                            .show(|ui| {
++                                ui.set_min_width(220.0);
++                                rail_view_menu(ui, view)
++                            })
++                            .and_then(|r| r.inner);
++                        let tip = crate::commands::key_tip(ui.ctx(), tl!("Rotate view clockwise ({key})"), crate::commands::ROTATE_CW);
++                        if icons::button(ui, "rotate-cw", 32.0, false, &tip).clicked() {
++                            view.rotate_view(true);
++                        }
++                        // Not `columns-2` while fitting the page: that is the two-page view's icon.
++                        let fit_icon = if view.fit == Fit::Width { "maximize" } else { "maximize-2" };
++                        if icons::button(ui, fit_icon, 32.0, false, tl!("Toggle fit page / fit width")).clicked() {
++                            view.fit = if view.fit == Fit::Width { Fit::Page } else { Fit::Width };
++                            view.goto = Some((view.current, 0.0));
++                        }
++                    }
++                    let zoom = format!("{:.0}%", view.zoom * 100.0);
++                    ui.allocate_ui_with_layout(vec2(40.0, 16.0), Layout::top_down(Align::Center), |ui| {
++                        ui.label(egui::RichText::new(zoom).font(theme::medium(11.0)).color(t.text_muted));
++                    });
++                    ui.add_space(6.0);
++                    if icons::button(ui, "chevron-down", 30.0, false, tl!("Next page")).clicked() {
++                        view.step_page(true);
++                    }
++                    if icons::button(ui, "chevron-up", 30.0, false, tl!("Previous page")).clicked() {
++                        view.step_page(false);
++                    }
++                    ui.label(egui::RichText::new(page_count.to_string()).font(theme::regular(11.0)).color(t.text_muted));
++                    let edit = egui::TextEdit::singleline(&mut view.page_input)
++                        .id(egui::Id::new("page-input"))
++                        .desired_width(34.0)
++                        .horizontal_align(Align::Center)
++                        .font(theme::medium(12.0))
++                        .margin(vec2(2.0, 4.0));
++                    let r = egui::Frame::NONE
++                        .fill(t.field)
++                        .stroke(Stroke::new(1.0, t.border))
++                        .corner_radius(CornerRadius::same(5))
++                        .show(ui, |ui| ui.add(edit))
++                        .inner
++                        .on_hover_text(tl!("Current page — type a page number or label (such as iv) and press Enter"));
++                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
++                        // A page label first (logical page numbers, as Acrobat), then a number.
++                        let typed = view.page_input.clone();
++                        if !view.go_to_typed(&typed, &labels) {
++                            view.page_input = (view.current + 1).to_string();
++                        }
++                    }
++                })
++                .response
++                .rect;
++
++            let right = app.right;
+             let mut rail_button = |ui: &mut egui::Ui, panel: RightPanel, icon: &str, tip: &str, has: bool| {
+                 let selected = app.right == Some(panel) && (app.mode == Mode::Read || app.docking.exposed(crate::docking::Panel::Inspector));
+                 let r = icons::button(ui, icon, 34.0, selected, tl!(tip));
+@@ -539,83 +615,55 @@
+                     app.choose_right_panel(if selected { None } else { Some(panel) });
+                 }
+             };
+-            rail_button(ui, RightPanel::Comments, "message-square-text", "Comments", has_comments);
+-            rail_button(ui, RightPanel::Bookmarks, "bookmark", "Bookmarks", has_outline);
+-            rail_button(ui, RightPanel::Pages, "files", "Page thumbnails", false);
+-            rail_button(ui, RightPanel::Fields, "text-cursor-input", "Form fields", has_fields);
+-            rail_button(ui, RightPanel::Layers, "layers", "Layers", has_layers);
+-            rail_button(ui, RightPanel::Attachments, "paperclip", "Attachments", has_files);
+-            rail_button(ui, RightPanel::Signatures, "signature", "Signatures", has_signatures);
++            let mut panels = vec![
++                (RightPanel::Comments, "message-square-text", "Comments", has_comments),
++                (RightPanel::Bookmarks, "bookmark", "Bookmarks", has_outline),
++                (RightPanel::Pages, "files", "Page thumbnails", false),
++                (RightPanel::Fields, "text-cursor-input", "Form fields", has_fields),
++                (RightPanel::Layers, "layers", "Layers", has_layers),
++                (RightPanel::Attachments, "paperclip", "Attachments", has_files),
++                (RightPanel::Signatures, "signature", "Signatures", has_signatures),
++            ];
+             if has_check {
+-                rail_button(ui, RightPanel::Accessibility, "accessibility", "Accessibility Checker", false);
++                panels.push((RightPanel::Accessibility, "accessibility", "Accessibility Checker", false));
+             }
+-            rail_button(ui, RightPanel::Tags, "tag", "Tags", false);
+-
+-            // Page navigation cluster at the bottom (as in Acrobat's rail).
+-            let view = &mut app.views[index];
+-            let mut page_display = None;
+-            ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+-                ui.spacing_mut().item_spacing.y = 2.0;
+-                let tip = crate::commands::key_tip(ui.ctx(), tl!("Zoom out ({key})"), crate::commands::ZOOM_OUT);
+-                if icons::button(ui, "zoom-out", 32.0, false, &tip).clicked() {
+-                    view.zoom_step(false);
++            panels.push((RightPanel::Tags, "tag", "Tags", false));
++            // On a short window (a phone held sideways) the buttons that don't fit above the page
++            // controls go in a More menu, rather than being drawn over them.
++            let room = (nav.top() - 6.0 - full.top()).max(0.0);
++            let step = 34.0 + ui.spacing().item_spacing.y;
++            let fit = ((room + ui.spacing().item_spacing.y) / step).floor() as usize;
++            let shown = if fit >= panels.len() { panels.len() } else { fit.saturating_sub(1) };
++            let top = egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, full.top() + room));
++            let hidden = panels.get(shown..).unwrap_or_default();
++            let mut more = None;
++            ui.scope_builder(egui::UiBuilder::new().max_rect(top), |ui| {
++                for &(panel, icon, tip, has) in panels.iter().take(shown) {
++                    rail_button(ui, panel, icon, tip, has);
+                 }
+-                let tip = crate::commands::key_tip(ui.ctx(), tl!("Zoom in ({key})"), crate::commands::ZOOM_IN);
+-                if icons::button(ui, "zoom-in", 32.0, false, &tip).clicked() {
+-                    view.zoom_step(true);
++                // With no room even for More, the panels are still in View.
++                if !hidden.is_empty() && room >= 34.0 {
++                    let selected = hidden.iter().any(|p| right == Some(p.0));
++                    more = Some(icons::button(ui, "ellipsis", 34.0, selected, tl!("More")));
+                 }
+-                // Between rotate and zoom, as in Acrobat. Its command runs once `view` is free.
+-                let tip = crate::i18n::fmt(tl!("Page display: {layout}"), &[("layout", tl!(view.layout.label()))]);
+-                let resp = icons::button(ui, view.layout.icon(), 32.0, false, &tip);
+-                page_display = egui::Popup::menu(&resp)
++            });
++            if let Some(r) = more {
++                let picked = egui::Popup::menu(&r)
+                     .show(|ui| {
+-                        ui.set_min_width(220.0);
+-                        rail_view_menu(ui, view)
++                        let mut picked = None;
++                        for &(panel, _, tip, _) in hidden {
++                            if ui.add(widgets::radio(app.right == Some(panel), tl!(tip))).clicked() {
++                                picked = Some(panel);
++                            }
++                        }
++                        picked
+                     })
+                     .and_then(|r| r.inner);
+-                let tip = crate::commands::key_tip(ui.ctx(), tl!("Rotate view clockwise ({key})"), crate::commands::ROTATE_CW);
+-                if icons::button(ui, "rotate-cw", 32.0, false, &tip).clicked() {
+-                    view.rotate_view(true);
+-                }
+-                // Not `columns-2` while fitting the page: that is the two-page view's icon.
+-                let fit_icon = if view.fit == Fit::Width { "maximize" } else { "maximize-2" };
+-                if icons::button(ui, fit_icon, 32.0, false, tl!("Toggle fit page / fit width")).clicked() {
+-                    view.fit = if view.fit == Fit::Width { Fit::Page } else { Fit::Width };
+-                    view.goto = Some((view.current, 0.0));
+-                }
+-                let zoom = format!("{:.0}%", view.zoom * 100.0);
+-                ui.allocate_ui_with_layout(vec2(40.0, 16.0), Layout::top_down(Align::Center), |ui| {
+-                    ui.label(egui::RichText::new(zoom).font(theme::medium(11.0)).color(t.text_muted));
+-                });
+-                ui.add_space(6.0);
+-                if icons::button(ui, "chevron-down", 30.0, false, tl!("Next page")).clicked() {
+-                    view.step_page(true);
++                if let Some(panel) = picked {
++                    let open = app.right != Some(panel);
++                    app.choose_right_panel(open.then_some(panel));
+                 }
+-                if icons::button(ui, "chevron-up", 30.0, false, tl!("Previous page")).clicked() {
+-                    view.step_page(false);
+-                }
+-                ui.label(egui::RichText::new(page_count.to_string()).font(theme::regular(11.0)).color(t.text_muted));
+-                let edit = egui::TextEdit::singleline(&mut view.page_input)
+-                    .id(egui::Id::new("page-input"))
+-                    .desired_width(34.0)
+-                    .horizontal_align(Align::Center)
+-                    .font(theme::medium(12.0))
+-                    .margin(vec2(2.0, 4.0));
+-                let r = egui::Frame::NONE
+-                    .fill(t.field)
+-                    .stroke(Stroke::new(1.0, t.border))
+-                    .corner_radius(CornerRadius::same(5))
+-                    .show(ui, |ui| ui.add(edit))
+-                    .inner
+-                    .on_hover_text(tl!("Current page — type a page number or label (such as iv) and press Enter"));
+-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+-                    // A page label first (logical page numbers, as Acrobat), then a number.
+-                    let typed = view.page_input.clone();
+-                    if !view.go_to_typed(&typed, &labels) {
+-                        view.page_input = (view.current + 1).to_string();
+-                    }
+-                }
+-            });
++            }
+             if let Some(id) = page_display {
+                 app.execute(id);
+             }
+@@ -733,3 +781,65 @@
+         assert!(MAC_CONTENT_LEFT <= f32::from(i8::MAX));
+     }
+ }
++
++#[cfg(test)]
++mod rail_tests {
++    use super::*;
++    use egui_kittest::{Harness, kittest::Queryable};
++
++    /// PdfCraft with a document open, in a window `height` points tall.
++    fn shown(height: f32) -> Harness<'static, PdfCraftApp> {
++        let mut h = Harness::builder().with_size(egui::vec2(900.0, height)).build_eframe(|_| {
++            let mut app = PdfCraftApp::new();
++            app.set_option("language", "en").unwrap();
++            app.open_bytes("form.pdf", None, include_bytes!("../tests/data/form.pdf").to_vec()).unwrap();
++            app
++        });
++        h.run_steps(8);
++        h
++    }
++
++    /// The top of the page controls at the rail's foot (page number field, Previous page, ...).
++    fn page_controls_top(h: &Harness<'static, PdfCraftApp>) -> f32 {
++        let field = h
++            .get_all_by_role(egui::accesskit::Role::TextInput)
++            .map(|n| n.rect())
++            .filter(|r| r.center().x > 900.0 - 48.0)
++            .map(|r| r.top())
++            .fold(f32::INFINITY, f32::min);
++        field.min(h.get_by_label("Previous page").rect().top())
++    }
++
++    #[test]
++    fn the_rail_shows_every_panel_button_when_there_is_room() {
++        let h = shown(900.0);
++        assert!(h.query_all_by_label("More").all(|n| n.rect().center().x < 900.0 - 48.0));
++        let tags = h.get_by_label("Tags").rect();
++        assert!(tags.bottom() <= page_controls_top(&h), "Tags {tags:?} runs into the page controls");
++    }
++
++    #[test]
++    fn a_phone_held_sideways_keeps_the_page_controls_clear() {
++        // A phone's landscape height: the view buttons go, and the panels are behind More.
++        let h = shown(380.0);
++        let more = h.get_all_by_label("More").map(|n| n.rect()).find(|r| r.center().x > 900.0 - 48.0).expect("a More button in the rail");
++        assert!(more.bottom() <= page_controls_top(&h), "More {more:?} runs into the page controls");
++        assert!(h.query_by_label_contains("Rotate view clockwise").is_none() && h.query_by_label("Toggle fit page / fit width").is_none());
++        assert!(h.get_by_label_contains("Zoom out").rect().bottom() <= 380.0);
++    }
++
++    #[test]
++    fn a_short_rail_puts_the_buttons_that_dont_fit_in_a_more_menu() {
++        let mut h = shown(420.0);
++        let more = h.get_all_by_label("More").map(|n| n.rect()).find(|r| r.center().x > 900.0 - 48.0).expect("a More button in the rail");
++        assert!(more.bottom() <= page_controls_top(&h), "More {more:?} runs into the page controls");
++        assert!(h.get_by_label("Comments").rect().bottom() <= more.top());
++        assert!(h.query_by_label("Tags").is_none(), "Tags is in the More menu");
++        let more_node = h.get_all_by_label("More").find(|n| n.rect().center().x > 900.0 - 48.0).expect("the rail's More button");
++        more_node.click();
++        h.run_steps(3);
++        h.get_by_label("Tags").click();
++        h.run_steps(3);
++        assert_eq!(h.state().right, Some(RightPanel::Tags));
++    }
++}

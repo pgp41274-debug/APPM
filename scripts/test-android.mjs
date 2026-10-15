@@ -225,7 +225,8 @@ const marker = () => page.evaluate(() => window.__marker).catch(() => null);
 // ---- uiautomator, for the system's own screens (pickers, print dialog) ----
 
 function uiNodes() {
-  sh('uiautomator dump /sdcard/ui.xml');
+  // A failed dump writes nothing: remove the last one first, so it can't be read as this one.
+  sh('rm -f /sdcard/ui.xml; uiautomator dump /sdcard/ui.xml');
   const xml = adb(['exec-out', 'cat', '/sdcard/ui.xml']).out || '';
   return [...xml.matchAll(/<node [^>]*>/g)].map(([n]) => {
     const attr = (k) => (n.match(new RegExp(` ${k}="([^"]*)"`)) || [])[1] || '';
@@ -383,32 +384,48 @@ async function main() {
   const dialog = await waitTop(/printspooler/i, 60000);
   check('printing opens Android\'s print dialog', dialog, dialog || ours(mark).slice(-3).join(' | '));
   if (dialog) {
-    await sleep(5000); // The preview renders the PDF Printer wrote.
+    // The preview renders the PDF Printer wrote: a page, or the print spooler's error message.
+    const shown = (await until(() => {
+      const nodes = uiNodes();
+      return nodes.some((n) => /printspooler:id\/(page_content|message)$/.test(n.id)) ? nodes : null;
+    }, 30000, 1000)) || [];
     screenshot('4-print-dialog.png');
-    const texts = uiNodes().map((n) => n.text).join(' | ');
-    check('... and it can render what PdfCraft sent', !/couldn.t|error|went wrong/i.test(texts), texts.slice(0, 200));
+    const error = shown.find((n) => /printspooler:id\/message$/.test(n.id));
+    check('... and it can render what PdfCraft sent', shown.some((n) => /printspooler:id\/page_content$/.test(n.id)) && !error,
+      error ? error.text : shown.map((n) => n.text).filter(Boolean).join(' | ').slice(0, 200));
     sh('input keyevent KEYCODE_BACK');
     await waitTop(/pdfcraft/, 15000);
   }
 
   // 6. Configuration changes keep PdfCraft and its documents (no recreated activity).
+  // Each change must reach the activity (it logs "configuration changed") and leave the same
+  // page and process.
   const pid = pidOf();
   const before = await marker();
+  check('the page is still there before the configuration changes', before);
+  const kept = async (change) => {
+    const seen = await waitLog(/configuration changed: /, mark, 15000);
+    await sleep(1500);
+    return seen && change.test(seen) && before && (await marker()) === before && pidOf() === pid;
+  };
+  mark = logMark();
   sh('settings put system user_rotation 1');
-  await sleep(4000);
+  check('turning the phone keeps PdfCraft and its documents', await kept(/ land /));
   screenshot('5-landscape.png');
-  check('turning the phone keeps PdfCraft and its documents', (await marker()) === before && pidOf() === pid);
   sh('settings put system user_rotation 0');
   await sleep(2000);
+  mark = logMark();
   sh('cmd uimode night yes');
-  await sleep(4000);
+  check('switching to Dark theme keeps PdfCraft and its documents', await kept(/ night /));
   screenshot('6-dark-theme.png');
-  check('switching to Dark theme keeps PdfCraft and its documents', (await marker()) === before && pidOf() === pid);
   sh('cmd uimode night no');
   await sleep(2000);
+  mark = logMark();
   sh('settings put secure theme_customization_overlay_packages \'{"android.theme.customization.system_palette":"B3261E","android.theme.customization.color_source":"preset"}\'');
   await sleep(5000);
-  check('a wallpaper or theme colour change keeps PdfCraft and its documents', (await marker()) === before && pidOf() === pid);
+  const themed = ours(mark).some((l) => /configuration changed: /.test(l));
+  check('a wallpaper or theme colour change keeps PdfCraft and its documents', before && (await marker()) === before && pidOf() === pid,
+    themed ? 'the change reached the activity in place' : 'no configuration change reached the activity');
   sh('settings delete secure theme_customization_overlay_packages');
   await sleep(2000);
 
@@ -421,9 +438,15 @@ async function main() {
   sh(`am start -W -a android.intent.action.VIEW -t application/pdf -d ${coldUri} --grant-read-uri-permission -n ${MAIN}`);
   device = (await android.devices())[0];
   await attach();
-  await waitReady();
-  check('"Open with" starts PdfCraft when it isn\'t running', await waitLog(/incoming f\d+: /, mark, 10000));
-  await sleep(3000);
+  const coldError = await waitReady();
+  // The shell drains Android's queue once PdfCraft is ready: nothing should still be waiting.
+  const leftover = coldError ? null : await page.evaluate(() => AndroidShell.pending()).catch(() => null);
+  await sleep(3000); // Time for the file's fetch to fail, if it is going to.
+  const coldLines = ours(mark).filter((l) => /incoming f\d+: |Couldn't open/.test(l));
+  check('"Open with" starts PdfCraft when it isn\'t running and opens the file',
+    !coldError && leftover === '[]' && coldLines.some((l) => /incoming f\d+: /.test(l))
+      && !coldLines.some((l) => /Couldn't open/.test(l)),
+    coldError ? `error screen: ${coldError}` : `pending ${leftover}; ${coldLines.join(' | ')}`);
   sh('input keyevent KEYCODE_HOME');
   await sleep(2000);
   sh(`am kill ${PKG}`);

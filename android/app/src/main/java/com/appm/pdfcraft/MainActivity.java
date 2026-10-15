@@ -83,6 +83,7 @@ public final class MainActivity extends ComponentActivity {
     // Instance state: saves waiting on (or queued behind) the "Save as" picker.
     private static final String STATE_ASKING = "asking";
     private static final String STATE_SAVES = "saves";
+    private static final String STATE_INCOMING = "incoming";
 
     /** Writes saves, one at a time and in order. */
     private final ExecutorService io = Executors.newSingleThreadExecutor();
@@ -175,6 +176,7 @@ public final class MainActivity extends ComponentActivity {
     @Override
     public void onConfigurationChanged(@NonNull Configuration config) {
         super.onConfigurationChanged(config);
+        Log.i(TAG, "configuration changed: " + config);
         // Changes are handled here rather than by recreating the activity (that would lose every
         // open document): follow a switch to or from Dark theme.
         int surface = ContextCompat.getColor(this, R.color.surface);
@@ -202,6 +204,8 @@ public final class MainActivity extends ComponentActivity {
             if (!job.isClose()) queued.add(job.toBundle());
         }
         out.putParcelableArrayList(STATE_SAVES, queued);
+        // Files handed in that the page hasn't opened yet: their intents won't come again.
+        out.putParcelableArrayList(STATE_INCOMING, files.waiting());
     }
 
     /**
@@ -230,6 +234,12 @@ public final class MainActivity extends ComponentActivity {
             }
         }
         files.sweepSpools(keep);
+        if (state != null) {
+            ArrayList<Bundle> waiting = BundleCompat.getParcelableArrayList(state, STATE_INCOMING, Bundle.class);
+            if (waiting != null) files.restoreWaiting(waiting);
+        }
+        // Bytes no save could write, kept in their own tabs until saved or closed.
+        files.reopenAll();
     }
 
     @Override
@@ -356,6 +366,7 @@ public final class MainActivity extends ComponentActivity {
                 // hand its files to the next page instead.
                 files.abortAll();
                 printer.abortAll();
+                files.reopenAll();
                 if (chooser != null) {
                     chooser.onReceiveValue(null);
                     chooser = null;
@@ -566,6 +577,12 @@ public final class MainActivity extends ComponentActivity {
     }
 
     private boolean supportsWrite(Uri uri) {
+        // Only these providers set FLAG_SUPPORTS_WRITE exactly when a file can be written: the
+        // media provider's Documents and Recent entries never set it, yet write fine. Elsewhere
+        // try the write; a failed one is safe (FileStore.replace) and saves a copy instead.
+        String authority = uri.getAuthority();
+        if (!"com.android.externalstorage.documents".equals(authority)
+                && !"com.android.providers.downloads.documents".equals(authority)) return true;
         if (!DocumentsContract.isDocumentUri(this, uri)) return true;
         try (Cursor c = getContentResolver().query(uri, new String[] {DocumentsContract.Document.COLUMN_FLAGS}, null, null, null)) {
             if (c != null && c.moveToFirst() && !c.isNull(0)) {
@@ -622,6 +639,7 @@ public final class MainActivity extends ComponentActivity {
         if (job == null) return;
         if (job.isClose()) {
             files.forget(job.key);
+            files.settled(job.key);
             nextSave();
             return;
         }
@@ -671,6 +689,14 @@ public final class MainActivity extends ComponentActivity {
             nextSave();
             return;
         }
+        if (uri != null) {
+            try {
+                getContentResolver().takePersistableUriPermission(uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            } catch (SecurityException ignored) {
+                // Writable for now; a write cut short by a restart then goes to Downloads.
+            }
+        }
         // PdfCraft already counts the document as saved, so a cancelled Save As still keeps
         // a copy (in Downloads/PdfCraft) rather than losing the work.
         if (uri != null && !job.isExport()) files.bind(job.key, uri);
@@ -689,8 +715,20 @@ public final class MainActivity extends ComponentActivity {
 
     /** Write a save to {@code target}, or to Downloads/PdfCraft when there's none or it fails. */
     private String write(FileStore.SaveJob job, Uri target) {
+        if (job.restore) return undo(job, target);
         String message = writeOrCopy(job, target);
         return job.resume != null ? getString(R.string.save_resumed, message) : message;
+    }
+
+    /** A write an earlier process didn't finish, whose new bytes are gone: put the file back. */
+    private String undo(FileStore.SaveJob job, Uri target) {
+        try {
+            if (files.restore(target, job)) return getString(R.string.save_undone, files.displayName(target));
+            return getString(R.string.save_undone_copy, job.name, FileStore.DOWNLOADS_FOLDER + "/" + FileStore.beforeSaving(job.name));
+        } catch (IOException | RuntimeException e) {
+            Log.e(TAG, "can't put back " + target, e);
+            return getString(R.string.save_undone_later, job.name);
+        }
     }
 
     private String writeOrCopy(FileStore.SaveJob job, Uri target) {
@@ -700,6 +738,7 @@ public final class MainActivity extends ComponentActivity {
                 try {
                     // Never leaves the file half-written: on failure it holds what it held.
                     files.replace(target, job);
+                    files.settled(job.key);
                     return getString(R.string.saved, files.displayName(target));
                 } catch (IOException | RuntimeException e) {
                     Log.w(TAG, "can't write " + target, e);
@@ -711,6 +750,7 @@ public final class MainActivity extends ComponentActivity {
             if (!job.isExport() && job.key != null) {
                 if (target == null && job.saveAs) files.bindIfUnbound(job.key, copy);
                 else files.bind(job.key, copy);
+                files.settled(job.key);
             }
             String where = FileStore.DOWNLOADS_FOLDER + "/" + files.displayName(copy);
             return target != null ? getString(R.string.saved_instead, where) : getString(R.string.saved_to, where);
@@ -718,17 +758,23 @@ public final class MainActivity extends ComponentActivity {
             Log.e(TAG, "save failed", e);
             String reason = String.valueOf(e.getMessage());
             if (job.isExport()) return getString(R.string.save_failed, job.name, reason);
-            // PdfCraft counts the document as saved (and may have closed it already): open the
-            // bytes that couldn't be written in a new tab, so the work isn't lost.
-            keep = true;
+            // PdfCraft counts the document as saved (and may have closed it already): keep the
+            // bytes that couldn't be written, open in a new tab until saved or closed.
+            try {
+                files.settled(job.key); // Older bytes kept for this document are superseded.
+                files.reopen(job);
+            } catch (IOException | RuntimeException again) {
+                Log.e(TAG, "can't keep the unsaved bytes", again);
+                keep = true; // In the cache at least, until the next start.
+                return getString(R.string.save_failed, job.name, reason);
+            }
             runOnUiThread(() -> {
-                files.addIncoming(Uri.fromFile(job.file), job.name, false);
                 if (web != null) web.evaluateJavascript("window.shell && shell.incoming()", null);
             });
             return getString(R.string.save_failed_reopened, job.name, reason);
         } finally {
             //noinspection ResultOfMethodCallIgnored
-            if (!keep) job.file.delete();
+            if (!keep) job.file.delete(); // Gone already if it was kept (reopen moved it).
         }
     }
 

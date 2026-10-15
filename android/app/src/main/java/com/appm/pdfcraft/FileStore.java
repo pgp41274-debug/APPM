@@ -14,6 +14,8 @@ import android.util.Base64;
 import android.util.Log;
 import android.webkit.MimeTypeMap;
 
+import androidx.core.os.BundleCompat;
+
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -33,9 +35,12 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -52,10 +57,12 @@ final class FileStore {
     private static final class Incoming {
         final Uri uri;
         final String name;
+        final boolean canWrite;
 
-        Incoming(Uri uri, String name) {
+        Incoming(Uri uri, String name, boolean canWrite) {
             this.uri = uri;
             this.name = name;
+            this.canWrite = canWrite;
         }
     }
 
@@ -81,12 +88,17 @@ final class FileStore {
          * ({@link #interruptedWrites}); null for every other job.
          */
         final Uri resume;
+        /**
+         * For a {@link #resume}d write whose new bytes are gone: {@link #file} is what the file
+         * held before, to be put back ({@link FileStore#restore}).
+         */
+        final boolean restore;
 
         SaveJob(String name, String mime, boolean saveAs, String kind, String key, File file) {
-            this(name, mime, saveAs, kind, key, file, null);
+            this(name, mime, saveAs, kind, key, file, null, false);
         }
 
-        private SaveJob(String name, String mime, boolean saveAs, String kind, String key, File file, Uri resume) {
+        private SaveJob(String name, String mime, boolean saveAs, String kind, String key, File file, Uri resume, boolean restore) {
             this.name = name;
             this.mime = mime;
             this.saveAs = saveAs;
@@ -94,6 +106,12 @@ final class FileStore {
             this.key = key;
             this.file = file;
             this.resume = resume;
+            this.restore = restore;
+        }
+
+        /** A write an earlier process began ({@link FileStore#interruptedWrites}), to finish or undo. */
+        static SaveJob resumed(String name, String mime, File file, Uri uri, boolean restore) {
+            return new SaveJob(name, mime, false, "save", null, file, uri, restore);
         }
 
         boolean isExport() {
@@ -117,6 +135,7 @@ final class FileStore {
             b.putString("key", key);
             b.putString("file", file.getPath());
             if (resume != null) b.putString("resume", resume.toString());
+            b.putBoolean("restore", restore);
             return b;
         }
 
@@ -128,7 +147,7 @@ final class FileStore {
             if (name == null || path == null || !new File(path).isFile()) return null;
             String resume = b.getString("resume");
             return new SaveJob(name, b.getString("mime"), b.getBoolean("saveAs"), b.getString("kind"), b.getString("key"),
-                    new File(path), resume == null ? null : Uri.parse(resume));
+                    new File(path), resume == null ? null : Uri.parse(resume), b.getBoolean("restore"));
         }
     }
 
@@ -149,6 +168,8 @@ final class FileStore {
     private final List<String> pending = new ArrayList<>();
     private final SaveTargets<Uri> targets = new SaveTargets<>();
     private final Map<String, Spool> spools = new HashMap<>();
+    /** Bytes that couldn't be saved anywhere, open again in a tab ({@link #reopen}), by that tab's id. */
+    private final Map<String, File> unsaved = new HashMap<>();
 
     FileStore(Context context) {
         this.context = context.getApplicationContext();
@@ -169,7 +190,7 @@ final class FileStore {
     String addIncoming(Uri uri, String name, boolean canWrite) {
         synchronized (this) {
             String id = "f" + ids.incrementAndGet();
-            incoming.put(id, new Incoming(uri, name));
+            incoming.put(id, new Incoming(uri, name, canWrite));
             pending.add(id);
             targets.addIncoming(id, name, uri, canWrite);
             return id;
@@ -179,6 +200,35 @@ final class FileStore {
     /** Note a file picked in PdfCraft's own Open; {@code canWrite} if a Save may overwrite it. */
     void addPicked(Uri uri, boolean canWrite) {
         targets.addPicked(displayName(uri), uri, canWrite);
+    }
+
+    /**
+     * The files handed in that the page hasn't taken yet, as instance state: if Android ends the
+     * process before PdfCraft is ready, the next one opens them ({@link #restoreWaiting}). Their
+     * grants last as long as the activity. Only files from other apps: bytes kept by
+     * {@link #reopen} come back by themselves.
+     */
+    synchronized ArrayList<Bundle> waiting() {
+        ArrayList<Bundle> out = new ArrayList<>();
+        for (String id : pending) {
+            Incoming in = incoming.get(id);
+            if (in == null || !"content".equals(in.uri.getScheme())) continue;
+            Bundle b = new Bundle();
+            b.putParcelable("uri", in.uri);
+            b.putString("name", in.name);
+            b.putBoolean("canWrite", in.canWrite);
+            out.add(b);
+        }
+        return out;
+    }
+
+    /** Queue again the files {@link #waiting} kept. */
+    void restoreWaiting(List<Bundle> waiting) {
+        for (Bundle b : waiting) {
+            Uri uri = BundleCompat.getParcelable(b, "uri", Uri.class);
+            String name = b.getString("name");
+            if (uri != null && name != null) addIncoming(uri, name, b.getBoolean("canWrite"));
+        }
     }
 
     /** The files queued since the last call, as a JSON list of {@code {id, name}}. */
@@ -372,44 +422,69 @@ final class FileStore {
         String base = job.file.getName(); // Unique: the spool's temporary name.
         File backup = new File(dir, base + ".bak");
         File note = new File(dir, base + ".json");
-        // A write an earlier process didn't finish keeps the copy taken before it started: the
-        // file itself may be cut short now.
+        // A write an earlier process began keeps the copy taken before it: the file itself may be
+        // cut short now.
         boolean resumed = backup.isFile();
         if (!resumed) {
+            // The note first: if the process ends while the file is being copied aside, the next
+            // one still has the save to finish.
+            writeNote(note, uri, job);
             File part = new File(dir, base + ".bak.part");
             try (InputStream in = resolver.openInputStream(uri)) {
                 if (in == null) throw new FileNotFoundException("can't read " + uri);
                 copy(in, part);
+                if (!part.renameTo(backup)) throw new IOException("can't keep a copy of " + uri);
             } catch (IOException | RuntimeException e) {
-                delete(part);
+                delete(part, note); // The file is untouched.
                 throw e;
             }
-            if (!part.renameTo(backup)) throw new IOException("can't keep a copy of " + uri);
         }
-        writeNote(note, uri, job);
         OutputStream out;
         try {
             out = openForWrite(uri); // Empties the file.
         } catch (IOException | RuntimeException e) {
-            // Not writable. Untouched, unless an earlier process had begun writing it.
-            if (resumed) keepCopy(beforeSaving(job.name), job.mime, backup);
-            delete(note, backup);
+            // Not writable: untouched, unless an earlier process had begun writing it. Then what
+            // it held goes to Downloads, or stays here for the next process to try again.
+            if (!resumed || keepCopy(beforeSaving(job.name), job.mime, backup)) delete(note, backup);
             throw e;
         }
         try {
             copy(job.file, out);
         } catch (IOException | RuntimeException e) {
+            boolean kept;
             try {
                 writeTo(uri, backup);
+                kept = true;
             } catch (IOException | RuntimeException again) {
                 // The file is cut short and can't be mended: keep what it held in Downloads.
                 e.addSuppressed(again);
-                keepCopy(beforeSaving(job.name), job.mime, backup);
+                kept = keepCopy(beforeSaving(job.name), job.mime, backup);
             }
-            delete(note, backup);
+            if (kept) delete(note, backup); // Else the next process tries again.
             throw e;
         }
         delete(note, backup);
+    }
+
+    /**
+     * Put back what {@code uri} held before a write an earlier process didn't finish and whose
+     * new bytes are gone ({@link SaveJob#restore}). Returns false if it can't be reached any more
+     * (its grant ended with the task) and what it held went to Downloads as
+     * {@link #beforeSaving}; throws if even that failed, leaving everything for the next process.
+     */
+    boolean restore(Uri uri, SaveJob job) throws IOException {
+        File backup = job.file;
+        String base = backup.getName().substring(0, Math.max(0, backup.getName().length() - ".bak".length()));
+        File note = new File(backup.getParentFile(), base + ".json");
+        try {
+            writeTo(uri, backup);
+            delete(note, backup);
+            return true;
+        } catch (IOException | RuntimeException e) {
+            if (!keepCopy(beforeSaving(job.name), job.mime, backup)) throw e;
+            delete(note, backup);
+            return false;
+        }
     }
 
     /**
@@ -422,25 +497,39 @@ final class FileStore {
         synchronized (FileStore.class) {
             if (swept) return jobs;
         }
-        File[] notes = writingDir().listFiles((dir, n) -> n.endsWith(".json"));
-        if (notes == null) return jobs;
-        for (File note : notes) {
-            String base = note.getName().substring(0, note.getName().length() - ".json".length());
-            File backup = new File(note.getParentFile(), base + ".bak");
+        File dir = writingDir();
+        File[] all = dir.listFiles();
+        if (all == null) return jobs;
+        Set<String> notes = new HashSet<>();
+        for (File f : all) {
+            String n = f.getName();
+            if (n.endsWith(".json")) notes.add(n.substring(0, n.length() - ".json".length()));
+        }
+        // What a process left half done: a copy or note it was still writing, a copy with no note.
+        for (File f : all) {
+            String n = f.getName();
+            if (n.endsWith(".part") || (n.endsWith(".bak") && !notes.contains(n.substring(0, n.length() - ".bak".length())))) {
+                delete(f);
+            }
+        }
+        for (String base : notes) {
+            File note = new File(dir, base + ".json");
+            File backup = new File(dir, base + ".bak");
             try {
                 JSONObject o = new JSONObject(new String(readAll(note), StandardCharsets.UTF_8));
                 Uri uri = Uri.parse(o.getString("uri"));
                 File bytes = new File(o.getString("file"));
                 String name = o.getString("name");
                 String mime = o.optString("mime", "application/pdf");
-                if (!backup.isFile()) throw new IOException("no copy of " + uri);
-                if (!bytes.isFile()) {
-                    // The new bytes are gone (the cache was cleared): the file gets its old ones back.
-                    File parent = bytes.getParentFile();
-                    if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("can't create " + parent);
-                    if (!backup.renameTo(bytes)) throw new IOException("can't restore " + uri);
+                if (bytes.isFile()) {
+                    // Write it again; from the start if the file was never touched (no copy yet).
+                    jobs.add(SaveJob.resumed(name, mime, bytes, uri, false));
+                } else if (backup.isFile()) {
+                    // The new bytes are gone (the cache was cleared): put back what the file held.
+                    jobs.add(SaveJob.resumed(name, mime, backup, uri, true));
+                } else {
+                    delete(note); // Nothing was written, and there is nothing left to write.
                 }
-                jobs.add(new SaveJob(name, mime, false, "save", null, bytes, uri));
             } catch (IOException | JSONException | RuntimeException e) {
                 delete(note, backup);
             }
@@ -461,11 +550,16 @@ final class FileStore {
             throw new IOException(e);
         }
         File part = new File(note.getPath() + ".part");
-        try (OutputStream out = new FileOutputStream(part)) {
-            out.write(json.getBytes(StandardCharsets.UTF_8));
-            ((FileOutputStream) out).getFD().sync();
+        try {
+            try (FileOutputStream out = new FileOutputStream(part)) {
+                out.write(json.getBytes(StandardCharsets.UTF_8));
+                out.getFD().sync();
+            }
+            if (!part.renameTo(note)) throw new IOException("can't write " + note);
+        } catch (IOException | RuntimeException e) {
+            delete(part);
+            throw e;
         }
-        if (!part.renameTo(note)) throw new IOException("can't write " + note);
     }
 
     private static void delete(File... files) {
@@ -489,12 +583,77 @@ final class FileStore {
         }
     }
 
-    /** Keep {@code file} in Downloads/PdfCraft as {@code name}, if at all possible. */
-    private void keepCopy(String name, String mime, File file) {
+    /**
+     * Keep {@code file} in Downloads/PdfCraft as {@code name}; false if that failed. An empty
+     * file (a new document from the "Save as" picker held nothing yet) needs no keeping.
+     */
+    private boolean keepCopy(String name, String mime, File file) {
+        if (file.length() == 0) return true;
         try {
             saveToDownloads(name, mime, file);
+            return true;
         } catch (IOException | RuntimeException e) {
             Log.e("PdfCraft", "can't keep " + name, e);
+            return false;
+        }
+    }
+
+    // ---- bytes no save could write ----
+
+    private File unsavedDir() {
+        return new File(context.getNoBackupFilesDir(), "unsaved");
+    }
+
+    /**
+     * Keep the bytes of a save that couldn't be written anywhere, and open them again in a tab.
+     * They stay, and open again after a restart ({@link #reopenAll}), until that document is
+     * saved or closed ({@link #settled}). Returns the tab's id.
+     */
+    String reopen(SaveJob job) throws IOException {
+        File dir = new File(unsavedDir(), job.file.getName());
+        if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("can't create " + dir);
+        File kept = new File(dir, job.name);
+        if (!job.file.renameTo(kept)) throw new IOException("can't keep " + job.name);
+        synchronized (this) {
+            String id = addIncoming(Uri.fromFile(kept), job.name, false);
+            unsaved.put(id, kept);
+            return id;
+        }
+    }
+
+    /**
+     * A new page or process: open the bytes {@link #reopen} kept in tabs again, except those
+     * still waiting to be opened.
+     */
+    synchronized void reopenAll() {
+        Set<File> waiting = new HashSet<>();
+        for (Iterator<Map.Entry<String, File>> it = unsaved.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, File> e = it.next();
+            if (pending.contains(e.getKey())) waiting.add(e.getValue());
+            else it.remove();
+        }
+        File[] dirs = unsavedDir().listFiles();
+        if (dirs == null) return;
+        for (File dir : dirs) {
+            File[] kept = dir.listFiles();
+            if (kept == null || kept.length == 0) {
+                delete(dir);
+                continue;
+            }
+            if (waiting.contains(kept[0])) continue;
+            unsaved.put(addIncoming(Uri.fromFile(kept[0]), kept[0].getName(), false), kept[0]);
+        }
+    }
+
+    /** Document {@code key} was saved or closed: bytes {@link #reopen} kept for it can go. */
+    synchronized void settled(String key) {
+        if (key == null) return;
+        for (Iterator<Map.Entry<String, File>> it = unsaved.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, File> e = it.next();
+            if (key.equals(targets.keyFor(e.getKey(), ""))) {
+                delete(e.getValue(), e.getValue().getParentFile());
+                it.remove();
+            }
         }
     }
 
