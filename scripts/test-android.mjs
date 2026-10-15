@@ -483,8 +483,17 @@ async function main() {
     if (shot) {
       const [x0, x1] = [Math.round(shot.width * 0.2), Math.round(shot.width * 0.7)];
       const [y0, y1] = [Math.round(shot.height * 0.3), Math.round(shot.height * 0.85)];
-      sh(`input swipe ${Math.round(shot.width * 0.45)} ${Math.round(shot.height * 0.75)} ${Math.round(shot.width * 0.45)} ${Math.round(shot.height * 0.45)} 500`);
-      await sleep(3000); // The glide settles.
+      // The finger moves up in steps and rests before it lifts, so the page moves by the swipe
+      // and no glide carries it further (past the range the shift is searched in).
+      const [sx, sy0, sy1] = [Math.round(shot.width * 0.45), Math.round(shot.height * 0.75), Math.round(shot.height * 0.45)];
+      sh(`input motionevent DOWN ${sx} ${sy0}`);
+      for (let k = 1; k <= 12; k++) {
+        sh(`input motionevent MOVE ${sx} ${Math.round(sy0 - ((sy0 - sy1) * k) / 12)}`);
+        await sleep(40);
+      }
+      await sleep(600);
+      sh(`input motionevent UP ${sx} ${sy1}`);
+      await sleep(3000); // The page settles.
       const moved = shiftUp(shot, screenPixels() || shot, x0, x1, y0, y1);
       const swiped = Math.round(shot.height * 0.3);
       check('a finger swiped up the page scrolls it', moved.unmoved > 1 && moved.shift >= swiped * 0.7,
