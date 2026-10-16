@@ -765,9 +765,13 @@ try {
         await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
         await sleep(70);
         await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-        await sleep(100);
+        // The tap is logged when the page has handled its release, which a slow machine (CI draws
+        // in software) can leave for a good while. Wait for it: a second tap made too early would
+        // land on a page that has already let go of its selection and hide the bars.
+        for (let waited = 0; waited < 4000 && (await p.evaluate(() => window.__downs.length)) <= before; waited += 100) await sleep(100);
         const downs2 = await p.evaluate(() => window.__downs);
         if (downs2.length > before && downs2.at(-1) <= 300) return downs2.at(-1);
+        if (downs2.length <= before) return -1; // never logged: do not tap again blindly
         await sleep(800);
       }
       return -1;
