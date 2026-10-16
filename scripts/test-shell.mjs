@@ -705,11 +705,20 @@ try {
 
     // Taps are not a long press: one, two or three quick taps on that same word select nothing
     // (a mouse's double and triple click select a word and a line; a finger lands in them by accident).
-    const tapAt = async (x, y) => {
-      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
-      await sleep(40);
-      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-    };
+    // Both events go out together: a slow machine (CI draws in software) otherwise holds the
+    // finger down for a frame or more between them, and a finger down for half a second IS a
+    // long press. Each tap's real time down is recorded, so a failure says which it was.
+    await p.frames().find((f) => f.url().includes('/app/pdfcraft/')).evaluate(() => {
+      window.top.__downs = [];
+      let t0 = 0;
+      document.addEventListener('pointerdown', () => { t0 = performance.now(); }, true);
+      document.addEventListener('pointerup', () => { window.top.__downs.push(Math.round(performance.now() - t0)); }, true);
+    });
+    if (process.env.TAP_SLOW) await cdp.send('Emulation.setCPUThrottlingRate', { rate: Number(process.env.TAP_SLOW) });
+    const tapAt = (x, y) => Promise.all([
+      cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] }),
+      cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }),
+    ]);
     const [wx, wy] = [fb.x + fb.width * onWord[0], fb.y + fb.height * onWord[1]];
     const taps = {};
     for (const n of [1, 2, 3, 4]) {
@@ -726,7 +735,10 @@ try {
       }
       await sleep(600);
     }
-    check('quick taps on a word select nothing: only a held finger does', Object.values(taps).every((t) => t === null), JSON.stringify(taps));
+    const downs = await p.evaluate(() => window.__downs);
+    if (process.env.TAP_SLOW) await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 });
+    check('quick taps on a word select nothing: only a held finger does', Object.values(taps).every((t) => t === null),
+      JSON.stringify({ taps, msDown: downs }));
     // The taps may have hidden the bars (a tap on the page does); bring them back for what follows.
     if (await p.evaluate(() => document.body.classList.contains('immersive'))) {
       await p.touchscreen.tap(fb.x + fb.width * 0.9, fb.y + fb.height * 0.97);
