@@ -1,0 +1,234 @@
+--- a/apps/pdfcraft-web/src/main.rs
++++ b/apps/pdfcraft-web/src/main.rs
+@@ -69,6 +69,9 @@
+                         // `&chrome=host`: the page draws the controls (a phone's toolbars).
+                         if query_param("chrome").as_deref() == Some("host") {
+                             app.host_chrome = true;
++                            // `&panel=side`: panels dock beside the page (a tablet), not under it.
++                            app.host_side_panel = query_param("panel").as_deref() == Some("side");
++                            watch_pointer_type(app.host_pointer_touch.clone());
+                             // No panel left open from last time: on a phone it covers the page.
+                             app.right = None;
+                             app.host_state = Some(bridge.state_fn());
+@@ -96,6 +99,22 @@
+     });
+ }
+ 
++/// Note, before any frame sees it, whether each press comes from a finger: the browser's
++/// `pointerType`. (A frame can run between a tap's `pointerdown` and its `touchstart`.)
++#[cfg(target_arch = "wasm32")]
++fn watch_pointer_type(touch: std::sync::Arc<std::sync::atomic::AtomicBool>) {
++    use eframe::wasm_bindgen::{JsCast, JsValue, closure::Closure};
++    let Some(window) = web_sys::window() else { return };
++    let handler = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
++        let finger = js_sys::Reflect::get(&event, &JsValue::from_str("pointerType")).ok().and_then(|t| t.as_string()).is_some_and(|t| t == "touch");
++        touch.store(finger, std::sync::atomic::Ordering::Relaxed);
++    });
++    // In the capture phase: ahead of the page's own handlers.
++    if window.add_event_listener_with_callback_and_bool("pointerdown", handler.as_ref().unchecked_ref(), true).is_ok() {
++        handler.forget();
++    }
++}
++
+ #[cfg(target_arch = "wasm32")]
+ fn warn_before_unload(unsaved: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+     use eframe::wasm_bindgen::{JsCast, closure::Closure};
+--- a/crates/ui-egui/src/canvas.rs
++++ b/crates/ui-egui/src/canvas.rs
+@@ -370,6 +370,8 @@
+     pub(crate) host_compose: Option<bool>,
+     /// A long press selected a word: its release is not a tap that clears the selection.
+     long_pressed: bool,
++    /// The latest press on a page was a finger's (a mouse on the same screen keeps its double click).
++    press_touch: bool,
+     viewport_h: f32,
+     page_count: usize,
+     /// Page heights in points (view space), for mapping text positions to scroll offsets.
+@@ -641,6 +643,7 @@
+             host: false,
+             host_compose: None,
+             long_pressed: false,
++            press_touch: false,
+             viewport_h: 600.0,
+             page_count: info.pages.len(),
+             page_heights: info.pages.iter().map(|p| p.height).collect(),
+@@ -2141,6 +2144,7 @@
+     }
+     // The Prepare a form panel is open (or a field tool is picked): fields are edited, not filled.
+     let preparing = app.is_preparing();
++    let pointer_touch = app.host_pointer_touch.load(std::sync::atomic::Ordering::Relaxed);
+     // Edit a PDF: added text and images can be selected, moved and edited.
+     let editing_content =
+         (app.left_open && app.left == crate::LeftPanel::Tool("edit")) || matches!(app.quick_tool, QuickTool::AddText | QuickTool::EditText);
+@@ -2365,8 +2369,8 @@
+     // A finger dragged across the page with the Select tool scrolls it, as on any phone or
+     // tablet. The page widget below senses every drag (text selection), so the ScrollArea's
+     // own drag-to-scroll never gets one. A press on a comment or a form field still goes to
+-    // it, a double tap still selects a word (not when a host draws the controls: there only a
+-    // finger held on a word does), and two fingers pinch-zoom instead.
++    // it, a double tap still selects a word (not for a finger when a host draws the controls: there
++    // only a finger held on a word selects), and two fingers pinch-zoom instead.
+     let touch_pan = tool == QuickTool::Select && !preparing && ui.input(|i| i.any_touches() && i.multi_touch().is_none());
+     // Text selection runs for the Select tool and for the markup tools (highlight…).
+     let selects_text = match tool {
+@@ -2908,12 +2912,18 @@
+                         view.clicks = if is_consecutive { view.clicks.saturating_add(1) } else { 1 };
+                         view.last_press_time = now;
+                         view.last_press_pos = Some(p);
++                        // What the browser said the pointer was (`pointerType`, noted before any frame
++                        // ran), and, outside a browser, this frame's touch events and fingers down.
++                        view.press_touch =
++                            pointer_touch || ui.input(|inp| inp.any_touches() || inp.events.iter().any(|e| matches!(e, egui::Event::Touch { .. })));
+ 
+                         // Multi-click highlights immediately on pointer press instead of release (#1024).
+                         let clicks = if view.clicks > 2 && tool != QuickTool::Select { 1 } else { view.clicks };
+-                        // On a phone (the host draws the controls) two quick taps are not a double click:
+-                        // a word is selected by holding a finger on it, and by nothing else.
+-                        if clicks >= 2 && over_text && !view.host {
++                        // With the host drawing the controls, two quick taps are not a double click: a
++                        // word is selected by holding a finger on it, and by nothing else. (A mouse
++                        // on the same screen, a tablet's keyboard and mouse, keeps its double click.)
++                        let finger_only = view.host && view.press_touch;
++                        if clicks >= 2 && over_text && !finger_only {
+                             let span = text.nearest(vx, vy).and_then(|a| match clicks {
+                                 2 => text.word_at(a),
+                                 3 => text.line_at(a),
+@@ -2991,7 +3001,7 @@
+                     // Only on the frame egui reports the multi-click: `view.clicks` outlives it, and
+                     // acting on every frame re-selected the word as soon as a selection was cleared
+                     // (a highlight made by the double-click left its word selected).
+-                    if release_clicks > 0 && clicks >= 2 && over_text && !view.host {
++                    if release_clicks > 0 && clicks >= 2 && over_text && !(view.host && view.press_touch) {
+                         if view.selection.is_none() {
+                             let span = text.nearest(vx, vy).and_then(|a| match clicks {
+                                 2 => text.word_at(a),
+--- a/crates/ui-egui/src/host_chrome.rs
++++ b/crates/ui-egui/src/host_chrome.rs
+@@ -237,12 +237,13 @@
+             "night": self.reading_colors.mode_name() == "white-on-black",
+             "organize": active.is_some_and(|v| v.organize),
+             "editable": editable,
++            "panelRect": self.host_panel_rect.map(|r| json!({ "x": px(r.left()), "y": px(r.top()), "w": px(r.width()), "h": px(r.height()) })),
+             "busy": self.dialog.is_some() || self.palette_open,
+         })
+     }
+ 
+-    /// The frame when the host draws the controls: the open panel as a sheet from the bottom,
+-    /// the page above it, and what PdfCraft draws over the page.
++    /// The frame when the host draws the controls: the open panel as a sheet from the bottom (or,
++    /// for a tablet, beside the page), the page, and what PdfCraft draws over the page.
+     pub(crate) fn host_chrome_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+         let t = theme::Tokens::get(ctx);
+         // No floating quick-action bar to keep the pages clear of: a phone's width is the page's.
+@@ -250,14 +251,33 @@
+             view.side = HOST_SIDE;
+             view.host = true;
+         }
++        self.host_panel_rect = None;
+         if self.active.is_some() && self.right.is_some_and(|p| PANELS.contains(&p)) {
+-            let height = ui.max_rect().height();
+-            egui::Panel::bottom("host_panel")
+-                .resizable(true)
+-                .default_size(height * 0.45)
+-                .size_range(120.0..=(height * 0.85).max(120.0))
+-                .frame(egui::Frame::NONE.fill(t.panel).stroke(egui::Stroke::new(1.0, t.divider)))
+-                .show(ui, |ui| panels::right_panel(self, ui));
++            let frame = egui::Frame::NONE.fill(t.panel).stroke(egui::Stroke::new(1.0, t.divider));
++            let shown = if self.host_side_panel {
++                // Beside the page: a third of the width, within what a panel reads well at.
++                let width = ui.max_rect().width();
++                egui::Panel::right("host_panel")
++                    .resizable(true)
++                    .default_size((width * 0.34).clamp(300.0, 440.0))
++                    .size_range(260.0..=(width * 0.6).max(260.0))
++                    .frame(frame)
++                    .show(ui, |ui| panels::right_panel(self, ui))
++                    .response
++                    .rect
++            } else {
++                // Under the page, as a sheet from the bottom.
++                let height = ui.max_rect().height();
++                egui::Panel::bottom("host_panel")
++                    .resizable(true)
++                    .default_size(height * 0.45)
++                    .size_range(120.0..=(height * 0.85).max(120.0))
++                    .frame(frame)
++                    .show(ui, |ui| panels::right_panel(self, ui))
++                    .response
++                    .rect
++            };
++            self.host_panel_rect = Some(shown);
+         }
+         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.pasteboard)).show(ui, |ui| match self.active {
+             Some(index) => canvas::document_area(self, index, ui),
+@@ -450,6 +470,42 @@
+         assert_eq!(state(&h)["undo"], false, "and no stroke was drawn");
+     }
+ 
++    /// A 1000 x 700 screen (a tablet), with the panel under the page or, with `side`, beside it.
++    fn tablet(side: bool) -> Harness<'static, PdfCraftApp> {
++        let mut h = Harness::builder().with_size(egui::vec2(1000.0, 700.0)).build_eframe(move |_| {
++            let mut app = PdfCraftApp::new();
++            app.set_option("language", "en").unwrap();
++            app.host_chrome = true;
++            app.host_side_panel = side;
++            app.open_bytes("long.pdf", None, crate::canvas::touch_tests::long_pdf(3)).unwrap();
++            app
++        });
++        h.run_steps(8);
++        h
++    }
++
++    #[test]
++    fn a_tablet_docks_the_panel_beside_the_page_and_a_phone_under_it() {
++        for side in [false, true] {
++            let mut h = tablet(side);
++            assert!(state(&h)["panelRect"].is_null(), "no panel open yet");
++            ask(&mut h, HostRequest::Panel(Some("Pages".into())));
++            h.run_steps(4);
++            let r = state(&h)["panelRect"].clone();
++            let (x, y, w, hgt) = (r["x"].as_f64().unwrap(), r["y"].as_f64().unwrap(), r["w"].as_f64().unwrap(), r["h"].as_f64().unwrap());
++            let pages = h.state().views[0].visible_page_rects();
++            let right_edge = pages.iter().map(|(_, r)| r.right()).fold(0.0_f32, f32::max);
++            if side {
++                assert!(x > 500.0 && (300.0..=440.0).contains(&w) && hgt > 600.0, "beside the page: {r}");
++                assert!(f64::from(right_edge) <= x + 1.0, "the pages stay clear of the panel ({right_edge} vs {x})");
++            } else {
++                assert!(w > 900.0 && y > 250.0 && hgt < 400.0, "under the page: {r}");
++            }
++            ask(&mut h, HostRequest::Panel(None));
++            assert!(state(&h)["panelRect"].is_null());
++        }
++    }
++
+     #[test]
+     fn the_host_sets_colours_searches_writes_comments_and_shares() {
+         let mut h = phone(2);
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -638,6 +638,15 @@
+     /// dialogs and, as a sheet from the bottom, the open panel; never its own tab strip,
+     /// toolbars, tool strip or rail.
+     pub host_chrome: bool,
++    /// With [`Self::host_chrome`]: the open panel docks at the right, beside the page (a tablet
++    /// has the room), instead of rising from the bottom (a phone).
++    pub host_side_panel: bool,
++    /// Whether the latest pointer press came from a finger, as the browser reports it
++    /// (`pointerType`, noted before any frame): a frame can run between a tap's `pointerdown`
++    /// and its `touchstart`, so the frame's own touch events cannot tell.
++    pub host_pointer_touch: std::sync::Arc<std::sync::atomic::AtomicBool>,
++    /// Where the open panel was drawn last frame, for the host's state (`panelRect`).
++    pub(crate) host_panel_rect: Option<egui::Rect>,
+     /// What that page asked for (see [`HostRequest`]).
+     pub host_requests: HostRequests,
+     /// Reports what that page needs to draw its controls (see [`HostStateFn`]).
+@@ -962,6 +971,9 @@
+             host_full_screen: None,
+             host_leave_full_screen: Default::default(),
+             host_chrome: false,
++            host_side_panel: false,
++            host_pointer_touch: Default::default(),
++            host_panel_rect: None,
+             host_requests: Default::default(),
+             host_state: None,
+             host_share: None,

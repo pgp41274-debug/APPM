@@ -17,7 +17,7 @@
   'use strict';
 
   const shell = window.shell;
-  if (!shell || !shell.phone) return;
+  if (!shell || !shell.controls) return;
   const frame = document.getElementById('app');
   const origin = location.origin;
   const body = document.body;
@@ -197,11 +197,15 @@
   };
   const iconButton = (id, label, name, onclick) => el('button', { class: 'icon-btn', id, 'aria-label': label, title: label, onclick }, icon(name));
 
+  // The file's name, where a tablet's top bar has room for it (CSS hides it on a phone).
+  const docTitle = el('span', { id: 'doc-title' });
+
   // Reading: ← home, then what applies to the whole file.
   const undoBtn = iconButton('undo', 'Undo', 'undo-2', () => command('edit.undo'));
   const redoBtn = iconButton('redo', 'Redo', 'redo-2', () => command('edit.redo'));
   const topbar = el('header', { id: 'topbar', class: 'pbar topbar' },
     iconButton('back', 'Home', 'chevron-left', () => showHome(true)),
+    docTitle,
     el('div', { class: 'spacer' }),
     undoBtn, redoBtn,
     iconButton('find', 'Search', 'search', () => openSearch()),
@@ -324,7 +328,9 @@
 
   document.body.append(topbar, modebar, searchbar, bottombar, toolbar, panelbar, pill, hint, composer, selCard, ...handles,
     homeScreen, scrim, sheet);
+  // `phone`: the host draws the controls (phones and tablets); `tablet`: 600 dp or wider.
   body.classList.add('phone', 'home');
+  if (shell.tablet) body.classList.add('tablet');
 
   // ---- drawing PdfCraft's state ----
 
@@ -350,9 +356,13 @@
     renderHome(s);
     const open = doc && s.panel ? PANEL_NAMES[s.panel] || s.panel : '';
     panelName.textContent = open;
-    panelbar.hidden = home || !open;
-    bottombar.hidden = home || !!open || !!mode;
-    toolbar.hidden = home || !!open || !mode;
+    docTitle.textContent = doc ? doc.name : '';
+    // A phone's panel covers the bars (its own bar closes it); a tablet's sits beside the page,
+    // with its own close button, and the bars stay.
+    const covering = !!open && !shell.tablet;
+    panelbar.hidden = home || !covering;
+    bottombar.hidden = home || covering || !!mode;
+    toolbar.hidden = home || covering || !mode;
     topbar.hidden = home || !!mode || searching;
     modebar.hidden = home || !mode;
     searchbar.hidden = home || !searching || !!mode;

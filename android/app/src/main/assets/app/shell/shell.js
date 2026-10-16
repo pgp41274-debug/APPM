@@ -14,10 +14,11 @@
   const splash = document.getElementById('splash');
   const errorBox = document.getElementById('error');
   const origin = location.origin;
-  // A phone draws PdfCraft's controls itself (phone.js), as phone PDF apps lay them out; a
-  // tablet has room for PdfCraft's own.
-  const PHONE = Math.min(screen.width, screen.height) < 600;
-  const APP_URL = `../pdfcraft/index.html?host=parent${PHONE ? '&chrome=host' : ''}`;
+  // Phones and tablets alike draw PdfCraft's controls themselves (phone.js), as PDF apps for
+  // them lay them out; PdfCraft draws the page. A tablet (600 dp or wider) has room to dock a
+  // panel beside the page instead of raising it from the bottom, and for roomier bars and sheets.
+  const TABLET = Math.min(screen.width, screen.height) >= 600;
+  const APP_URL = `../pdfcraft/index.html?host=parent&chrome=host${TABLET ? '&panel=side' : ''}`;
   // A slow phone compiles the 40 MB module for a while; only then say something is wrong.
   const STARTUP_TIMEOUT_MS = 45000;
   // Bytes per bridge call, a multiple of 3 so every slice's base64 decodes on its own. A file
@@ -431,7 +432,7 @@
     else if (navigator.clipboard) navigator.clipboard.writeText(String(text)).catch(() => {});
   }
 
-  window.shell = { incoming, leaveFullScreen, copyText, phone: PHONE };
+  window.shell = { incoming, leaveFullScreen, copyText, controls: true, tablet: TABLET };
   seedPhoneDefaults();
   start();
 })();

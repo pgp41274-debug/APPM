@@ -207,9 +207,9 @@ function largestPatch({ width, height, rgb }, top, match, keep = () => true) {
 // pixels, so eframe would size its canvas at 1x and draw a blurry, oversized interface that no
 // phone shows.
 const PHONE = { width: 412, height: 915, scale: 2.625 };
-const launch = (width, height) => chromium.launch({
+const launch = (width, height, scale = PHONE.scale) => chromium.launch({
   args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist',
-    `--force-device-scale-factor=${PHONE.scale}`, `--window-size=${width},${height}`],
+    `--force-device-scale-factor=${scale}`, `--window-size=${width},${height}`],
 });
 const browser = await launch(PHONE.width, PHONE.height);
 try {
@@ -219,6 +219,9 @@ try {
   const showcase = await maker.pdf({ format: 'A4', printBackground: true });
   incoming.set('f1', showcase);
   await maker.close();
+
+  // ONLY_TABLET=1 runs just the tablet checks (9h): a quicker loop while working on that layout.
+  if (!process.env.ONLY_TABLET) {
   incoming.set('f2', fs.readFileSync(path.join(root, 'build/src/pdfcraft/crates/ui-egui/tests/data/form.pdf')));
 
   const context = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
@@ -721,14 +724,15 @@ try {
     ]);
     const [wx, wy] = [fb.x + fb.width * onWord[0], fb.y + fb.height * onWord[1]];
     const taps = {};
-    for (const n of [1, 2, 3, 4]) {
+    // More than once each: a miss that depends on where a frame falls shows up now and then.
+    for (const [i, n] of [1, 2, 3, 4, 2, 3, 3, 4].entries()) {
       for (let k = 0; k < n; k++) {
         await tapAt(wx, wy);
         await sleep(60);
       }
       await sleep(1500); // a selection would show by now (and the bars' tap timer has run)
       const sel = (await st()).selection;
-      taps[n] = sel ? sel.text : null;
+      taps[`${n}#${i}`] = sel ? sel.text : null;
       if (sel) {
         await p.evaluate(() => window.shell.back()); // clear it for the next try
         await settle(() => !window.__state.selection, 3000);
@@ -945,6 +949,152 @@ try {
     check('Edit PDF outlines the paragraphs it can edit', editing && editable === 2 && outlined > plain + 200,
       JSON.stringify({ editing, editable, toolNow, plain, outlined }));
     await ctx.close();
+  }
+
+  } // ONLY_TABLET
+
+  // 9h. A tablet (600 dp and wider) has the same controls with the room used: centred bars, the
+  // file's name on top, sheets as cards, and a panel docked beside the page with the bars kept.
+  for (const [name, W, H] of [['landscape', 1280, 800], ['portrait', 800, 1280]]) {
+    // Pixel ratio 1: `screen` is the display in CSS px, as on a tablet (a higher ratio shrinks it).
+    const tab = await launch(W, H, 1);
+    try {
+      const ctx = await tab.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+      await ctx.addInitScript(mockBridge);
+      incoming.set('f1', showcase);
+      const p = await ctx.newPage();
+      await p.goto(`${base}/app/shell/index.html`);
+      await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+      await p.waitForFunction(() => window.__state && window.__state.pages === 12, null, { timeout: 30000 }).catch(() => {});
+      const st = () => p.evaluate(() => window.__state);
+      const settle = (fn, ms = 8000) => p.waitForFunction(fn, null, { timeout: ms }).then(() => true, () => false);
+      const box = (sel) => p.evaluate((q) => { const e = document.querySelector(q); if (!e) return null; const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height, hidden: e.hidden || r.height === 0 }; }, sel);
+      const sheetRow = (text) => p.evaluate((t) => {
+        const r = [...document.querySelectorAll('#sheet .row, #sheet .action')].find((x) => x.textContent.trim() === t);
+        if (r) r.click();
+        return !!r;
+      }, text);
+      const inner = await p.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+      const tag = `tablet ${name}`;
+      await settle(() => !document.body.classList.contains('home'));
+      const app3 = p.frames().find((f) => f.url().includes('/app/pdfcraft/'));
+      check(`${tag}: runs PdfCraft with the controls drawn around it and panels docked beside the page`,
+        app3 && app3.url().includes('chrome=host') && app3.url().includes('panel=side')
+        && await p.evaluate(() => document.body.classList.contains('tablet')), app3 && app3.url());
+
+      // The file's name on the top bar; the bottom bar's buttons together in the middle.
+      const title = await p.evaluate(() => document.getElementById('doc-title').textContent);
+      const titleBox = await box('#doc-title');
+      const cats = await p.evaluate(() => [...document.querySelectorAll('#bottombar .cat')].map((c) => { const r = c.getBoundingClientRect(); return [r.left, r.right]; }));
+      const groupW = cats.at(-1)[1] - cats[0][0];
+      const groupMid = (cats.at(-1)[1] + cats[0][0]) / 2;
+      const bar = await box('#bottombar');
+      check(`${tag}: the file's name is on the top bar`, title === 'showcase.pdf' && !titleBox.hidden, JSON.stringify({ title, titleBox }));
+      check(`${tag}: the bottom bar's buttons sit together in the middle, not stretched across`,
+        cats.length === 6 && groupW < Math.min(inner.w - 80, 760) && Math.abs(groupMid - inner.w / 2) < 6 && bar.w >= inner.w - 1,
+        JSON.stringify({ groupW, groupMid, inner, barW: bar.w }));
+      const page = await box('#app');
+      check(`${tag}: the page gets the room between the bars`, page.h > inner.h - 64 - 76 - 4, JSON.stringify(page));
+      await p.screenshot({ path: path.join(shots, `tablet-1-reading-${name}.png`) });
+
+      // ⋮ is a card in the middle, not a strip across the whole width; More tools is a wider grid.
+      await p.tap('#more');
+      await settle(() => !document.getElementById('sheet').hidden);
+      await sleep(600);
+      const card = await box('#sheet');
+      check(`${tag}: the ⋮ menu is a centred card`, card.w <= 561 && card.w >= 400 && Math.abs(card.x + card.w / 2 - inner.w / 2) < 2 && card.y + card.h <= inner.h - 8,
+        JSON.stringify({ card, inner }));
+      await p.screenshot({ path: path.join(shots, `tablet-2-menu-${name}.png`) });
+      await p.evaluate(() => window.shell.back());
+      await p.tap('#bottombar [data-item="tools"]');
+      await settle(() => document.getElementById('sheet').dataset.kind === 'tools');
+      await sleep(600);
+      const cols = await p.evaluate(() => getComputedStyle(document.querySelector('#sheet .grid')).gridTemplateColumns.split(' ').length);
+      const grid = await box('#sheet');
+      check(`${tag}: More tools is a six-column grid on a card`, cols === 6 && grid.w <= 781 && Math.abs(grid.x + grid.w / 2 - inner.w / 2) < 2, JSON.stringify({ cols, grid }));
+      await p.screenshot({ path: path.join(shots, `tablet-3-more-tools-${name}.png`) });
+      await p.evaluate(() => window.shell.back());
+
+      // A panel docks beside the page, and the bars stay.
+      await p.tap('#more');
+      await settle(() => !document.getElementById('sheet').hidden);
+      await sheetRow('Pages');
+      const docked = await settle(() => window.__state.panel === 'Pages' && window.__state.panelRect, 8000);
+      await sleep(800);
+      const pr = (await st()).panelRect;
+      check(`${tag}: Pages docks beside the page, and the bars stay`, docked && pr && pr.w >= 299 && pr.w <= 441 && pr.x + pr.w >= inner.w - 2 && pr.h > (inner.h - 64 - 76) * 0.9
+        && !(await box('#bottombar')).hidden && (await box('#panelbar')).hidden, JSON.stringify({ pr, inner }));
+      await p.screenshot({ path: path.join(shots, `tablet-4-pages-panel-${name}.png`) });
+      await p.evaluate(() => window.shell.back());
+      check(`${tag}: Back closes the panel`, await settle(() => !window.__state.panel && !window.__state.panelRect));
+
+      // Highlight: its tools in the middle of the bottom, ✓ at the top.
+      await p.tap('#bottombar [data-item="highlight"]');
+      await settle(() => window.__state.tool === 'comment.highlight');
+      const tools = await p.evaluate(() => [...document.querySelectorAll('#mode-tools .tool-btn')].map((c) => { const r = c.getBoundingClientRect(); return [r.left, r.right]; }));
+      const mid = (tools.at(-1)[1] + tools[0][0]) / 2;
+      check(`${tag}: a mode's tools sit in the middle of the bottom bar`, tools.length === 3 && Math.abs(mid - inner.w / 2) < 120 && (await box('#modebar')) && !(await box('#toolbar')).hidden,
+        JSON.stringify({ tools, mid, w: inner.w }));
+      await p.screenshot({ path: path.join(shots, `tablet-5-highlight-${name}.png`) });
+      await p.tap('#done');
+      await settle(() => window.__state.tool === 'select');
+
+      // Home: a column, the quick actions in a row that wraps.
+      await p.tap('#back');
+      await settle(() => document.body.classList.contains('home'));
+      await sleep(600);
+      const acts = await p.evaluate(() => [...document.querySelectorAll('#home .actions .action')].map((a) => a.getBoundingClientRect().top));
+      const fileRow = await box('#home .file');
+      check(`${tag}: home is a column with the quick actions together`, acts.length === 4 && fileRow.w <= 761 && fileRow.x >= 20, JSON.stringify({ acts, fileRow }));
+      await p.screenshot({ path: path.join(shots, `tablet-6-home-${name}.png`) });
+      await p.tap('#home .file-open');
+      await settle(() => !document.body.classList.contains('home'));
+
+      if (name === 'landscape') {
+        // A mouse's double click still selects a word on a tablet, and a finger's double tap does
+        // not. A small plain PDF with big words in a known place (the cover's are widely spaced).
+        incoming.set('f1', plainPdf(['A paragraph to edit', 'on two lines']));
+        const ctx2 = await tab.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+        await ctx2.addInitScript(mockBridge);
+        const q = await ctx2.newPage();
+        await q.goto(`${base}/app/shell/index.html`);
+        await q.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+        await q.waitForFunction(() => window.__state && window.__state.pages === 1, null, { timeout: 30000 }).catch(() => {});
+        await sleep(2500);
+        const sel = (page) => page.evaluate(() => window.__state.selection && window.__state.selection.text);
+        let found = null;
+        for (const y of [236, 252, 268, 284]) {
+          for (const x of [300, 340, 380, 420]) {
+            await q.mouse.dblclick(x, y);
+            await sleep(500);
+            if (await sel(q)) {
+              found = [x, y];
+              break;
+            }
+          }
+          if (found) break;
+        }
+        check(`${tag}: a mouse's double click still selects a word`, !!found, JSON.stringify({ found, sel: await sel(q) }));
+        if (found) {
+          await q.evaluate(() => window.shell.back());
+          await sleep(500);
+          const cdp2 = await ctx2.newCDPSession(q);
+          for (let k = 0; k < 2; k++) {
+            await Promise.all([
+              cdp2.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: found[0], y: found[1] }] }),
+              cdp2.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }),
+            ]);
+            await sleep(60);
+          }
+          await sleep(1500);
+          check(`${tag}: a finger's double tap selects nothing`, !(await sel(q)), JSON.stringify(await sel(q)));
+        }
+        await ctx2.close();
+      }
+      await ctx.close();
+    } finally {
+      await tab.close();
+    }
   }
 } finally {
   await browser.close();
