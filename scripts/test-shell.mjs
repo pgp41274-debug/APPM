@@ -221,7 +221,8 @@ try {
   await maker.close();
 
   // ONLY_TABLET=1 runs just the tablet checks (9h): a quicker loop while working on that layout.
-  if (!process.env.ONLY_TABLET) {
+  // ONLY_PHONE=1 runs just 9f and 9g (the phone's controls).
+  if (!process.env.ONLY_TABLET && !process.env.ONLY_PHONE) {
   incoming.set('f2', fs.readFileSync(path.join(root, 'build/src/pdfcraft/crates/ui-egui/tests/data/form.pdf')));
 
   const context = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
@@ -639,6 +640,8 @@ try {
     await ctx.close();
   }
 
+  } // end of the sections before 9f (ONLY_PHONE skips them)
+  {
   // 9f. The phone's controls (phone.js), laid out as phone PDF apps lay them out: PdfCraft draws
   // the page; the page around it draws the controls from pdfcraft:state and drives PdfCraft.
   {
@@ -747,6 +750,60 @@ try {
     if (await p.evaluate(() => document.body.classList.contains('immersive'))) {
       await p.touchscreen.tap(fb.x + fb.width * 0.9, fb.y + fb.height * 0.97);
       await settle(() => !document.body.classList.contains('immersive'), 4000);
+    }
+
+    // A tap outside the selected text lets it go, as in any PDF viewer; a tap on it does not. The
+    // bars stay as they are (the tap that clears a selection is not the tap that hides them).
+    await sleep(600);
+    const fb2 = await p.locator('#app').boundingBox(); // the bars may have moved the page
+    // A finger takes about a tenth of a second to tap: press and release land in different frames,
+    // which is what the shell sees on a phone. (The quick taps above are the harsh case.) A slow
+    // machine can stretch it, so a tap that took too long to be one is tried again.
+    const humanTap = async (x, y) => {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const before = await p.evaluate(() => window.__downs.length);
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+        await sleep(70);
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+        await sleep(100);
+        const downs2 = await p.evaluate(() => window.__downs);
+        if (downs2.length > before && downs2.at(-1) <= 300) return downs2.at(-1);
+        await sleep(800);
+      }
+      return -1;
+    };
+    // A long press that a slow machine missed is made again (a few times) before it counts as failed.
+    const holdWord = async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if ((await st()).selection) return true;
+        await hold(fb2.x + fb2.width * onWord[0], fb2.y + fb2.height * onWord[1], 1500);
+        if (await settle(() => !!(window.__state.selection && window.__state.selection.text), 3500)) return true;
+      }
+      return false;
+    };
+    const results = {};
+    for (const [label, fx, fy] of [['the left margin', 0.03, 0.62], ['the top corner', 0.97, 0.1]]) {
+      const held = await holdWord();
+      const tapMs = held ? await humanTap(fb2.x + fb2.width * fx, fb2.y + fb2.height * fy) : null;
+      const gone = held && await settle(() => !window.__state.selection, 4000);
+      await sleep(700);
+      results[label] = { held, gone, tapMs, page: (await st()).page, barsKept: await p.evaluate(() => !document.body.classList.contains('immersive')) };
+    }
+    check('a tap outside the selected text lets it go, and keeps the bars',
+      Object.values(results).every((r) => r.held && r.gone && r.barsKept && r.page === 1), JSON.stringify(results));
+    // A tap on the selected words leaves it (a long press is how another word is chosen).
+    let keptOnTap = false;
+    let onMs = null;
+    if (await holdWord()) {
+      const b = (await st()).selection;
+      onMs = await humanTap(fb2.x + b.x + b.w / 2, fb2.y + b.y + b.h / 2);
+      await sleep(1200);
+      keptOnTap = !!(await st()).selection;
+    }
+    check('a tap on the selected text leaves it', keptOnTap, JSON.stringify({ keptOnTap, onMs }));
+    if ((await st()).selection) {
+      await p.evaluate(() => window.shell.back()); // so the next checks start clean
+      await settle(() => !window.__state.selection, 3000);
     }
 
     // Highlight: ✓ at the top, the tools along the bottom, a hint, and the colour.
@@ -955,7 +1012,7 @@ try {
 
   // 9h. A tablet (600 dp and wider) has the same controls with the room used: centred bars, the
   // file's name on top, sheets as cards, and a panel docked beside the page with the bars kept.
-  for (const [name, W, H] of [['landscape', 1280, 800], ['portrait', 800, 1280]]) {
+  for (const [name, W, H] of process.env.ONLY_PHONE ? [] : [['landscape', 1280, 800], ['portrait', 800, 1280]]) {
     // Pixel ratio 1: `screen` is the display in CSS px, as on a tablet (a higher ratio shrinks it).
     const tab = await launch(W, H, 1);
     try {

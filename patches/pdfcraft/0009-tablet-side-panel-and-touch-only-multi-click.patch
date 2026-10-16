@@ -102,6 +102,23 @@
                          if view.selection.is_none() {
                              let span = text.nearest(vx, vy).and_then(|a| match clicks {
                                  2 => text.word_at(a),
+@@ -3002,11 +3012,14 @@
+                                 view.selection = Some(Selection::run(i, first, last));
+                             }
+                         }
+-                    } else if resp.clicked() && view.clicks < 2 && !over_link && !view.long_pressed {
++                    } else if resp.clicked() && view.clicks < 2 && !over_link && !view.long_pressed && !(view.host && view.press_touch) {
+                         // ⇧-click extends a selection on this page to the click, keeping its
+                         // anchor (#527). Otherwise (no shift, no selection on this page, or a
+                         // column selection, which has no anchor glyph; a selection cannot yet
+-                        // span pages) a click clears the selection.
++                        // span pages) a click clears the selection. A finger's tap, when a host
++                        // draws the controls, does not: the host knows where the selection is on
++                        // screen and lets it go for a tap outside it (a frame that sees a lifted
++                        // finger has no pointer position, so PdfCraft cannot decide this itself).
+                         let shift = ui.input(|inp| inp.modifiers.shift);
+                         match (view.selection.as_mut().filter(|s| shift && s.page == i).map(|s| &mut s.span), text.nearest(vx, vy)) {
+                             (Some(Span::Run { head, .. }), Some(h)) => *head = h,
 --- a/crates/ui-egui/src/host_chrome.rs
 +++ b/crates/ui-egui/src/host_chrome.rs
 @@ -237,12 +237,13 @@

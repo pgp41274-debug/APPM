@@ -792,11 +792,13 @@
     doc.addEventListener('pointerdown', (e) => {
       fingers++;
       clearTimeout(pending); // a second tap: a double tap selects a word instead
-      // A finger's tap only, and only while reading: a tap that clears a selection, or one
-      // that places a comment, keeps the bars.
-      const reading = state && state.active && !home && !mode && !searching && state.tool === 'select' && !state.busy
-        && !state.selection && !state.composer && sheet.hidden && !state.panel && !state.fullScreen;
-      down = fingers === 1 && e.pointerType === 'touch' && reading ? { x: e.clientX, y: e.clientY, t: e.timeStamp } : null;
+      // A finger's tap only. With text selected, a tap lets it go (below); otherwise, while
+      // reading, it hides the bars. A tap that places a comment or goes to a tool keeps them.
+      const free = state && state.active && !home && !mode && !searching && !state.busy && !state.composer && sheet.hidden;
+      const selecting = free && !!state.selection;
+      const reading = free && state.tool === 'select' && !state.selection && !state.panel && !state.fullScreen;
+      down = fingers === 1 && e.pointerType === 'touch' && (reading || selecting)
+        ? { x: e.clientX, y: e.clientY, t: e.timeStamp, selecting } : null;
     }, true);
     const up = (e) => {
       fingers = Math.max(0, fingers - 1);
@@ -804,6 +806,15 @@
       down = null;
       if (!d || e.type !== 'pointerup') return;
       if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 12 || e.timeStamp - d.t > 350) return;
+      if (d.selecting) {
+        // A tap anywhere but on the selected words lets the selection go, as in any PDF viewer
+        // (Back does too). A tap on them leaves it; a long press is how another word is chosen.
+        const sel = state && state.selection;
+        const pad = 12;
+        const inside = sel && d.x >= sel.x - pad && d.x <= sel.x + sel.w + pad && d.y >= sel.y - pad && d.y <= sel.y + sel.h + pad;
+        if (sel && !inside) post('pdfcraft:selection', { action: 'clear' });
+        return;
+      }
       pending = setTimeout(() => setImmersive(!immersive), 320);
     };
     doc.addEventListener('pointerup', up, true);
