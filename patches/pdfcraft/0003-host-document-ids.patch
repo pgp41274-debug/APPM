@@ -1,0 +1,466 @@
+diff --git a/apps/pdfcraft-web/src/main.rs b/apps/pdfcraft-web/src/main.rs
+index a46a467..cec77c7 100644
+--- a/apps/pdfcraft-web/src/main.rs
++++ b/apps/pdfcraft-web/src/main.rs
+@@ -66,9 +66,10 @@ fn main() {
+                         {
+                             app.comment_prefs.author = author.chars().take(200).collect();
+                         }
+-                        bridge.listen(app.startup_inbox.clone(), cc.egui_ctx.clone());
++                        bridge.listen(app.host_inbox.clone(), cc.egui_ctx.clone());
+                         app.host_save = Some(bridge.save_fn());
+                         app.host_dirty = Some(bridge.dirty_fn());
++                        app.host_closed = Some(bridge.closed_fn());
+                         bridge.post_ready();
+                     }
+                     Ok(Box::new(app))
+@@ -123,10 +124,19 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+ /// `type`:
+ ///
+ /// - `pdfcraft:ready` (to the parent): the app is listening; send files now.
+-/// - `pdfcraft:open` (from the parent): `{ name, bytes }`, where `bytes` is an `ArrayBuffer` or
+-///   `Uint8Array` holding a PDF. It opens in a tab, like a `?file=` URL.
+-/// - `pdfcraft:save` (to the parent): `{ name, saveAs, bytes }` when the user saves; `bytes` is
+-///   a transferred `ArrayBuffer`. The parent stores the file (and reports its own errors).
++/// - `pdfcraft:open` (from the parent): `{ name, bytes, id }`, where `bytes` is an `ArrayBuffer`
++///   or `Uint8Array` holding a PDF. It opens in a tab, like a `?file=` URL. `id` (optional) is
++///   the parent's own string for the file: the document keeps it, and its saves send it back.
++/// - `pdfcraft:save` (to the parent): `{ name, saveAs, bytes, id, doc }` when the user saves;
++///   `bytes` is a transferred `ArrayBuffer`. `id` is the document's id from `pdfcraft:open`
++///   (`undefined` for a document the parent didn't send), and `doc` is the app's number for the
++///   document, which no other document gets while the page lives: with them the parent can tell
++///   documents of the same name apart. The parent stores the file (and reports its own errors).
++/// - `pdfcraft:closed` (to the parent): `{ id, doc }` when a tab closes, named as in
++///   `pdfcraft:save`; it comes after every `pdfcraft:save` of the document. A file from
++///   `pdfcraft:open` that never became a document of its own (it couldn't be opened, its password
++///   prompt went away unanswered, or it was an image or text file that became a new PDF) sends
++///   only its `id`. The parent can then let go of where the document's saves went.
+ /// - `pdfcraft:dirty` (to the parent): `{ dirty }` whenever unsaved work appears or goes away.
+ /// - `pdfcraft:failed` (to the parent): `{ error }` when the app couldn't start.
+ ///
+@@ -176,7 +186,7 @@ mod host {
+         }
+ 
+         /// Hear `pdfcraft:open` from the parent and queue the file like a `?file=` download.
+-        pub fn listen(&self, inbox: pdfcraft_ui_egui::Inbox, ctx: egui::Context) {
++        pub fn listen(&self, inbox: pdfcraft_ui_egui::HostInbox, ctx: egui::Context) {
+             let parent = self.parent.clone();
+             let origin = self.origin.clone();
+             let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+@@ -188,6 +198,7 @@ mod host {
+                     return;
+                 }
+                 let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "document.pdf".to_string());
++                let id = string(&data, "id").filter(|i| !i.is_empty());
+                 let Ok(bytes) = js_sys::Reflect::get(&data, &JsValue::from_str("bytes")) else { return };
+                 let bytes = if let Some(array) = bytes.dyn_ref::<js_sys::Uint8Array>() {
+                     array.to_vec()
+@@ -197,7 +208,7 @@ mod host {
+                     return;
+                 };
+                 if let Ok(mut q) = inbox.lock() {
+-                    q.push((name, bytes));
++                    q.push((name, id, bytes));
+                 }
+                 ctx.request_repaint();
+             });
+@@ -209,15 +220,35 @@ mod host {
+ 
+         pub fn save_fn(&self) -> pdfcraft_ui_egui::HostSaveFn {
+             let bridge = self.clone();
+-            Box::new(move |name: &str, bytes: &[u8], save_as: bool| {
++            Box::new(move |name: &str, bytes: &[u8], save_as: bool, id: Option<&str>, doc: u64| {
+                 let buffer = js_sys::Uint8Array::from(bytes).buffer();
+-                let m =
+-                    message(&[("type", "pdfcraft:save".into()), ("name", name.into()), ("saveAs", save_as.into()), ("bytes", buffer.clone().into())])
+-                        .ok_or_else(|| "couldn't build the message".to_string())?;
++                let m = message(&[
++                    ("type", "pdfcraft:save".into()),
++                    ("name", name.into()),
++                    ("saveAs", save_as.into()),
++                    ("bytes", buffer.clone().into()),
++                    ("id", id.map_or(JsValue::UNDEFINED, JsValue::from_str)),
++                    // A JS number, not a BigInt: document numbers stay far below 2^53.
++                    ("doc", JsValue::from_f64(doc as f64)),
++                ])
++                .ok_or_else(|| "couldn't build the message".to_string())?;
+                 bridge.post(&m, Some(&buffer))
+             })
+         }
+ 
++        pub fn closed_fn(&self) -> pdfcraft_ui_egui::HostClosedFn {
++            let bridge = self.clone();
++            Box::new(move |id: Option<&str>, doc: Option<u64>| {
++                if let Some(m) = message(&[
++                    ("type", "pdfcraft:closed".into()),
++                    ("id", id.map_or(JsValue::UNDEFINED, JsValue::from_str)),
++                    ("doc", doc.map_or(JsValue::UNDEFINED, |d| JsValue::from_f64(d as f64))),
++                ]) {
++                    let _ = bridge.post(&m, None);
++                }
++            })
++        }
++
+         pub fn dirty_fn(&self) -> pdfcraft_ui_egui::HostDirtyFn {
+             let bridge = self.clone();
+             let mut last = false;
+diff --git a/crates/ui-egui/src/editing.rs b/crates/ui-egui/src/editing.rs
+index 6410898..661ac10 100644
+--- a/crates/ui-egui/src/editing.rs
++++ b/crates/ui-egui/src/editing.rs
+@@ -617,11 +617,11 @@ impl PdfCraftApp {
+                     return false;
+                 }
+             };
+-            // An embedding page that asked for saves (`?host=parent`) gets the bytes; otherwise
+-            // the browser downloads them.
++            // An embedding page that asked for saves (`?host=parent`) gets the bytes, and which
++            // document they are; otherwise the browser downloads them.
+             let to_host = self.host_save.is_some();
+             let delivered = match &self.host_save {
+-                Some(save) => save(&name, &bytes, matches!(target, SaveTarget::As)),
++                Some(save) => save(&name, &bytes, matches!(target, SaveTarget::As), self.host_ids.get(&id).map(String::as_str), id.0),
+                 None => download(&name, &bytes),
+             };
+             match delivered {
+@@ -1437,3 +1437,98 @@ mod content_page_tests {
+         assert_eq!(content_page(&Edit::SetInfo { key: "Title".into(), value: "x".into() }), None);
+     }
+ }
++
++#[cfg(test)]
++mod host_close_tests {
++    use crate::PdfCraftApp;
++    use std::sync::{Arc, Mutex};
++
++    type Reports = Arc<Mutex<Vec<(Option<String>, Option<u64>)>>>;
++
++    /// An app in an embedding page that hears every close.
++    fn app() -> (PdfCraftApp, Reports) {
++        let mut app = PdfCraftApp::new();
++        let reports = Reports::default();
++        let sink = reports.clone();
++        app.host_closed = Some(Box::new(move |id, doc| sink.lock().unwrap().push((id.map(str::to_string), doc))));
++        (app, reports)
++    }
++
++    /// The closes reported since the last call.
++    fn taken(reports: &Reports) -> Vec<(Option<String>, Option<u64>)> {
++        std::mem::take(&mut *reports.lock().unwrap())
++    }
++
++    fn sent(id: &str) -> Option<String> {
++        Some(id.to_string())
++    }
++
++    fn form() -> Vec<u8> {
++        include_bytes!("../tests/data/form.pdf").to_vec()
++    }
++
++    /// The form, protected with the open password "pw".
++    fn locked_form() -> Vec<u8> {
++        let mut doc = pdfcraft_cos::Document::open(Arc::new(form())).unwrap();
++        doc.set_encryption(&pdfcraft_cos::NewEncryption {
++            algorithm: pdfcraft_cos::Algorithm::Aes256,
++            user_password: "pw",
++            owner_password: "owner",
++            permissions: -1,
++            encrypt_metadata: true,
++            seed: [3; 32],
++        })
++        .unwrap();
++        pdfcraft_cos::write_full(&doc, &Default::default()).unwrap()
++    }
++
++    #[test]
++    fn closed_tabs_are_reported_with_the_page_id_and_number() {
++        let (mut app, reports) = app();
++        app.open_bytes_with_focus("sent.pdf", None, form(), true, sent("f1")).unwrap();
++        app.open_bytes("picked.pdf", None, form()).unwrap();
++        app.open_bytes("other.pdf", None, form()).unwrap();
++        let docs: Vec<u64> = app.views.iter().map(|v| v.id.0).collect();
++        assert!(taken(&reports).is_empty(), "opening reports nothing");
++        app.request_close_tab(1);
++        assert_eq!(taken(&reports), [(None, Some(docs[1]))]);
++        app.close_all();
++        assert_eq!(taken(&reports), [(None, Some(docs[2])), (sent("f1"), Some(docs[0]))]);
++        assert!(app.views.is_empty() && app.host_ids.is_empty());
++    }
++
++    #[test]
++    fn files_that_never_become_their_own_document_are_reported_by_id() {
++        let (mut app, reports) = app();
++        assert!(app.open_bytes_with_focus("broken.pdf", None, b"not a PDF".to_vec(), true, sent("f1")).is_err());
++        assert_eq!(taken(&reports), [(sent("f1"), None)], "a file that can't be opened");
++
++        // An image or text file becomes a new PDF, which is not the page's file.
++        app.open_bytes_with_focus("notes.txt", None, b"Hello".to_vec(), true, sent("f2")).unwrap();
++        assert_eq!(taken(&reports), [(sent("f2"), None)], "a file that became a new PDF");
++        assert!(app.views.len() == 1 && app.host_ids.is_empty());
++
++        // A password prompt that goes away unanswered: cancelled, or replaced by another file.
++        app.open_bytes_with_focus("locked.pdf", None, locked_form(), true, sent("f3")).unwrap();
++        app.submit_password(Some("wrong".into()));
++        assert!(app.password_prompt.is_some() && taken(&reports).is_empty(), "a wrong password asks again");
++        app.submit_password(None);
++        assert_eq!(taken(&reports), [(sent("f3"), None)], "a cancelled password prompt");
++        app.open_bytes_with_focus("locked.pdf", None, locked_form(), true, sent("f4")).unwrap();
++        app.open_bytes("plain.pdf", None, form()).unwrap();
++        assert!(app.password_prompt.is_none());
++        assert_eq!(taken(&reports), [(sent("f4"), None)], "a password prompt another file replaced");
++    }
++
++    #[test]
++    fn an_unlocked_file_keeps_its_page_id_until_its_tab_closes() {
++        let (mut app, reports) = app();
++        app.open_bytes_with_focus("locked.pdf", None, locked_form(), true, sent("f1")).unwrap();
++        app.submit_password(Some("pw".into()));
++        assert!(app.password_prompt.is_none() && taken(&reports).is_empty());
++        let doc = app.views[0].id;
++        assert_eq!(app.host_ids.get(&doc).map(String::as_str), Some("f1"));
++        app.close_tab(0);
++        assert_eq!(taken(&reports), [(sent("f1"), Some(doc.0))]);
++    }
++}
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 2d4f5b0..8d6a6a8 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -363,6 +363,11 @@ pub struct PageClip {
+ /// Files delivered asynchronously: (name, bytes).
+ pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+ 
++/// Files the page embedding PdfCraft sent (web): `(name, id, bytes)`. `id` is the page's own
++/// id for the file, if it gave one: the document opened from the file keeps it, and its saves
++/// hand it back ([`HostSaveFn`]). They open like the browser's startup `?file=` download.
++pub type HostInbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>, Vec<u8>)>>>;
++
+ /// Files that failed to arrive asynchronously (a browser `?file=` URL that couldn't be fetched):
+ /// `(name, error)`, reported to the user on the next frame (#173).
+ pub type FailedInbox = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+@@ -380,14 +385,24 @@ pub enum OsEvent {
+ /// Returns the [`OsEvent`]s that arrived since it was last called (set by the desktop app).
+ pub type OsEventsFn = Box<dyn FnMut() -> Vec<OsEvent>>;
+ 
+-/// Hands a saved PDF to the page embedding PdfCraft (web): `(name, bytes, save_as)`. `save_as`
+-/// is `true` for Save As. Set by the web app when a host page (such as a Nextcloud app) asked
+-/// for saves; without it the browser downloads the file.
+-pub type HostSaveFn = Box<dyn Fn(&str, &[u8], bool) -> Result<(), String>>;
++/// Hands a saved PDF to the page embedding PdfCraft (web): `(name, bytes, save_as, id, doc)`.
++/// `save_as` is `true` for Save As. `id` is the page's id for the file the document was opened
++/// from ([`HostInbox`]), and `doc` is PdfCraft's number for the document, never given to another
++/// while the app runs: with them the page can tell documents of the same name apart. Set by
++/// the web app when a host page (such as a Nextcloud app) asked for saves; without it the
++/// browser downloads the file.
++pub type HostSaveFn = Box<dyn Fn(&str, &[u8], bool, Option<&str>, u64) -> Result<(), String>>;
+ 
+ /// Told every frame whether any tab has unsaved work, so a host page can warn before leaving.
+ pub type HostDirtyFn = Box<dyn FnMut(bool)>;
+ 
++/// Tells the page embedding PdfCraft (web) that a document is gone: `(id, doc)`, named as in
++/// [`HostSaveFn`]. A closed tab sends its `doc`, and its `id` if it has one. A file the page
++/// sent that never became a document of its own sends only its `id`: one that couldn't be
++/// opened, whose password prompt went away unanswered, or an image or text file that became a
++/// new PDF. With it the page can let go of where the document's saves went.
++pub type HostClosedFn = Box<dyn Fn(Option<&str>, Option<u64>)>;
++
+ pub struct PasswordPrompt {
+     pub name: String,
+     pub path: Option<String>,
+@@ -404,6 +419,9 @@ pub struct PasswordPrompt {
+     then: Option<&'static str>,
+     /// A link destination to apply after the linked PDF is unlocked.
+     after_open: Option<pdfcraft_render::RemoteDestination>,
++    /// The embedding page's id for the file ([`HostInbox`]), which the document takes once it
++    /// is unlocked.
++    host_id: Option<String>,
+ }
+ 
+ /// Asks for the permissions password of an open document whose security restricts it, which
+@@ -548,6 +566,12 @@ pub struct PdfCraftApp {
+     pub host_save: Option<HostSaveFn>,
+     /// Reports unsaved work to the embedding page (web, see [`HostDirtyFn`]).
+     pub host_dirty: Option<HostDirtyFn>,
++    /// Reports closed documents to the embedding page (web, see [`HostClosedFn`]).
++    pub host_closed: Option<HostClosedFn>,
++    /// Files the embedding page sent (web, see [`HostInbox`]).
++    pub host_inbox: HostInbox,
++    /// The embedding page's id for each document opened from a file it sent ([`HostInbox`]).
++    host_ids: std::collections::HashMap<DocId, String>,
+     /// A pending "save changes?" question (closing a dirty tab or quitting).
+     pub close_request: Option<CloseRequest>,
+     /// Save to this path instead of asking (tests and automation).
+@@ -858,6 +882,9 @@ impl PdfCraftApp {
+             os_events: None,
+             host_save: None,
+             host_dirty: None,
++            host_closed: None,
++            host_inbox: Default::default(),
++            host_ids: Default::default(),
+             close_request: None,
+             save_override: None,
+             props_draft: None,
+@@ -1017,19 +1044,68 @@ impl PdfCraftApp {
+     /// Open a document and make it the active tab. Encrypted files raise the password prompt.
+     pub fn open_bytes(&mut self, name: &str, path: Option<String>, bytes: Vec<u8>) -> Result<(), String> {
+         self.startup_superseded = true;
+-        self.open_bytes_with_focus(name, path, bytes, true)
++        self.open_bytes_with_focus(name, path, bytes, true, None)
+     }
+ 
+-    fn open_bytes_with_focus(&mut self, name: &str, path: Option<String>, bytes: Vec<u8>, activate: bool) -> Result<(), String> {
+-        // Images and text files become new, unsaved PDFs (Create a PDF).
++    /// `host_id`: the embedding page's id for the file ([`HostInbox`]), which the document keeps.
++    fn open_bytes_with_focus(
++        &mut self,
++        name: &str,
++        path: Option<String>,
++        bytes: Vec<u8>,
++        activate: bool,
++        host_id: Option<String>,
++    ) -> Result<(), String> {
++        // Images and text files become new, unsaved PDFs (Create a PDF). Such a PDF is not the
++        // page's file, so it doesn't take the page's id, and the page is done with the file.
+         let active = self.active;
+         if let Some(r) = self.open_converted(name, &bytes) {
+             if !activate {
+                 self.active = active;
+             }
++            self.report_closed(host_id.as_deref(), None);
+             return r;
+         }
+-        self.try_open(name, path, std::sync::Arc::new(bytes), None, activate)
++        let opened = self.views.len();
++        if let Err(e) = self.try_open(name, path, std::sync::Arc::new(bytes), None, activate) {
++            self.report_closed(host_id.as_deref(), None);
++            return Err(e);
++        }
++        if let Some(id) = host_id {
++            self.take_host_id(opened, id);
++        }
++        Ok(())
++    }
++
++    /// The document just opened after `opened` tabs, or else the one waiting behind the password
++    /// prompt, came from the embedding page's file `id` ([`HostInbox`]).
++    fn take_host_id(&mut self, opened: usize, id: String) {
++        if self.views.len() > opened
++            && let Some(doc) = self.views.last().map(|v| v.id)
++        {
++            self.host_ids.insert(doc, id);
++        } else if let Some(prompt) = self.password_prompt.as_mut() {
++            prompt.host_id = Some(id);
++        } else {
++            self.report_closed(Some(&id), None);
++        }
++    }
++
++    /// Tell the embedding page that a document, or a file it sent, is gone ([`HostClosedFn`]).
++    fn report_closed(&self, id: Option<&str>, doc: Option<DocId>) {
++        if (id.is_some() || doc.is_some())
++            && let Some(closed) = &self.host_closed
++        {
++            closed(id, doc.map(|d| d.0));
++        }
++    }
++
++    /// Show `prompt` as the password prompt, or none. A file from the embedding page that the
++    /// prompt it replaces was waiting for won't open now.
++    fn set_password_prompt(&mut self, prompt: Option<PasswordPrompt>) {
++        if let Some(old) = std::mem::replace(&mut self.password_prompt, prompt) {
++            self.report_closed(old.host_id.as_deref(), None);
++        }
+     }
+ 
+     fn try_open(
+@@ -1046,7 +1122,7 @@ impl PdfCraftApp {
+             Ok(id) => id,
+             Err(e @ (OpenError::NeedsPassword | OpenError::WrongPassword)) => {
+                 let error = matches!(e, OpenError::WrongPassword).then(|| "Incorrect password. Try again.".to_string());
+-                self.password_prompt = Some(PasswordPrompt {
++                self.set_password_prompt(Some(PasswordPrompt {
+                     name: name.to_string(),
+                     path,
+                     bytes,
+@@ -1056,12 +1132,13 @@ impl PdfCraftApp {
+                     recovered: None,
+                     then: None,
+                     after_open: None,
+-                });
++                    host_id: None,
++                }));
+                 return Ok(());
+             }
+             Err(e) => return Err(e.to_string()),
+         };
+-        self.password_prompt = None;
++        self.set_password_prompt(None);
+         // The reading-colours preference is app-wide: a newly opened document starts with it.
+         // Idempotent: the engine returns `false` when the document has the setting already.
+         self.session.set_reading_colors(id, self.reading_colors);
+@@ -1258,13 +1335,21 @@ impl PdfCraftApp {
+             if let Some(meta) = p.recovered {
+                 self.recoverable.push(meta);
+             }
++            self.report_closed(p.host_id.as_deref(), None);
+             return;
+         };
+         let after_open = p.after_open.clone();
++        let opened = self.views.len();
+         match self.try_open(&p.name, p.path, p.bytes, Some(&pw), p.activate) {
+-            Err(e) => self.notify_fmt("Couldn't open {name}: {e}", &[("name", &p.name), ("e", &e.to_string())]),
++            Err(e) => {
++                self.notify_fmt("Couldn't open {name}: {e}", &[("name", &p.name), ("e", &e.to_string())]);
++                self.report_closed(p.host_id.as_deref(), None);
++            }
+             // A recovered encrypted document is open once its prompt is gone.
+             Ok(()) if self.password_prompt.is_none() => {
++                if let Some(id) = p.host_id {
++                    self.take_host_id(opened, id);
++                }
+                 if let Some(destination) = after_open {
+                     self.apply_remote_destination(destination);
+                 }
+@@ -1275,13 +1360,14 @@ impl PdfCraftApp {
+                     self.execute(command);
+                 }
+             }
+-            // Wrong password: the new prompt is for the same bytes, so it keeps the snapshot
+-            // and the tool waiting for it.
++            // Wrong password: the new prompt is for the same bytes, so it keeps the snapshot,
++            // the tool waiting for it and the page's id for the file.
+             Ok(()) => {
+                 if let Some(prompt) = self.password_prompt.as_mut() {
+                     prompt.recovered = p.recovered;
+                     prompt.then = p.then;
+                     prompt.after_open = after_open;
++                    prompt.host_id = p.host_id;
+                 }
+             }
+         }
+@@ -1453,6 +1539,8 @@ impl PdfCraftApp {
+             self.closed_tabs.push(path);
+         }
+         self.forget_recovery(id);
++        let host_id = self.host_ids.remove(&id);
++        self.report_closed(host_id.as_deref(), Some(id));
+         self.session.close(id);
+         self.active = match self.active {
+             _ if self.views.is_empty() => None,
+@@ -2459,7 +2547,15 @@ impl eframe::App for PdfCraftApp {
+             let startup = self.startup_inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+             for (name, bytes) in startup {
+                 let activate = !self.startup_superseded;
+-                if let Err(e) = self.open_bytes_with_focus(&name, None, bytes, activate) {
++                if let Err(e) = self.open_bytes_with_focus(&name, None, bytes, activate, None) {
++                    self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e)]);
++                }
++            }
++            // Files from the embedding page open the same way, and keep the page's ids.
++            let from_host = self.host_inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
++            for (name, host_id, bytes) in from_host {
++                let activate = !self.startup_superseded;
++                if let Err(e) = self.open_bytes_with_focus(&name, None, bytes, activate, host_id) {
+                     self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e)]);
+                 }
+             }

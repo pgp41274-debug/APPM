@@ -1,0 +1,1154 @@
+--- a/apps/pdfcraft-web/src/main.rs
++++ b/apps/pdfcraft-web/src/main.rs
+@@ -72,6 +72,7 @@
+                             // No panel left open from last time: on a phone it covers the page.
+                             app.right = None;
+                             app.host_state = Some(bridge.state_fn());
++                            app.host_share = Some(bridge.share_fn());
+                         }
+                         bridge.listen(app.host_inbox.clone(), app.host_leave_full_screen.clone(), app.host_requests.clone(), cc.egui_ctx.clone());
+                         app.host_save = Some(bridge.save_fn());
+@@ -157,7 +158,14 @@
+ /// - `pdfcraft:command` (from the parent): `{ id }`, run a command as a menu would.
+ /// - `pdfcraft:select`: back to the Select tool. `pdfcraft:panel`: `{ name }` shows a panel,
+ ///   no name closes it. `pdfcraft:activate`: `{ doc }` brings a tab to the front.
+-///   `pdfcraft:gotoPage`: `{ page }` (1-based).
++///   `pdfcraft:gotoPage`: `{ page }` (1-based). `pdfcraft:style`: `{ color: "#rrggbb", width,
++///   opacity }` for the current comment tool. `pdfcraft:selection`: `{ action }` on the text
++///   selection (`note`, `highlight`, `underline`, `strikeout`, `replace`, `clear`), and
++///   `pdfcraft:selectionHandle`: `{ end, x, y }` moves one of its ends. `pdfcraft:composerText`:
++///   `{ text }` and `pdfcraft:composerDone`: `{ post }` write the comment being added.
++///   `pdfcraft:find`: `{ query }`, `pdfcraft:findStep`: `{ forward }`, `pdfcraft:findClose`.
++///   `pdfcraft:night`: `{ on }`. `pdfcraft:share` asks for `pdfcraft:share` (to the parent):
++///   `{ name, bytes }`, the active document as Save would write it.
+ /// - `pdfcraft:failed` (to the parent): `{ error }` when the app couldn't start.
+ ///
+ /// Only the parent window on the app's own origin is heard or answered.
+@@ -236,6 +244,23 @@
+                             "pdfcraft:panel" => Some(HostRequest::Panel(string(&data, "name").filter(|n| !n.is_empty()))),
+                             "pdfcraft:activate" => number(&data, "doc").map(|d| HostRequest::Activate(d as u64)),
+                             "pdfcraft:gotoPage" => number(&data, "page").map(|p| HostRequest::GotoPage(p as usize)),
++                            "pdfcraft:style" => Some(HostRequest::Style {
++                                color: string(&data, "color").and_then(|c| hex_color(&c)),
++                                width: real(&data, "width"),
++                                opacity: real(&data, "opacity"),
++                            }),
++                            "pdfcraft:selection" => string(&data, "action").map(HostRequest::SelectionAction),
++                            "pdfcraft:selectionHandle" => match (real(&data, "x"), real(&data, "y")) {
++                                (Some(x), Some(y)) => Some(HostRequest::SelectionHandle { end: boolean(&data, "end"), x: x as f32, y: y as f32 }),
++                                _ => None,
++                            },
++                            "pdfcraft:composerText" => string(&data, "text").map(HostRequest::ComposerText),
++                            "pdfcraft:composerDone" => Some(HostRequest::ComposerDone(boolean(&data, "post"))),
++                            "pdfcraft:find" => string(&data, "query").map(HostRequest::Find),
++                            "pdfcraft:findStep" => Some(HostRequest::FindStep(boolean(&data, "forward"))),
++                            "pdfcraft:findClose" => Some(HostRequest::FindClose),
++                            "pdfcraft:night" => Some(HostRequest::Night(boolean(&data, "on"))),
++                            "pdfcraft:share" => Some(HostRequest::Share),
+                             _ => None,
+                         };
+                         if let Some(request) = request
+@@ -287,6 +312,17 @@
+             })
+         }
+ 
++        /// `pdfcraft:share` to the parent: the bytes of a document to share.
++        pub fn share_fn(&self) -> pdfcraft_ui_egui::HostShareFn {
++            let bridge = self.clone();
++            Box::new(move |name: &str, bytes: &[u8]| {
++                let buffer = js_sys::Uint8Array::from(bytes).buffer();
++                let m = message(&[("type", "pdfcraft:share".into()), ("name", name.into()), ("bytes", buffer.clone().into())])
++                    .ok_or_else(|| "couldn't build the message".to_string())?;
++                bridge.post(&m, Some(&buffer))
++            })
++        }
++
+         pub fn closed_fn(&self) -> pdfcraft_ui_egui::HostClosedFn {
+             let bridge = self.clone();
+             Box::new(move |id: Option<&str>, doc: Option<u64>| {
+@@ -356,6 +392,26 @@
+     fn string(data: &JsValue, key: &str) -> Option<String> {
+         js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?.as_string()
+     }
++
++    /// Any finite number (a position, a width).
++    fn real(data: &JsValue, key: &str) -> Option<f64> {
++        js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?.as_f64().filter(|n| n.is_finite())
++    }
++
++    /// `true` only for a real `true`.
++    fn boolean(data: &JsValue, key: &str) -> bool {
++        js_sys::Reflect::get(data, &JsValue::from_str(key)).ok().and_then(|v| v.as_bool()).unwrap_or(false)
++    }
++
++    /// `#rrggbb` as RGB from 0 to 1.
++    fn hex_color(s: &str) -> Option<[f64; 3]> {
++        let hex = s.strip_prefix('#')?;
++        if hex.len() != 6 || !hex.is_ascii() {
++            return None;
++        }
++        let channel = |i: usize| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()).map(|v| f64::from(v) / 255.0);
++        Some([channel(0)?, channel(2)?, channel(4)?])
++    }
+ }
+ 
+ #[cfg(not(target_arch = "wasm32"))]
+--- a/crates/ui-egui/src/canvas.rs
++++ b/crates/ui-egui/src/canvas.rs
+@@ -363,6 +363,13 @@
+     /// Room kept beside the pages for the floating quick-action bar ([`SIDE`]); little on a
+     /// phone whose controls the host draws, which has no such bar.
+     pub(crate) side: f32,
++    /// The embedding page draws the controls (`?chrome=host`): no find bar, selection actions
++    /// or comment card of PdfCraft's own; the page draws them from the reported state.
++    pub(crate) host: bool,
++    /// The host's Post (`true`) or Cancel for the comment being written.
++    pub(crate) host_compose: Option<bool>,
++    /// A long press selected a word: its release is not a tap that clears the selection.
++    long_pressed: bool,
+     viewport_h: f32,
+     page_count: usize,
+     /// Page heights in points (view space), for mapping text positions to scroll offsets.
+@@ -631,6 +638,9 @@
+             last_queue: Vec::new(),
+             viewport_w: 800.0,
+             side: SIDE,
++            host: false,
++            host_compose: None,
++            long_pressed: false,
+             viewport_h: 600.0,
+             page_count: info.pages.len(),
+             page_heights: info.pages.iter().map(|p| p.height).collect(),
+@@ -903,6 +913,64 @@
+         self.selection = None;
+     }
+ 
++    /// The host's selection action by name (see [`crate::HostRequest::SelectionAction`]).
++    /// Returns `false` for a name it doesn't know.
++    pub(crate) fn host_selection_action(&mut self, name: &str, info: &DocInfo, prefs: &comments::CommentPrefs, can_comment: bool) -> bool {
++        let action = match name {
++            "clear" => {
++                self.selection = None;
++                return true;
++            }
++            "note" => SelectionAction::Note,
++            "highlight" => SelectionAction::Markup(comments::CommentTool::Highlight),
++            "underline" => SelectionAction::Markup(comments::CommentTool::Underline),
++            "strikeout" => SelectionAction::Markup(comments::CommentTool::StrikeOut),
++            "replace" => SelectionAction::Replace,
++            _ => return false,
++        };
++        if can_comment {
++            act_on_selection(self, info, prefs, action);
++        }
++        true
++    }
++
++    /// Move one end of the text selection to the text nearest `pos` (screen points) on the
++    /// selection's page; the other end stays. A selection can't span pages.
++    pub(crate) fn move_selection_end(&mut self, end: bool, pos: Pos2) {
++        let Some(sel) = self.selection else { return };
++        let Span::Run { anchor, head } = sel.span else { return };
++        let (Some(text), Some(xf)) = (self.texts.get(&sel.page), self.page_xform(sel.page)) else { return };
++        let (vx, vy) = xf.screen_to_view(pos);
++        let Some(to) = text.nearest(vx, vy) else { return };
++        let (lo, hi) = (anchor.min(head), anchor.max(head));
++        let (lo, hi) = if end { (lo, to.max(lo)) } else { (to.min(hi), hi) };
++        self.selection = Some(Selection::run(sel.page, lo, hi));
++    }
++
++    /// Where the text selection is on screen (points): its bounding box, the bottom-left of
++    /// its first piece and the bottom-right of its last (where a phone draws its handles), and
++    /// the selected text. `None` without a selection on a page that is drawn.
++    pub(crate) fn selection_on_screen(&self) -> Option<(Rect, Pos2, Pos2, String)> {
++        let sel = self.selection?;
++        let text = self.texts.get(&sel.page)?;
++        let xf = self.page_xform(sel.page)?;
++        let rects: Vec<Rect> = sel.rects(text).into_iter().map(|r| xf.view_rect(r)).collect();
++        let (first, last) = (rects.first()?, rects.last()?);
++        let bounds = rects.iter().fold(*first, |a, b| a.union(*b));
++        let words = sel.text(text);
++        (!words.is_empty()).then(|| (bounds, first.left_bottom(), last.right_bottom(), words))
++    }
++
++    /// The find bar's search for the host's box: run `query` (an empty one clears the matches).
++    pub(crate) fn host_find(&mut self, query: &str) {
++        let f = self.find.get_or_insert_with(Find::default);
++        f.focus = false;
++        if f.query != query || f.case_query != query {
++            f.query = query.to_string();
++            self.rerun_find();
++        }
++    }
++
+     /// Select text on `page` from glyph `from` to glyph `to` (tests and automation).
+     pub fn select_text(&mut self, page: usize, from: usize, to: usize) {
+         self.selection = Some(Selection::run(page, from, to));
+@@ -2131,7 +2199,9 @@
+     let zoom_delta = crate::motion::zoom_delta(ui.ctx());
+     // Exclude the previous frame's scrollbar tracks from gesture activation.
+     let navigation_rect = if view.viewport_screen.is_positive() { avail.intersect(view.viewport_screen) } else { avail };
+-    let navigation_enabled = app.dialog.is_none() && app.close_request.is_none() && !app.palette_open && ui.is_enabled() && ui.input(|i| i.focused);
++    // The host's controls take the focus when tapped (`?chrome=host`), yet the page still pinches.
++    let focused = app.host_chrome || ui.input(|i| i.focused);
++    let navigation_enabled = app.dialog.is_none() && app.close_request.is_none() && !app.palette_open && ui.is_enabled() && focused;
+     if zoom_delta.is_finite() && zoom_delta > 0.0 && zoom_delta != 1.0 && navigation_enabled && ui.rect_contains_pointer(navigation_rect) {
+         let z = view.zoom * zoom_delta;
+         match ui.input(|i| i.pointer.hover_pos()) {
+@@ -2295,7 +2365,8 @@
+     // A finger dragged across the page with the Select tool scrolls it, as on any phone or
+     // tablet. The page widget below senses every drag (text selection), so the ScrollArea's
+     // own drag-to-scroll never gets one. A press on a comment or a form field still goes to
+-    // it, a double tap still selects a word, and two fingers pinch-zoom instead.
++    // it, a double tap still selects a word (not when a host draws the controls: there only a
++    // finger held on a word does), and two fingers pinch-zoom instead.
+     let touch_pan = tool == QuickTool::Select && !preparing && ui.input(|i| i.any_touches() && i.multi_touch().is_none());
+     // Text selection runs for the Select tool and for the markup tools (highlight…).
+     let selects_text = match tool {
+@@ -2436,6 +2507,16 @@
+                 ui.ctx().request_repaint();
+             }
+         }
++        // Two fingers scroll the page with every tool, as they pinch-zoom it: the pen and the
++        // highlighter keep one finger for themselves.
++        if let Some(touch) = ui.input(|i| i.multi_touch())
++            && touch.num_touches >= 2
++            && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| ui.clip_rect().contains(p))
++            && touch.translation_delta.is_finite()
++            && touch.translation_delta != Vec2::ZERO
++        {
++            ui.scroll_with_delta_animation(touch.translation_delta, egui::style::ScrollAnimation::none());
++        }
+         let mut comment_grabbed = false;
+         let origin = resp_rect.min - vec2(0.0, y_shift);
+         let painter = ui.painter();
+@@ -2830,7 +2911,9 @@
+ 
+                         // Multi-click highlights immediately on pointer press instead of release (#1024).
+                         let clicks = if view.clicks > 2 && tool != QuickTool::Select { 1 } else { view.clicks };
+-                        if clicks >= 2 && over_text {
++                        // On a phone (the host draws the controls) two quick taps are not a double click:
++                        // a word is selected by holding a finger on it, and by nothing else.
++                        if clicks >= 2 && over_text && !view.host {
+                             let span = text.nearest(vx, vy).and_then(|a| match clicks {
+                                 2 => text.word_at(a),
+                                 3 => text.line_at(a),
+@@ -2841,6 +2924,24 @@
+                             }
+                         }
+                     }
++                    if pressed && press_here {
++                        view.long_pressed = false;
++                    }
++                    // A finger held still on a word selects it, as on any phone; a finger that
++                    // moves scrolls instead (`touch_pan`).
++                    if touch_pan && over_text && !over_link && !view.long_pressed && !view.touch_panning && resp.is_pointer_button_down_on() {
++                        let (start, origin) = ui.input(|inp| (inp.pointer.press_start_time(), inp.pointer.press_origin()));
++                        let held = start.map(|t0| ui.input(|inp| inp.time) - t0);
++                        let still = origin.is_some_and(|o| r.contains(o) && o.distance(p) <= 10.0);
++                        if still && held.is_some_and(|h| h >= LONG_PRESS) {
++                            if let Some((first, last)) = text.nearest(vx, vy).and_then(|a| text.word_at(a)) {
++                                view.selection = Some(Selection::run(i, first, last));
++                            }
++                            view.long_pressed = true;
++                        } else if still && let Some(h) = held {
++                            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((LONG_PRESS - h).max(0.01)));
++                        }
++                    }
+                     if resp.drag_started() && press_here && !over_link && !touch_pan {
+                         let origin = ui.input(|inp| inp.pointer.press_origin()).unwrap_or(p);
+                         let (ox, oy) = xf.screen_to_view(origin);
+@@ -2890,7 +2991,7 @@
+                     // Only on the frame egui reports the multi-click: `view.clicks` outlives it, and
+                     // acting on every frame re-selected the word as soon as a selection was cleared
+                     // (a highlight made by the double-click left its word selected).
+-                    if release_clicks > 0 && clicks >= 2 && over_text {
++                    if release_clicks > 0 && clicks >= 2 && over_text && !view.host {
+                         if view.selection.is_none() {
+                             let span = text.nearest(vx, vy).and_then(|a| match clicks {
+                                 2 => text.word_at(a),
+@@ -2901,7 +3002,7 @@
+                                 view.selection = Some(Selection::run(i, first, last));
+                             }
+                         }
+-                    } else if resp.clicked() && view.clicks < 2 && !over_link {
++                    } else if resp.clicked() && view.clicks < 2 && !over_link && !view.long_pressed {
+                         // ⇧-click extends a selection on this page to the click, keeping its
+                         // anchor (#527). Otherwise (no shift, no selection on this page, or a
+                         // column selection, which has no anchor glyph; a selection cannot yet
+@@ -3069,105 +3170,110 @@
+                 view.page_input = (current + 1).to_string();
+             }
+         }
+-        resp.context_menu(|ui| {
+-            // Preparing a form: the selected field's menu.
+-            if preparing && let Some((name, wi)) = view.prepare.selected.clone() {
+-                // Several fields: Align, Center, Distribute, Set Fields to Same Size.
+-                if !view.prepare.also.is_empty() {
+-                    use crate::prepare::Arrange as A;
+-                    let others = view.prepare.also.clone();
+-                    let anchor = (name.clone(), wi);
+-                    let mut pick = |ui: &mut egui::Ui, op: A, label: &str| {
+-                        if ui.add_enabled(can_modify, egui::Button::new(tl!(label))).clicked() {
+-                            view.pending_edit = crate::prepare::arrange(&form, &anchor, &others, op);
+-                            ui.close();
+-                        }
+-                    };
+-                    ui.menu_button(tl!("Align"), |ui| {
+-                        pick(ui, A::AlignLeft, "Left");
+-                        pick(ui, A::AlignRight, "Right");
+-                        pick(ui, A::AlignTop, "Top");
+-                        pick(ui, A::AlignBottom, "Bottom");
+-                        pick(ui, A::AlignCenterV, "Center vertically");
+-                        pick(ui, A::AlignCenterH, "Center horizontally");
+-                    });
+-                    ui.menu_button(tl!("Distribute"), |ui| {
+-                        pick(ui, A::DistributeH, "Horizontally");
+-                        pick(ui, A::DistributeV, "Vertically");
+-                    });
+-                    ui.menu_button(tl!("Set Fields to Same Size"), |ui| {
+-                        pick(ui, A::SameHeight, "Height");
+-                        pick(ui, A::SameWidth, "Width");
+-                        pick(ui, A::SameSize, "Both");
+-                    });
++        // On a phone whose controls the host draws, a finger held on the page selects a word
++        // (the host shows what to do with it); it opens no desktop menu.
++        let long_press_menu = !(view.host && resp.long_touched());
++        if long_press_menu {
++            resp.context_menu(|ui| {
++                // Preparing a form: the selected field's menu.
++                if preparing && let Some((name, wi)) = view.prepare.selected.clone() {
++                    // Several fields: Align, Center, Distribute, Set Fields to Same Size.
++                    if !view.prepare.also.is_empty() {
++                        use crate::prepare::Arrange as A;
++                        let others = view.prepare.also.clone();
++                        let anchor = (name.clone(), wi);
++                        let mut pick = |ui: &mut egui::Ui, op: A, label: &str| {
++                            if ui.add_enabled(can_modify, egui::Button::new(tl!(label))).clicked() {
++                                view.pending_edit = crate::prepare::arrange(&form, &anchor, &others, op);
++                                ui.close();
++                            }
++                        };
++                        ui.menu_button(tl!("Align"), |ui| {
++                            pick(ui, A::AlignLeft, "Left");
++                            pick(ui, A::AlignRight, "Right");
++                            pick(ui, A::AlignTop, "Top");
++                            pick(ui, A::AlignBottom, "Bottom");
++                            pick(ui, A::AlignCenterV, "Center vertically");
++                            pick(ui, A::AlignCenterH, "Center horizontally");
++                        });
++                        ui.menu_button(tl!("Distribute"), |ui| {
++                            pick(ui, A::DistributeH, "Horizontally");
++                            pick(ui, A::DistributeV, "Vertically");
++                        });
++                        ui.menu_button(tl!("Set Fields to Same Size"), |ui| {
++                            pick(ui, A::SameHeight, "Height");
++                            pick(ui, A::SameWidth, "Width");
++                            pick(ui, A::SameSize, "Both");
++                        });
++                        ui.separator();
++                    }
++                    if ui.button(tl!("Properties…")).clicked() {
++                        field_menu = Some(FieldMenu::Properties);
++                        ui.close();
++                    }
++                    if ui.add_enabled(can_modify, egui::Button::new(tl!("Duplicate…"))).clicked() {
++                        field_menu = Some(FieldMenu::Duplicate(name.clone()));
++                        ui.close();
++                    }
+                     ui.separator();
+-                }
+-                if ui.button(tl!("Properties…")).clicked() {
+-                    field_menu = Some(FieldMenu::Properties);
+-                    ui.close();
+-                }
+-                if ui.add_enabled(can_modify, egui::Button::new(tl!("Duplicate…"))).clicked() {
+-                    field_menu = Some(FieldMenu::Duplicate(name.clone()));
+-                    ui.close();
+-                }
+-                ui.separator();
+-                let delete = if view.prepare.also.is_empty() { "Delete" } else { "Delete selected fields" };
+-                if ui.add_enabled(can_modify, egui::Button::new(tl!(delete))).clicked() {
+-                    view.pending_edit = crate::prepare::delete_selected(view);
+-                    ui.close();
+-                }
+-                return;
+-            }
+-            if let Some((page, index)) = view.links.context {
+-                if ui.button(tl!("Properties…")).clicked() {
+-                    view.links.open_existing = Some((page, index));
+-                    ui.close();
+-                }
+-                if ui.add_enabled(can_modify, egui::Button::new(tl!("Delete"))).clicked() {
+-                    view.pending_edit = Some(Edit::DeleteLink { page, index });
+-                    view.links.selected = None;
+-                    view.links.context = None;
+-                    ui.close();
+-                }
+-                ui.separator();
+-                if ui.add_enabled(can_modify, egui::Button::new(tl!("Remove all links"))).clicked() {
+-                    view.pending_edit = Some(Edit::RemoveLinks { pages: None });
+-                    view.links.selected = None;
+-                    view.links.context = None;
+-                    ui.close();
+-                }
+-                return;
+-            }
+-            // Over a picture (and no comment): Copy Image, as in Acrobat's page menu.
+-            let mut copy_image = None;
+-            if view.comments.selected.is_none()
+-                && let Some((page, at)) = view.comments.context_at
+-            {
+-                // The page's content is parsed once per right-click, not on every frame the menu is open.
+-                let key = egui::Id::new("copy-image-under-menu");
+-                let cached = ui.data(|d| d.get_temp::<(usize, [f64; 2], Option<usize>)>(key)).filter(|c| c.0 == page && c.1 == at);
+-                let hit = match cached {
+-                    Some(c) => c.2,
+-                    None => {
+-                        let hit = doc.page_image_at(page, at);
+-                        ui.data_mut(|d| d.insert_temp(key, (page, at, hit)));
+-                        hit
++                    let delete = if view.prepare.also.is_empty() { "Delete" } else { "Delete selected fields" };
++                    if ui.add_enabled(can_modify, egui::Button::new(tl!(delete))).clicked() {
++                        view.pending_edit = crate::prepare::delete_selected(view);
++                        ui.close();
+                     }
+-                };
+-                if let Some(image) = hit {
+-                    if ui.button(tl!("Copy Image")).clicked() {
+-                        copy_image = Some(comments::CanvasAction::CopyImage(page, image));
++                    return;
++                }
++                if let Some((page, index)) = view.links.context {
++                    if ui.button(tl!("Properties…")).clicked() {
++                        view.links.open_existing = Some((page, index));
+                         ui.close();
+                     }
+-                    if ui.button(tl!("Copy Image in Original Format")).clicked() {
+-                        copy_image = Some(comments::CanvasAction::CopyImageFile(page, image));
++                    if ui.add_enabled(can_modify, egui::Button::new(tl!("Delete"))).clicked() {
++                        view.pending_edit = Some(Edit::DeleteLink { page, index });
++                        view.links.selected = None;
++                        view.links.context = None;
+                         ui.close();
+                     }
+                     ui.separator();
++                    if ui.add_enabled(can_modify, egui::Button::new(tl!("Remove all links"))).clicked() {
++                        view.pending_edit = Some(Edit::RemoveLinks { pages: None });
++                        view.links.selected = None;
++                        view.links.context = None;
++                        ui.close();
++                    }
++                    return;
+                 }
+-            }
+-            canvas_action = comments::context_menu(ui, view, info, prefs, allowed).or(copy_image);
+-        });
++                // Over a picture (and no comment): Copy Image, as in Acrobat's page menu.
++                let mut copy_image = None;
++                if view.comments.selected.is_none()
++                    && let Some((page, at)) = view.comments.context_at
++                {
++                    // The page's content is parsed once per right-click, not on every frame the menu is open.
++                    let key = egui::Id::new("copy-image-under-menu");
++                    let cached = ui.data(|d| d.get_temp::<(usize, [f64; 2], Option<usize>)>(key)).filter(|c| c.0 == page && c.1 == at);
++                    let hit = match cached {
++                        Some(c) => c.2,
++                        None => {
++                            let hit = doc.page_image_at(page, at);
++                            ui.data_mut(|d| d.insert_temp(key, (page, at, hit)));
++                            hit
++                        }
++                    };
++                    if let Some(image) = hit {
++                        if ui.button(tl!("Copy Image")).clicked() {
++                            copy_image = Some(comments::CanvasAction::CopyImage(page, image));
++                            ui.close();
++                        }
++                        if ui.button(tl!("Copy Image in Original Format")).clicked() {
++                            copy_image = Some(comments::CanvasAction::CopyImageFile(page, image));
++                            ui.close();
++                        }
++                        ui.separator();
++                    }
++                }
++                canvas_action = comments::context_menu(ui, view, info, prefs, allowed).or(copy_image);
++            });
++        }
+         (wanted, visible_now)
+     });
+     view.single_edges = visible_pages.first().copied().filter(|_| !view.continuous).map(|page| {
+@@ -3180,7 +3286,7 @@
+ 
+     view.viewport_screen = out.inner_rect;
+     view.auto_scroll.paint(ui, avail);
+-    if unobstructed && matches!(tool, QuickTool::Select | QuickTool::ColumnSelect) {
++    if unobstructed && !view.host && matches!(tool, QuickTool::Select | QuickTool::ColumnSelect) {
+         selection_actions(ui, avail, view, info, prefs, allowed && !comments_hidden);
+     }
+ 
+@@ -3285,7 +3391,9 @@
+             });
+         });
+     }
+-    find_bar(view, info.pages.len(), avail, ui, &t);
++    if !view.host {
++        find_bar(view, info.pages.len(), avail, ui, &t);
++    }
+     if tool == QuickTool::EnhanceCamera {
+         crate::camera_ui::bar(ui.ctx(), view, avail, &t, can_modify);
+     }
+@@ -3461,6 +3569,9 @@
+     }
+ }
+ 
++/// How long a finger rests on a word before it selects it (seconds).
++const LONG_PRESS: f64 = 0.5;
++
+ #[derive(Clone, Copy)]
+ enum SelectionAction {
+     Note,
+@@ -3514,6 +3625,11 @@
+         ui.ctx().copy_text(selected);
+         return;
+     }
++    act_on_selection(view, info, prefs, action);
++}
++
++/// Comment on, mark up or replace the selected text (the selection's actions, or the host's).
++fn act_on_selection(view: &mut DocView, info: &DocInfo, prefs: &comments::CommentPrefs, action: SelectionAction) {
+     let Some((page, quads)) = view.selection_quads(info) else { return };
+     let last = quads.last().copied().unwrap_or_default();
+     let at = [last[2].max(last[6]), last[1].max(last[3])];
+--- a/crates/ui-egui/src/commands.rs
++++ b/crates/ui-egui/src/commands.rs
+@@ -383,7 +383,10 @@
+                 self.quick_tool = crate::QuickTool::EditText;
+                 self.left = crate::LeftPanel::Tool("edit");
+                 self.reveal_tools();
+-                self.notify_tr("Click text or an image to edit it");
++                // A phone's host says it in its own words (a tap, not a click).
++                if !self.host_chrome {
++                    self.notify_tr("Click text or an image to edit it");
++                }
+             }
+             "edit.advanced_search" => {
+                 if let Some(i) = self.active {
+@@ -406,7 +409,9 @@
+             "edit.image" => self.add_image_dialog(),
+             "edit.link" => {
+                 self.quick_tool = crate::QuickTool::Link;
+-                self.notify_tr("Drag a rectangle to create a link; double-click a link to edit it");
++                if !self.host_chrome {
++                    self.notify_tr("Drag a rectangle to create a link; double-click a link to edit it");
++                }
+             }
+             "edit.links_from_urls" => self.links_from_urls(),
+             "edit.remove_links" => self.remove_all_links(),
+--- a/crates/ui-egui/src/comments.rs
++++ b/crates/ui-egui/src/comments.rs
+@@ -608,6 +608,12 @@
+         cv.cancelled_drag = true;
+         return true;
+     }
++    // A second finger scrolls or zooms (canvas.rs): the stroke the first one began is dropped.
++    if cv.gesture.is_some() && ui.input(|i| i.multi_touch().is_some()) {
++        cv.gesture = None;
++        cv.cancelled_drag = true;
++        return true;
++    }
+     if cv.cancelled_drag {
+         return true;
+     }
+@@ -1142,6 +1148,14 @@
+     let t = Tokens::get(ctx);
+     let mut post = false;
+     let mut cancel = false;
++    // A host draws its own box for the text (`HostRequest::ComposerText`) and posts or drops
++    // the comment with `HostRequest::ComposerDone`.
++    let host = view.host;
++    match view.host_compose.take() {
++        Some(true) => post = true,
++        Some(false) => cancel = true,
++        None => {}
++    }
+     let c = view.comments.composer.as_mut()?;
+     let title = match c.kind {
+         ComposerKind::Note => "Sticky note",
+@@ -1152,51 +1166,55 @@
+         ComposerKind::Edit(_) => "Edit comment",
+     };
+     let pos = pos2(anchor.x + 12.0, anchor.y);
+-    egui::Area::new(egui::Id::new(("comment-composer", view.id.0))).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
+-        egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(12)).corner_radius(CornerRadius::same(8)).show(ui, |ui| {
+-            ui.set_width(260.0);
+-            ui.horizontal(|ui| {
+-                ui.label(egui::RichText::new(crate::bidi::visual_auto(&prefs.author)).font(theme::semibold(13.0)));
+-                ui.label(egui::RichText::new(tl!(title)).font(theme::regular(11.5)).color(t.text_faint));
+-            });
+-            ui.add_space(6.0);
+-            let hint = match c.kind {
+-                ComposerKind::TextBox | ComposerKind::Callout { .. } => tl!("Type text"),
+-                ComposerKind::Caret { .. } => tl!("Text to insert"),
+-                ComposerKind::Replace => tl!("Replacement text"),
+-                _ => tl!("Add a comment"),
+-            };
+-            let edit =
+-                ui.add(egui::TextEdit::multiline(&mut c.text).hint_text(hint).desired_rows(3).desired_width(f32::INFINITY).id_salt("composer-text"));
+-            if c.focus {
+-                edit.request_focus();
+-                c.focus = false;
+-            }
+-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
+-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+-                cancel = true;
+-            }
+-            ui.add_space(8.0);
+-            ui.horizontal(|ui| {
+-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+-                    let can_post = !c.text.trim().is_empty() || matches!(c.kind, ComposerKind::Edit(_));
+-                    if ui
+-                        .add_enabled(
+-                            can_post,
+-                            egui::Button::new(egui::RichText::new(tl!("Post")).color(Color32::WHITE)).fill(t.accent).corner_radius(14),
+-                        )
+-                        .clicked()
+-                        || (enter && can_post)
+-                    {
+-                        post = true;
+-                    }
+-                    if ui.add(egui::Button::new(tl!("Cancel")).corner_radius(14)).clicked() {
+-                        cancel = true;
+-                    }
++    let id = egui::Id::new(("comment-composer", view.id.0));
++    if !host {
++        egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
++            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(12)).corner_radius(CornerRadius::same(8)).show(ui, |ui| {
++                ui.set_width(260.0);
++                ui.horizontal(|ui| {
++                    ui.label(egui::RichText::new(crate::bidi::visual_auto(&prefs.author)).font(theme::semibold(13.0)));
++                    ui.label(egui::RichText::new(tl!(title)).font(theme::regular(11.5)).color(t.text_faint));
++                });
++                ui.add_space(6.0);
++                let hint = match c.kind {
++                    ComposerKind::TextBox | ComposerKind::Callout { .. } => tl!("Type text"),
++                    ComposerKind::Caret { .. } => tl!("Text to insert"),
++                    ComposerKind::Replace => tl!("Replacement text"),
++                    _ => tl!("Add a comment"),
++                };
++                let edit = ui.add(
++                    egui::TextEdit::multiline(&mut c.text).hint_text(hint).desired_rows(3).desired_width(f32::INFINITY).id_salt("composer-text"),
++                );
++                if c.focus {
++                    edit.request_focus();
++                    c.focus = false;
++                }
++                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
++                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
++                    cancel = true;
++                }
++                ui.add_space(8.0);
++                ui.horizontal(|ui| {
++                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                        let can_post = !c.text.trim().is_empty() || matches!(c.kind, ComposerKind::Edit(_));
++                        if ui
++                            .add_enabled(
++                                can_post,
++                                egui::Button::new(egui::RichText::new(tl!("Post")).color(Color32::WHITE)).fill(t.accent).corner_radius(14),
++                            )
++                            .clicked()
++                            || (enter && can_post)
++                        {
++                            post = true;
++                        }
++                        if ui.add(egui::Button::new(tl!("Cancel")).corner_radius(14)).clicked() {
++                            cancel = true;
++                        }
++                    });
+                 });
+             });
+         });
+-    });
++    }
+     if cancel {
+         view.comments.composer = None;
+         return None;
+--- a/crates/ui-egui/src/edit_text_ui.rs
++++ b/crates/ui-egui/src/edit_text_ui.rs
+@@ -97,6 +97,18 @@
+ /// hit-testing still covers every image, so nothing becomes unselectable.
+ const MAX_OUTLINES: usize = 250;
+ 
++/// The outline each editable box gets. A mouse lights a box up as it hovers it, so a hairline
++/// will do; a finger hovers nothing, so on a phone (`touch`) every box is dashed, as phone PDF
++/// apps draw them.
++fn paint_outline(painter: &egui::Painter, rect: Rect, rounding: u8, touch: bool) {
++    if touch {
++        let corners = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];
++        painter.extend(egui::Shape::dashed_line(&corners, Stroke::new(1.0, ACCENT.gamma_multiply(0.85)), 4.0, 3.0));
++    } else {
++        painter.rect_stroke(rect, CornerRadius::same(rounding), Stroke::new(0.75, ACCENT.gamma_multiply(0.35)), egui::StrokeKind::Outside);
++    }
++}
++
+ /// A paragraph being edited.
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct LineEditor {
+@@ -431,16 +443,17 @@
+     // hovered boxes, so a ~1000-image CAD page stays interactive in Edit text & images.
+     // Fully clipped placements (empty visible frames) get no outline.
+     let faint_all = boxes.len() <= MAX_OUTLINES;
++    let touch = view.host;
+     if faint_all {
+         for b in boxes.iter().filter(|b| b.is_positive()) {
+-            painter.rect_stroke(*b, CornerRadius::ZERO, Stroke::new(0.75, ACCENT.gamma_multiply(0.35)), egui::StrokeKind::Outside);
++            paint_outline(painter, *b, 0, touch);
+         }
+     }
+     let hovered_box = hover_pos.and_then(|p| boxes.iter().enumerate().rposition(|(i, b)| b.is_positive() && b.contains(p) && image_contains(i, p)));
+     if !faint_all {
+         for i in selected.into_iter().chain(hovered_box.filter(|h| Some(*h) != selected)) {
+             if let Some(b) = boxes.get(i).filter(|b| b.is_positive()) {
+-                painter.rect_stroke(*b, CornerRadius::ZERO, Stroke::new(0.75, ACCENT.gamma_multiply(0.35)), egui::StrokeKind::Outside);
++                paint_outline(painter, *b, 0, touch);
+             }
+         }
+     }
+@@ -636,7 +649,7 @@
+     let active = view.line_editor.as_ref().filter(|e| e.page == page).map(|e| e.block);
+     for (i, b) in boxes.iter().enumerate() {
+         if active != Some(i) {
+-            painter.rect_stroke(*b, CornerRadius::same(2), Stroke::new(0.75, ACCENT.gamma_multiply(0.35)), egui::StrokeKind::Outside);
++            paint_outline(painter, *b, 2, view.host);
+         }
+     }
+     if !allow_interaction {
+--- a/crates/ui-egui/src/editing.rs
++++ b/crates/ui-egui/src/editing.rs
+@@ -521,7 +521,7 @@
+ 
+     /// When the preference is on, bake Fill & Sign marks before the bytes are written.
+     /// Returns false when the document is not allowed to change (nothing is written).
+-    fn flatten_fill_sign_for_save(&mut self, id: pdfcraft_engine::DocId) -> bool {
++    pub(crate) fn flatten_fill_sign_for_save(&mut self, id: pdfcraft_engine::DocId) -> bool {
+         if !self.flatten_fill_sign_on_save {
+             return true;
+         }
+--- a/crates/ui-egui/src/host_chrome.rs
++++ b/crates/ui-egui/src/host_chrome.rs
+@@ -49,6 +49,11 @@
+     }
+ }
+ 
++/// A colour channel (0–1) as a byte.
++fn channel(c: f64) -> u8 {
++    if c.is_finite() { (c.clamp(0.0, 1.0) * 255.0).round() as u8 } else { 0 }
++}
++
+ impl PdfCraftApp {
+     /// Carry out what the host asked for since the last frame.
+     pub(crate) fn host_requests_tick(&mut self) {
+@@ -77,10 +82,87 @@
+                         self.views[i].goto = Some((page.clamp(1, pages) - 1, 0.0));
+                     }
+                 }
++                HostRequest::Style { color, width, opacity } => {
++                    if let QuickTool::Comment(tool) = self.quick_tool {
++                        if let Some(c) = color.filter(|c| c.iter().all(|x| x.is_finite())) {
++                            self.comment_prefs.set_color(tool, c.map(|x| x.clamp(0.0, 1.0)));
++                        }
++                        if let Some(w) = width.filter(|w| w.is_finite()) {
++                            self.comment_prefs.set_width(tool, w);
++                        }
++                        if let Some(o) = opacity {
++                            self.comment_prefs.set_opacity(tool, o);
++                        }
++                    }
++                }
++                HostRequest::SelectionAction(name) => {
++                    if let Some(i) = self.active
++                        && let Some(doc) = self.session.get(self.views[i].id)
++                    {
++                        let can_comment = doc.allows_annotation() && !doc.comments_hidden();
++                        self.views[i].host_selection_action(&name, &doc.info, &self.comment_prefs, can_comment);
++                    }
++                }
++                HostRequest::SelectionHandle { end, x, y } => {
++                    let scale = self.ctx.as_ref().map_or(1.0, |c| c.zoom_factor()).max(0.01);
++                    if let Some(view) = self.active.and_then(|i| self.views.get_mut(i))
++                        && x.is_finite()
++                        && y.is_finite()
++                    {
++                        view.move_selection_end(end, egui::pos2(x / scale, y / scale));
++                    }
++                }
++                HostRequest::ComposerText(text) => {
++                    if let Some(c) = self.active.and_then(|i| self.views.get_mut(i)).and_then(|v| v.comments.composer.as_mut()) {
++                        c.text = text;
++                    }
++                }
++                HostRequest::ComposerDone(post) => {
++                    if let Some(view) = self.active.and_then(|i| self.views.get_mut(i)) {
++                        view.host_compose = Some(post);
++                    }
++                }
++                HostRequest::Find(query) => {
++                    if let Some(view) = self.active.and_then(|i| self.views.get_mut(i)) {
++                        view.host_find(&query);
++                    }
++                }
++                HostRequest::FindStep(forward) => {
++                    if let Some(view) = self.active.and_then(|i| self.views.get_mut(i)) {
++                        view.find_step(forward);
++                    }
++                }
++                HostRequest::FindClose => {
++                    if let Some(view) = self.active.and_then(|i| self.views.get_mut(i)) {
++                        view.find = None;
++                    }
++                }
++                HostRequest::Night(on) => {
++                    let colors = if on { pdfcraft_render::ReadingColors::WHITE_ON_BLACK } else { pdfcraft_render::ReadingColors::default() };
++                    self.set_reading_colors(colors);
++                }
++                HostRequest::Share => self.share_active(),
+             }
+         }
+     }
+ 
++    /// Hand the active document, as Save would write it, to the host's share sheet.
++    fn share_active(&mut self) {
++        let Some(id) = self.active.and_then(|i| self.views.get(i)).map(|v| v.id) else { return };
++        if !self.commit_typing_in(id) || !self.flatten_fill_sign_for_save(id) {
++            return;
++        }
++        let Some(name) = self.session.get(id).map(|d| d.name.clone()) else { return };
++        let result = match (self.session.save_bytes(id), &self.host_share) {
++            (Ok(bytes), Some(share)) => share(&name, &bytes),
++            (Ok(_), None) => return,
++            (Err(e), _) => Err(e.to_string()),
++        };
++        if let Err(e) = result {
++            self.notify_fmt("Couldn't share {name}: {e}", &[("name", &name), ("e", &e)]);
++        }
++    }
++
+     /// What a host needs to draw its controls (see [`crate::HostStateFn`]).
+     pub(crate) fn host_state_json(&self) -> serde_json::Value {
+         use serde_json::json;
+@@ -97,6 +179,44 @@
+         let active = self.active.and_then(|i| self.views.get(i));
+         let pages = active.and_then(|v| self.session.get(v.id)).map_or(0, |d| d.info.pages.len());
+         let enabled = |id: &str| pdfcraft_engine::commands::command(id).is_some_and(|c| self.command_enabled(c));
++        // Positions go out in CSS pixels of the canvas, as the host lays out its own controls.
++        let scale = self.ctx.as_ref().map_or(1.0, |c| c.zoom_factor());
++        let px = |v: f32| ((v * scale) as f64 * 10.0).round() / 10.0;
++        let selection = active.and_then(|v| v.selection_on_screen()).map(|(bounds, start, end, text)| {
++            json!({
++                "x": px(bounds.left()), "y": px(bounds.top()), "w": px(bounds.width()), "h": px(bounds.height()),
++                "start": [px(start.x), px(start.y)], "end": [px(end.x), px(end.y)],
++                "text": text,
++            })
++        });
++        let style = match self.quick_tool {
++            QuickTool::Comment(tool) => {
++                let s = self.comment_prefs.style(tool);
++                let hex = format!("#{:02x}{:02x}{:02x}", channel(s.color[0]), channel(s.color[1]), channel(s.color[2]));
++                Some(json!({ "color": hex, "width": s.width, "opacity": s.opacity }))
++            }
++            _ => None,
++        };
++        let composer = active.and_then(|v| v.comments.composer.as_ref()).map(|c| {
++            let kind = match c.kind {
++                crate::comments::ComposerKind::Note => "note",
++                crate::comments::ComposerKind::TextBox => "textbox",
++                crate::comments::ComposerKind::Callout { .. } => "callout",
++                crate::comments::ComposerKind::Caret { .. } => "insert",
++                crate::comments::ComposerKind::Replace => "replace",
++                crate::comments::ComposerKind::Edit(_) => "edit",
++            };
++            json!({ "kind": kind, "text": c.text })
++        });
++        // Edit text: how many paragraphs of the pages looked at so far can be edited (none: the
++        // host says so, rather than showing a page where nothing happens).
++        let editable = active.filter(|v| self.quick_tool == QuickTool::EditText && !v.edit_lines.is_empty()).map(|v| {
++            let generation = self.session.get(v.id).map(|d| d.edit_generation());
++            v.edit_lines.values().filter(|(g, _)| Some(*g) == generation).map(|(_, l)| l.len()).sum::<usize>()
++        });
++        let find = active
++            .and_then(|v| v.find.as_ref())
++            .map(|f| json!({ "query": f.query, "matches": f.matches.len(), "current": f.current.map(|c| c + 1) }));
+         json!({
+             "docs": docs,
+             "active": active.map(|v| v.id.0),
+@@ -110,6 +230,13 @@
+             "redo": enabled("edit.redo"),
+             "save": enabled("file.save"),
+             "fullScreen": self.full_screen,
++            "selection": selection,
++            "style": style,
++            "composer": composer,
++            "find": find,
++            "night": self.reading_colors.mode_name() == "white-on-black",
++            "organize": active.is_some_and(|v| v.organize),
++            "editable": editable,
+             "busy": self.dialog.is_some() || self.palette_open,
+         })
+     }
+@@ -121,6 +248,7 @@
+         // No floating quick-action bar to keep the pages clear of: a phone's width is the page's.
+         for view in &mut self.views {
+             view.side = HOST_SIDE;
++            view.host = true;
+         }
+         if self.active.is_some() && self.right.is_some_and(|p| PANELS.contains(&p)) {
+             let height = ui.max_rect().height();
+@@ -209,4 +337,170 @@
+         ask(&mut h, HostRequest::Command("page.rotate".into()));
+         assert_eq!(state(&h)["undo"], true);
+     }
++
++    use egui::{Event, PointerButton, TouchDeviceId, TouchId, TouchPhase, pos2};
++
++    /// Frames until the first page's text is known; the screen centres of its first and last glyphs.
++    fn first_and_last_glyph(h: &mut Harness<'static, PdfCraftApp>) -> (egui::Pos2, egui::Pos2) {
++        until(h, |h| h.state().views[0].page_text(0).is_some());
++        let view = &h.state().views[0];
++        let (text, xf) = (view.page_text(0).expect("the page's text"), view.page_xform(0).expect("the page on screen"));
++        let first = text.glyphs.first().expect("a glyph").rect;
++        let last = text.glyphs.last().expect("a glyph").rect;
++        (xf.view_rect(first).center(), xf.view_rect(last).center())
++    }
++
++    /// Frames until `done`, for up to 20 seconds: page text is read on worker threads, which a
++    /// busy machine (every test at once) can keep waiting longer than a fixed number of frames.
++    fn until(h: &mut Harness<'static, PdfCraftApp>, done: impl Fn(&Harness<'static, PdfCraftApp>) -> bool) {
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
++        while !done(h) && std::time::Instant::now() < deadline {
++            h.step();
++            std::thread::sleep(std::time::Duration::from_millis(2));
++        }
++    }
++
++    fn finger(h: &mut Harness<'static, PdfCraftApp>, id: u64, phase: TouchPhase, at: egui::Pos2) {
++        h.event(Event::Touch { device_id: TouchDeviceId(1), id: TouchId(id), phase, pos: at, force: None });
++    }
++
++    /// One finger down at `at` (with the pointer events a browser sends for it).
++    fn press(h: &mut Harness<'static, PdfCraftApp>, at: egui::Pos2) {
++        finger(h, 1, TouchPhase::Start, at);
++        h.event(Event::PointerMoved(at));
++        h.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers: Default::default() });
++    }
++
++    fn lift(h: &mut Harness<'static, PdfCraftApp>, at: egui::Pos2) {
++        h.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Default::default() });
++        h.event(Event::PointerGone);
++        finger(h, 1, TouchPhase::End, at);
++    }
++
++    #[test]
++    fn a_finger_held_on_a_word_selects_it_and_the_host_acts_on_it() {
++        let mut h = phone(2);
++        let (word, last) = first_and_last_glyph(&mut h);
++        // A quick tap selects nothing.
++        press(&mut h, word);
++        h.step();
++        lift(&mut h, word);
++        h.run_steps(4);
++        assert!(state(&h)["selection"].is_null());
++        // Held for half a second, the word is selected, and stays when the finger lifts.
++        press(&mut h, word);
++        h.run_steps(40);
++        lift(&mut h, word);
++        h.run_steps(4);
++        let s = state(&h);
++        assert_eq!(s["selection"]["text"], "Page", "{s}");
++        // PdfCraft's own buttons stay away: the host draws them. The long press is no
++        // right-click either: no desktop menu.
++        assert!(h.query_by_label("Underline").is_none());
++        assert!(h.query_by_label_contains("sticky note").is_none(), "no context menu");
++        // Its end handle dragged to the last glyph takes in the page number.
++        ask(&mut h, HostRequest::SelectionHandle { end: true, x: last.x, y: last.y });
++        let s = state(&h);
++        assert_eq!(s["selection"]["text"], "Page 1", "{s}");
++        assert!(s["selection"]["end"][0].as_f64().unwrap() > s["selection"]["start"][0].as_f64().unwrap());
++        ask(&mut h, HostRequest::SelectionAction("highlight".into()));
++        h.run_steps(4);
++        let s = state(&h);
++        assert!(s["selection"].is_null());
++        assert_eq!(s["undo"], true, "the highlight was added");
++    }
++
++    #[test]
++    fn edit_text_reports_how_much_it_can_edit() {
++        let mut h = phone(2);
++        assert!(state(&h)["editable"].is_null());
++        // The tap on the host's Edit PDF took the focus from PdfCraft's frame.
++        h.input_mut().focused = false;
++        ask(&mut h, HostRequest::Command("edit.edit_text".into()));
++        until(&mut h, |h| state(h)["editable"] == 2);
++        assert_eq!(state(&h)["editable"], 2, "a paragraph on each page");
++        ask(&mut h, HostRequest::Select);
++        assert!(state(&h)["editable"].is_null());
++    }
++
++    #[test]
++    fn two_fingers_scroll_the_page_while_the_pen_draws_with_one() {
++        let mut h = phone(8);
++        ask(&mut h, HostRequest::Command("comment.ink".into()));
++        let top = |h: &Harness<'static, PdfCraftApp>| {
++            h.state().views[0].visible_page_rects().iter().find(|(p, _)| *p == 0).map_or(f32::NEG_INFINITY, |(_, r)| r.top())
++        };
++        let before = top(&h);
++        let (a, b) = (pos2(150.0, 600.0), pos2(260.0, 600.0));
++        press(&mut h, a);
++        finger(&mut h, 2, TouchPhase::Start, b);
++        h.step();
++        for k in 1..=10 {
++            let dy = -30.0 * k as f32;
++            finger(&mut h, 1, TouchPhase::Move, a + egui::vec2(0.0, dy));
++            finger(&mut h, 2, TouchPhase::Move, b + egui::vec2(0.0, dy));
++            h.event(Event::PointerMoved(a + egui::vec2(0.0, dy)));
++            h.step();
++        }
++        finger(&mut h, 2, TouchPhase::End, b + egui::vec2(0.0, -300.0));
++        lift(&mut h, a + egui::vec2(0.0, -300.0));
++        h.run_steps(8);
++        let moved = before - top(&h);
++        assert!(moved > 150.0, "the page scrolled with the fingers ({moved})");
++        assert_eq!(state(&h)["undo"], false, "and no stroke was drawn");
++    }
++
++    #[test]
++    fn the_host_sets_colours_searches_writes_comments_and_shares() {
++        let mut h = phone(2);
++        ask(&mut h, HostRequest::Command("comment.highlight".into()));
++        ask(&mut h, HostRequest::Style { color: Some([1.0, 0.0, 0.0]), width: None, opacity: Some(0.5) });
++        let s = state(&h);
++        assert_eq!(s["style"]["color"], "#ff0000");
++        assert_eq!(s["style"]["opacity"], 0.5);
++        ask(&mut h, HostRequest::Select);
++        assert!(state(&h)["style"].is_null());
++
++        ask(&mut h, HostRequest::Find("Page".into()));
++        until(&mut h, |h| state(h)["find"]["matches"] == 2);
++        assert_eq!(state(&h)["find"]["matches"], 2);
++        assert_eq!(state(&h)["find"]["current"], 1);
++        ask(&mut h, HostRequest::FindStep(true));
++        assert_eq!(state(&h)["find"]["current"], 2);
++        ask(&mut h, HostRequest::FindClose);
++        assert!(state(&h)["find"].is_null());
++
++        ask(&mut h, HostRequest::Night(true));
++        assert_eq!(state(&h)["night"], true);
++        ask(&mut h, HostRequest::Night(false));
++        assert_eq!(state(&h)["night"], false);
++
++        // A sticky note: a tap pins it, the host's box writes it.
++        ask(&mut h, HostRequest::Command("comment.note".into()));
++        let at = pos2(200.0, 400.0);
++        h.event(Event::PointerMoved(at));
++        h.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers: Default::default() });
++        h.step();
++        h.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Default::default() });
++        h.run_steps(4);
++        assert_eq!(state(&h)["composer"]["kind"], "note", "{}", state(&h));
++        assert!(h.query_by_label("Post").is_none(), "PdfCraft's own card stays hidden");
++        ask(&mut h, HostRequest::ComposerText("Check this".into()));
++        assert_eq!(state(&h)["composer"]["text"], "Check this");
++        ask(&mut h, HostRequest::ComposerDone(true));
++        h.run_steps(4);
++        assert!(state(&h)["composer"].is_null());
++        assert_eq!(state(&h)["undo"], true, "the note was added");
++
++        let shared = std::sync::Arc::new(std::sync::Mutex::new(None));
++        let sink = shared.clone();
++        h.state_mut().host_share = Some(Box::new(move |name: &str, bytes: &[u8]| {
++            *sink.lock().unwrap() = Some((name.to_string(), bytes.to_vec()));
++            Ok(())
++        }));
++        ask(&mut h, HostRequest::Share);
++        let (name, bytes) = shared.lock().unwrap().take().expect("the document was shared");
++        assert_eq!(name, "long.pdf");
++        assert!(bytes.starts_with(b"%PDF-"));
++    }
+ }
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -423,6 +423,36 @@
+     Activate(u64),
+     /// Go to this page (1-based).
+     GotoPage(usize),
++    /// The current comment tool's colour (RGB, 0–1), width (points) and opacity (0–1); a
++    /// `None` keeps that part. Comments made from then on use it, as Properties would.
++    Style {
++        color: Option<[f64; 3]>,
++        width: Option<f64>,
++        opacity: Option<f64>,
++    },
++    /// Act on the text selection: `note`, `highlight`, `underline`, `strikeout`, `replace`,
++    /// or `clear` (the host copied it, or let it go).
++    SelectionAction(String),
++    /// Move the start (`end: false`) or the end of the text selection to the text nearest this
++    /// point of the page, in CSS pixels from the canvas's top-left (a drag of a handle).
++    SelectionHandle {
++        end: bool,
++        x: f32,
++        y: f32,
++    },
++    /// The text of the comment being written (the host's box replaces PdfCraft's card).
++    ComposerText(String),
++    /// Post (`true`) or drop the comment being written.
++    ComposerDone(bool),
++    /// Find this text (empty: clear the matches), step to the next (`true`) or previous match,
++    /// or close the search.
++    Find(String),
++    FindStep(bool),
++    FindClose,
++    /// Pages in white on black (Night mode), or back to the document's own colours.
++    Night(bool),
++    /// Hand the active document's bytes, as Save would write them, to [`HostShareFn`].
++    Share,
+ }
+ 
+ /// Requests from the embedding page, filled by the web bridge.
+@@ -432,6 +462,9 @@
+ /// the open documents, the page, the tool, the open panel, and whether Undo and Redo apply.
+ pub type HostStateFn = Box<dyn FnMut(&str)>;
+ 
++/// Given the name and bytes of a document the host asked to share ([`HostRequest::Share`]).
++pub type HostShareFn = Box<dyn Fn(&str, &[u8]) -> Result<(), String>>;
++
+ pub struct PasswordPrompt {
+     pub name: String,
+     pub path: Option<String>,
+@@ -609,6 +642,8 @@
+     pub host_requests: HostRequests,
+     /// Reports what that page needs to draw its controls (see [`HostStateFn`]).
+     pub host_state: Option<HostStateFn>,
++    /// Where [`HostRequest::Share`] sends the bytes (the web bridge, `?chrome=host`).
++    pub host_share: Option<HostShareFn>,
+     /// Files the embedding page sent (web, see [`HostInbox`]).
+     pub host_inbox: HostInbox,
+     /// The embedding page's id for each document opened from a file it sent ([`HostInbox`]).
+@@ -929,6 +964,7 @@
+             host_chrome: false,
+             host_requests: Default::default(),
+             host_state: None,
++            host_share: None,
+             host_inbox: Default::default(),
+             host_ids: Default::default(),
+             close_request: None,
+@@ -2669,7 +2705,10 @@
+         self.shortcuts(ctx);
+         // Scrolling and group-drag previews are transient: never resume after changing tabs,
+         // opening a modal/palette, or returning to a window that lost focus.
+-        let blocked = self.modal_open() || self.palette_open || !ctx.input(|i| i.focused);
++        // A page that draws the controls takes the focus whenever one of them is tapped: its
++        // controls are this app's, so PdfCraft's frame counts as focused all the same.
++        let focused = self.host_chrome || ctx.input(|i| i.focused);
++        let blocked = self.modal_open() || self.palette_open || !focused;
+         for (index, view) in self.views.iter_mut().enumerate() {
+             view.objects.set_input_blocked(blocked || self.active != Some(index));
+             if blocked || self.active != Some(index) {
