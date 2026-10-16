@@ -195,7 +195,17 @@
      if zoom_delta.is_finite() && zoom_delta > 0.0 && zoom_delta != 1.0 && navigation_enabled && ui.rect_contains_pointer(navigation_rect) {
          let z = view.zoom * zoom_delta;
          match ui.input(|i| i.pointer.hover_pos()) {
-@@ -2436,6 +2506,16 @@
+@@ -2295,7 +2365,8 @@
+     // A finger dragged across the page with the Select tool scrolls it, as on any phone or
+     // tablet. The page widget below senses every drag (text selection), so the ScrollArea's
+     // own drag-to-scroll never gets one. A press on a comment or a form field still goes to
+-    // it, a double tap still selects a word, and two fingers pinch-zoom instead.
++    // it, a double tap still selects a word (not when a host draws the controls: there only a
++    // finger held on a word does), and two fingers pinch-zoom instead.
+     let touch_pan = tool == QuickTool::Select && !preparing && ui.input(|i| i.any_touches() && i.multi_touch().is_none());
+     // Text selection runs for the Select tool and for the markup tools (highlight…).
+     let selects_text = match tool {
+@@ -2436,6 +2507,16 @@
                  ui.ctx().request_repaint();
              }
          }
@@ -212,7 +222,18 @@
          let mut comment_grabbed = false;
          let origin = resp_rect.min - vec2(0.0, y_shift);
          let painter = ui.painter();
-@@ -2841,6 +2921,24 @@
+@@ -2830,7 +2911,9 @@
+ 
+                         // Multi-click highlights immediately on pointer press instead of release (#1024).
+                         let clicks = if view.clicks > 2 && tool != QuickTool::Select { 1 } else { view.clicks };
+-                        if clicks >= 2 && over_text {
++                        // On a phone (the host draws the controls) two quick taps are not a double click:
++                        // a word is selected by holding a finger on it, and by nothing else.
++                        if clicks >= 2 && over_text && !view.host {
+                             let span = text.nearest(vx, vy).and_then(|a| match clicks {
+                                 2 => text.word_at(a),
+                                 3 => text.line_at(a),
+@@ -2841,6 +2924,24 @@
                              }
                          }
                      }
@@ -237,7 +258,16 @@
                      if resp.drag_started() && press_here && !over_link && !touch_pan {
                          let origin = ui.input(|inp| inp.pointer.press_origin()).unwrap_or(p);
                          let (ox, oy) = xf.screen_to_view(origin);
-@@ -2901,7 +2999,7 @@
+@@ -2890,7 +2991,7 @@
+                     // Only on the frame egui reports the multi-click: `view.clicks` outlives it, and
+                     // acting on every frame re-selected the word as soon as a selection was cleared
+                     // (a highlight made by the double-click left its word selected).
+-                    if release_clicks > 0 && clicks >= 2 && over_text {
++                    if release_clicks > 0 && clicks >= 2 && over_text && !view.host {
+                         if view.selection.is_none() {
+                             let span = text.nearest(vx, vy).and_then(|a| match clicks {
+                                 2 => text.word_at(a),
+@@ -2901,7 +3002,7 @@
                                  view.selection = Some(Selection::run(i, first, last));
                              }
                          }
@@ -246,7 +276,7 @@
                          // ⇧-click extends a selection on this page to the click, keeping its
                          // anchor (#527). Otherwise (no shift, no selection on this page, or a
                          // column selection, which has no anchor glyph; a selection cannot yet
-@@ -3069,105 +3167,110 @@
+@@ -3069,105 +3170,110 @@
                  view.page_input = (current + 1).to_string();
              }
          }
@@ -448,7 +478,7 @@
          (wanted, visible_now)
      });
      view.single_edges = visible_pages.first().copied().filter(|_| !view.continuous).map(|page| {
-@@ -3180,7 +3283,7 @@
+@@ -3180,7 +3286,7 @@
  
      view.viewport_screen = out.inner_rect;
      view.auto_scroll.paint(ui, avail);
@@ -457,7 +487,7 @@
          selection_actions(ui, avail, view, info, prefs, allowed && !comments_hidden);
      }
  
-@@ -3285,7 +3388,9 @@
+@@ -3285,7 +3391,9 @@
              });
          });
      }
@@ -468,7 +498,7 @@
      if tool == QuickTool::EnhanceCamera {
          crate::camera_ui::bar(ui.ctx(), view, avail, &t, can_modify);
      }
-@@ -3461,6 +3566,9 @@
+@@ -3461,6 +3569,9 @@
      }
  }
  
@@ -478,7 +508,7 @@
  #[derive(Clone, Copy)]
  enum SelectionAction {
      Note,
-@@ -3514,6 +3622,11 @@
+@@ -3514,6 +3625,11 @@
          ui.ctx().copy_text(selected);
          return;
      }

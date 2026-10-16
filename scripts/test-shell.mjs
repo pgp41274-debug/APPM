@@ -673,10 +673,14 @@ try {
     // A finger held on a word selects it: handles at its ends, a card of what to do with it.
     const fb = await p.locator('#app').boundingBox();
     let selected = false;
+    let onWord = [0.36, 0.37]; // where a held finger found a word
     for (const [fx, fy] of [[0.36, 0.37], [0.3, 0.33], [0.45, 0.4], [0.25, 0.42]]) {
       await hold(fb.x + fb.width * fx, fb.y + fb.height * fy, 1500);
       selected = await settle(() => !!(window.__state.selection && window.__state.selection.text), 4000);
-      if (selected) break;
+      if (selected) {
+        onWord = [fx, fy];
+        break;
+      }
     }
     const card = selected && await settle(() => !document.getElementById('selcard').hidden, 3000);
     const handlesShown = await shown('#handle-start') && await shown('#handle-end');
@@ -698,6 +702,36 @@ try {
     const copied = await p.evaluate(() => window.__calls.filter((c) => c[0] === 'copyText').map((c) => c[1]));
     check('... Copy text puts the words on Android\'s clipboard', !!words && copied.at(-1) === words && await settle(() => !window.__state.selection),
       JSON.stringify({ words, copied }));
+
+    // Taps are not a long press: one, two or three quick taps on that same word select nothing
+    // (a mouse's double and triple click select a word and a line; a finger lands in them by accident).
+    const tapAt = async (x, y) => {
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+      await sleep(40);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    };
+    const [wx, wy] = [fb.x + fb.width * onWord[0], fb.y + fb.height * onWord[1]];
+    const taps = {};
+    for (const n of [1, 2, 3, 4]) {
+      for (let k = 0; k < n; k++) {
+        await tapAt(wx, wy);
+        await sleep(60);
+      }
+      await sleep(1500); // a selection would show by now (and the bars' tap timer has run)
+      const sel = (await st()).selection;
+      taps[n] = sel ? sel.text : null;
+      if (sel) {
+        await p.evaluate(() => window.shell.back()); // clear it for the next try
+        await settle(() => !window.__state.selection, 3000);
+      }
+      await sleep(600);
+    }
+    check('quick taps on a word select nothing: only a held finger does', Object.values(taps).every((t) => t === null), JSON.stringify(taps));
+    // The taps may have hidden the bars (a tap on the page does); bring them back for what follows.
+    if (await p.evaluate(() => document.body.classList.contains('immersive'))) {
+      await p.touchscreen.tap(fb.x + fb.width * 0.9, fb.y + fb.height * 0.97);
+      await settle(() => !document.body.classList.contains('immersive'), 4000);
+    }
 
     // Highlight: ✓ at the top, the tools along the bottom, a hint, and the colour.
     await p.tap('#bottombar [data-item="highlight"]');
