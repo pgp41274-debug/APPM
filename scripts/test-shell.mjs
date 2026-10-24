@@ -408,16 +408,29 @@ try {
     const b = largestPatch(shot, 0, (r, g, bl) => r > 250 && g > 250 && bl > 250);
     return b && { x: b.x0 / scale, y: b.y0 / scale, w: (b.x1 - b.x0 + 1) / scale, h: (b.y1 - b.y0 + 1) / scale };
   };
+  // A slow machine opens a dialog late: wait for its card (it has margins; the page has none),
+  // or for the card to be what `ok` wants.
+  const cardWhen = async (file, ok = () => true, ms = 10000) => {
+    const width = await page.evaluate(() => innerWidth);
+    const end = Date.now() + ms;
+    let c;
+    do {
+      c = await cardOn(file);
+      if (c && c.w < width - 8 && ok(c)) return c;
+      await sleep(400);
+    } while (Date.now() < end);
+    return c;
+  };
   await command('Document properties');
-  const described = await cardOn('2b-properties-description.png');
+  const described = await cardWhen('2b-properties-description.png');
   await page.keyboard.press('Escape');
   await sleep(800);
   await command('Security properties');
-  const secured = await cardOn('2c-properties-security.png');
+  const secured = await cardWhen('2c-properties-security.png');
   // The tabs run along the top of the card, Description first.
   if (secured) await page.mouse.click(secured.x + 60, secured.y + 75);
   await sleep(1500);
-  const switched = await cardOn('2d-properties-security-then-description.png');
+  const switched = await cardWhen('2d-properties-security-then-description.png', (c) => described && Math.abs(c.h - described.h) < 2, 6000);
   // More frames (the pointer moving over the backdrop) for a card that is still on the move.
   for (let i = 0; i < 20; i++) { await page.mouse.move(4 + (i % 2), 4); await sleep(50); }
   const settled = await cardOn('2e-properties-settled.png');
@@ -1217,6 +1230,9 @@ try {
     check('a pen drag in the Select tool scrolls the page, and selects nothing', penScrolled && !(await st()).selection && (await st()).pen === true,
       JSON.stringify({ pageBeforePen, page: (await st()).page, selection: (await st()).selection, pen: (await st()).pen }));
     check('... and the shell remembers that a pen is used here', await p.evaluate(() => localStorage.getItem('shell.pen') === '1'));
+    // The pen's scroll glides on after it lifts; back to page 1 once it has stopped, or the glide
+    // would carry the page on under the strokes below.
+    await sleep(2000);
     await p.evaluate(() => document.getElementById('app').contentWindow.postMessage({ type: 'pdfcraft:gotoPage', page: 1 }, location.origin));
     await settle(() => window.__state.page === 1, 4000);
 

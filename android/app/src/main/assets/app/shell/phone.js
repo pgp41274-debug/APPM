@@ -947,12 +947,11 @@
       else if (e.type === 'pointerup' || e.type === 'pointercancel') penDown = false;
     };
     doc.addEventListener('pointermove', notePen, true);
-    // The last 100 ms of the press's path, for its sideways speed as it lifts (Android's
-    // VelocityTracker looks at about as much).
+    // The press's recent path, for its sideways speed as it lifts.
     doc.addEventListener('pointermove', (e) => {
       if (!down) return;
       down.moves.push({ x: e.clientX, t: e.timeStamp });
-      while (down.moves.length > 2 && e.timeStamp - down.moves[1].t > 100) down.moves.shift();
+      if (down.moves.length > 32) down.moves.splice(1, 1);
     }, true);
     doc.addEventListener('pointerdown', (e) => {
       const palm = e.pointerType === 'touch' && penNear(e);
@@ -993,10 +992,11 @@
       // Single-page view: a quick sideways swipe turns the page (PdfCraft keeps a page zoomed in
       // past the screen's width for scrolling). Quick is Acrobat's fling: 500 screen pixels a
       // second sideways as the finger lifts; a slow drag only moves the page.
-      // A finger that rested a while before it lifted has stopped: no fling.
-      const [from, last] = [d.moves[0], d.moves[d.moves.length - 1]];
-      const speed = e.timeStamp - last.t > 250 ? 0
-        : Math.abs(last.x - from.x) / Math.max(1, last.t - from.t) * 1000 * (window.devicePixelRatio || 1);
+      // Over the path's last 50 ms or more (moves can arrive bunched in one frame), from the
+      // press itself when the path is shorter.
+      const last = d.moves[d.moves.length - 1];
+      const from = d.moves.findLast((m) => last.t - m.t >= 50) || d.moves[0];
+      const speed = Math.abs(last.x - from.x) / Math.max(1, last.t - from.t) * 1000 * (window.devicePixelRatio || 1);
       if (!d.selecting && !d.pen && !state.continuous && Math.abs(dx) > t.slop && Math.abs(dx) > 1.5 * Math.abs(dy) && speed > 500) {
         lastTap = null;
         post('pdfcraft:turnPage', { forward: dx < 0, swipe: true });
