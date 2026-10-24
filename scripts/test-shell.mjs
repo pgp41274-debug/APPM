@@ -1145,9 +1145,11 @@ try {
       const [x0, x1, y] = [fb.x + fb.width * 0.15, fb.x + fb.width * 0.7, fb.y + fb.height * fy];
       await penEvent('mouseMoved', x0, y, false);
       await penEvent('mousePressed', x0, y, true);
-      for (let k = 1; k <= 6; k++) {
-        await penEvent('mouseMoved', x0 + (x1 - x0) * k / 6, y, true);
-        await sleep(30);
+      // A stroke spans several frames, as a hand's does; a press and release within one frame
+      // is a click to PdfCraft, not a drag.
+      for (let k = 1; k <= 12; k++) {
+        await penEvent('mouseMoved', x0 + (x1 - x0) * k / 12, y, true);
+        await sleep(60);
       }
       await penEvent('mouseReleased', x1, y, false);
     };
