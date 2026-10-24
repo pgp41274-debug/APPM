@@ -908,6 +908,8 @@ try {
     await p.tap('#more');
     await settle(() => !document.getElementById('sheet').hidden);
     await sheetRow('View settings');
+    // The sheet slides in; a row tapped before it has been drawn is missed on a slow machine.
+    await settle(() => document.getElementById('sheet').dataset.kind === 'view' && !!document.querySelector('#sheet .row'));
     await sheetRow('Night mode');
     check('View settings ▸ Night mode turns the pages white on black, and back', night && switchOn && await settle(() => window.__state.night === false));
     await p.evaluate(() => window.shell.back());
