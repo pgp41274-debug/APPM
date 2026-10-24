@@ -142,6 +142,16 @@ body.busy .pbar { pointer-events: none; opacity: 0.5; }
 #pagepill[hidden] { display: none; }
 body.immersive #pagepill, body.full-screen #pagepill { top: 10px; }
 
+/* The scrubber: a tab at the right edge that drags through the pages. Its track (top, height)
+   is set by phone.js between the bars; the track itself lets touches through to the page. */
+#scrubber { position: fixed; z-index: 4; right: 0; width: 44px; pointer-events: none; }
+#scrubber[hidden] { display: none; }
+#scrubber .thumb { pointer-events: auto; width: 32px; height: 48px; margin-left: 12px; border-radius: 16px 0 0 16px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0;
+  background: rgba(32, 32, 36, 0.78); color: #fff; touch-action: none; -webkit-tap-highlight-color: transparent; }
+#scrubber .thumb .ic { width: 16px; height: 16px; margin: -2px 0; }
+#scrubber .thumb.held { background: var(--accent); }
+
 /* ---- home ---- */
 
 #home { position: fixed; inset: 0; z-index: 4; overflow-y: auto; background: var(--home-bg); color: var(--bar-fg);

@@ -13,7 +13,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PDFCRAFT_VERSION="${PDFCRAFT_VERSION:-0.7.1}"
+PDFCRAFT_VERSION="${PDFCRAFT_VERSION:-0.13.0}"
 PDFCRAFT_REF="${PDFCRAFT_REF:-v$PDFCRAFT_VERSION}"
 # The craft-fonts revision PdfCraft's own CI pins (Japanese + Thai fonts, as in official releases).
 CRAFT_FONTS_REF="${CRAFT_FONTS_REF:-3d9ab3a132ed0eff457e424226a435a901da30d3}"

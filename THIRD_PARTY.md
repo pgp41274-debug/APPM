@@ -4,7 +4,7 @@ The APK bundles PdfCraft's browser build and the material PdfCraft itself bundle
 
 | Material | Source | Licence |
 | --- | --- | --- |
-| PdfCraft v0.7.1 (compiled to WebAssembly), © 2026 ArtCraft Team and the PdfCraft contributors | https://github.com/storytold/pdfcraft | MIT OR Apache-2.0 |
+| PdfCraft v0.13.0 (compiled to WebAssembly), © 2026 ArtCraft Team and the PdfCraft contributors | https://github.com/storytold/pdfcraft | MIT OR Apache-2.0 |
 | PdfCraft app icon (`assets/app-icon/pdfcraft-1024.png`), used for the launcher and loading screen | PdfCraft | MIT OR Apache-2.0 |
 | Lucide icons | via PdfCraft, and 68 of them in `android/app/src/main/assets/app/icons/` for the phone controls (licence in that folder) | ISC |
 | Inter, JetBrains Mono, Dancing Script typefaces | via PdfCraft | SIL Open Font License 1.1 |

@@ -1,0 +1,366 @@
+diff --git a/apps/pdfcraft-web/src/main.rs b/apps/pdfcraft-web/src/main.rs
+index 44b58dd..28002a2 100644
+--- a/apps/pdfcraft-web/src/main.rs
++++ b/apps/pdfcraft-web/src/main.rs
+@@ -72,6 +72,10 @@ fn main() {
+                             // `&panel=side`: panels dock beside the page (a tablet), not under it.
+                             app.host_side_panel = query_param("panel").as_deref() == Some("side");
+                             watch_pointer_type(app.host_pointer_touch.clone());
++                            // `&longpress=<ms>`: the host's touch-and-hold delay, for selecting a word.
++                            if let Some(ms) = query_param("longpress").and_then(|v| v.parse::<f64>().ok()).filter(|ms| ms.is_finite()) {
++                                app.host_long_press = (ms / 1000.0).clamp(0.2, 2.0);
++                            }
+                             // No panel left open from last time: on a phone it covers the page.
+                             app.right = None;
+                             app.host_state = Some(bridge.state_fn());
+@@ -291,6 +295,11 @@ mod host {
+                             "pdfcraft:findClose" => Some(HostRequest::FindClose),
+                             "pdfcraft:night" => Some(HostRequest::Night(boolean(&data, "on"))),
+                             "pdfcraft:share" => Some(HostRequest::Share),
++                            "pdfcraft:smartZoom" => match (real(&data, "x"), real(&data, "y")) {
++                                (Some(x), Some(y)) => Some(HostRequest::SmartZoom { x: x as f32, y: y as f32 }),
++                                _ => None,
++                            },
++                            "pdfcraft:turnPage" => Some(HostRequest::TurnPage { forward: boolean(&data, "forward"), swipe: boolean(&data, "swipe") }),
+                             _ => None,
+                         };
+                         if let Some(request) = request
+diff --git a/crates/ui-egui/src/canvas.rs b/crates/ui-egui/src/canvas.rs
+index f55fe6c..dc7bd30 100644
+--- a/crates/ui-egui/src/canvas.rs
++++ b/crates/ui-egui/src/canvas.rs
+@@ -1242,6 +1242,60 @@ impl DocView {
+         (!words.is_empty()).then(|| (bounds, first.left_bottom(), last.right_bottom(), words))
+     }
+ 
++    /// A double tap at `pos` (screen points), as in Acrobat's phone app: zoom in on the column of
++    /// text under the finger until its lines fill the screen's width (twice the page's width
++    /// where there is no text), or, on a page already zoomed in, back to the page's width. The
++    /// point tapped stays where it is on screen, and the column's left edge goes to the screen's.
++    pub(crate) fn smart_zoom(&mut self, info: &DocInfo, pos: Pos2) {
++        let Some((page, rect)) = self.screen_rects.iter().copied().find(|(_, r)| r.expand(4.0).contains(pos)) else { return };
++        let (fit, zoom) = (self.fit, self.zoom);
++        self.fit = Fit::Width;
++        self.fit_zoom(info);
++        let width_zoom = self.zoom;
++        (self.fit, self.zoom) = (fit, zoom);
++        if self.zoom > width_zoom * 1.1 {
++            self.zoom_at(width_zoom, pos);
++            self.fit = Fit::Width;
++            return;
++        }
++        let max_zoom = width_zoom * SMART_ZOOM_MAX;
++        let avail = (self.viewport_w - 2.0 * self.side).max(100.0);
++        let column = self.page_xform(page).zip(self.texts.get(&page).cloned()).and_then(|(xf, text)| {
++            let (vx, vy) = xf.screen_to_view(pos);
++            let column = text_column(&text, vx, vy)?;
++            Some(xf.view_rect(column))
++        });
++        // The zoom at which the column, with a margin each side, is as wide as the screen.
++        let target = column.filter(|c| c.width() > 1.0).map(|c| zoom * (avail - 2.0 * SMART_ZOOM_MARGIN) / c.width());
++        match (column, target) {
++            (Some(c), Some(z)) if z > width_zoom * 1.2 => {
++                // The column's left edge goes to the screen's (less the margin), at the tap's height.
++                let f = vec2((c.left() - rect.left()) / rect.width().max(1.0), (pos.y - rect.top()) / rect.height().max(1.0));
++                self.zoom = z.min(max_zoom).clamp(0.08, 64.0);
++                self.fit = Fit::None;
++                self.zoom_anchor = Some((page, f.x, f.y, vec2(self.side + SMART_ZOOM_MARGIN, pos.y - self.viewport_screen.min.y)));
++            }
++            _ => self.zoom_at((width_zoom * 2.0).min(max_zoom), pos),
++        }
++    }
++
++    /// The previous or next page in single-page view (a swipe, or a tap at the screen's edge, as
++    /// in Acrobat's phone app). A swipe turns the page only while the page fits the screen's
++    /// width: on a page zoomed in past it, a sideways drag scrolls instead. Returns whether the
++    /// page turned.
++    pub(crate) fn turn_page(&mut self, forward: bool, swipe: bool) -> bool {
++        if self.continuous {
++            return false;
++        }
++        let fits = self.screen_rects.iter().find(|(p, _)| *p == self.current).is_none_or(|(_, r)| r.width() <= self.viewport_screen.width() + 1.0);
++        if swipe && !fits {
++            return false;
++        }
++        let before = self.current;
++        self.step_page(forward);
++        self.current != before || self.goto.is_some()
++    }
++
+     /// The find bar's search for the host's box: run `query` (an empty one clears the matches).
+     pub(crate) fn host_find(&mut self, query: &str) {
+         let f = self.find.get_or_insert_with(Find::default);
+@@ -2744,6 +2798,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+     // Prepare a form ▸ Calculation order: the order's steps and links on the page.
+     let calc_order = preparing && app.left_open && app.left == crate::LeftPanel::CalculationOrder;
+     let pointer_touch = app.host_pointer_touch.load(std::sync::atomic::Ordering::Relaxed);
++    let long_press = app.host_long_press;
+     // Edit a PDF: added text and images can be selected, moved and edited.
+     let editing_content =
+         (app.left_open && app.left == crate::LeftPanel::Tool("edit")) || matches!(app.quick_tool, QuickTool::AddText | QuickTool::EditText);
+@@ -3778,17 +3833,20 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                     }
+                     // A finger held still on a word selects it, as on any phone; a finger that
+                     // moves scrolls instead (`touch_pan`).
+-                    if touch_pan && over_text && !over_link && !view.long_pressed && !view.touch_panning && resp.is_pointer_button_down_on() {
++                    // egui lets go of a finger held past its 0.8 s for a click (it becomes a long
++                    // touch), so a longer host delay asks whether that finger is still down.
++                    let down = resp.is_pointer_button_down_on() || (view.press_touch && ui.input(|inp| inp.pointer.primary_down()));
++                    if touch_pan && over_text && !over_link && !view.long_pressed && !view.touch_panning && down {
+                         let (start, origin) = ui.input(|inp| (inp.pointer.press_start_time(), inp.pointer.press_origin()));
+                         let held = start.map(|t0| ui.input(|inp| inp.time) - t0);
+                         let still = origin.is_some_and(|o| r.contains(o) && o.distance(p) <= 10.0);
+-                        if still && held.is_some_and(|h| h >= LONG_PRESS) {
++                        if still && held.is_some_and(|h| h >= long_press) {
+                             if let Some((first, last)) = text.nearest(vx, vy).and_then(|a| text.word_at(a)) {
+                                 view.selection = Some(Selection::run(i, first, last));
+                             }
+                             view.long_pressed = true;
+                         } else if still && let Some(h) = held {
+-                            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((LONG_PRESS - h).max(0.01)));
++                            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((long_press - h).max(0.01)));
+                         }
+                     }
+                     if resp.drag_started() && press_here && !over_link && !touch_pan {
+@@ -4079,10 +4137,16 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+             }
+         }
+         // Scrolled by a finger: the drag pans, unless it is moving or resizing a comment.
+-        if touch_pan && resp.dragged() && !comment_grabbed {
+-            // egui reports no motion on the frame a drag starts: take it from the press.
+-            let delta = match ui.input(|i| (i.pointer.press_origin(), i.pointer.interact_pos())) {
+-                (Some(from), Some(to)) if resp.drag_started() => to - from,
++        // A finger resting on the page is a drag to egui once it is down too long to be a click
++        // (0.8 s), but it scrolls nothing until it moves: a hold longer than that (Android's
++        // Medium and Long touch-and-hold delays) still selects the word under it.
++        let (from, to) = ui.input(|i| (i.pointer.press_origin(), i.pointer.interact_pos()));
++        let moved = view.touch_panning || from.zip(to).is_some_and(|(a, b)| a.distance(b) > TOUCH_SLOP);
++        if touch_pan && resp.dragged() && !comment_grabbed && moved {
++            // egui reports no motion on the frame a drag starts, and none for a finger that only
++            // now moved past the slop: take it from the press.
++            let delta = match (from, to) {
++                (Some(from), Some(to)) if resp.drag_started() || !view.touch_panning => to - from,
+                 _ => resp.drag_delta(),
+             };
+             ui.scroll_with_delta_animation(delta, egui::style::ScrollAnimation::none());
+@@ -4610,8 +4674,47 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+     }
+ }
+ 
+-/// How long a finger rests on a word before it selects it (seconds).
+-const LONG_PRESS: f64 = 0.5;
++/// How long a finger rests on a word before it selects it (seconds), unless the host says
++/// otherwise ([`crate::PdfCraftApp::host_long_press`]: Android's own touch-and-hold delay).
++pub(crate) const LONG_PRESS: f64 = 0.5;
++
++/// How far a finger moves before it scrolls the page rather than resting on it (points; Android's
++/// touch slop is 8 dp).
++const TOUCH_SLOP: f32 = 8.0;
++
++/// A double tap zooms in to at most this many times the page's width ([`DocView::smart_zoom`]).
++const SMART_ZOOM_MAX: f32 = 4.0;
++/// Room left each side of the column a double tap zooms in on (screen points).
++const SMART_ZOOM_MARGIN: f32 = 8.0;
++
++/// The column of text around view point (`x`, `y`) on a page: the box of the lines within a
++/// short way above and below it that overlap it sideways (a paragraph, or one column of a
++/// two-column page). `None` far from any text.
++pub(crate) fn text_column(text: &PageText, x: f32, y: f32) -> Option<[f32; 4]> {
++    let mut lines: std::collections::BTreeMap<u32, [f32; 4]> = std::collections::BTreeMap::new();
++    for (g, line) in text.glyphs.iter().zip(&text.line_of) {
++        if g.text.trim().is_empty() || !g.rect.iter().all(|v| v.is_finite()) {
++            continue;
++        }
++        let b = lines.entry(*line).or_insert(g.rect);
++        *b = [b[0].min(g.rect[0]), b[1].min(g.rect[1]), b[2].max(g.rect[2]), b[3].max(g.rect[3])];
++    }
++    // The line under the point, or the nearest one within a few lines' height of it.
++    let distance = |b: &[f32; 4]| {
++        let dx = (b[0] - x).max(x - b[2]).max(0.0);
++        let dy = (b[1] - y).max(y - b[3]).max(0.0);
++        dx.hypot(dy)
++    };
++    let seed = *lines.values().min_by(|a, b| distance(a).total_cmp(&distance(b))).filter(|b| distance(b) <= 48.0)?;
++    // Lines around it that overlap it sideways by half the narrower of the two: the column.
++    let reach = 220.0;
++    let overlaps = |b: &[f32; 4]| {
++        let shared = b[2].min(seed[2]) - b[0].max(seed[0]);
++        shared >= 0.5 * (b[2] - b[0]).min(seed[2] - seed[0]) && b[3] >= seed[1] - reach && b[1] <= seed[3] + reach
++    };
++    let column = lines.values().filter(|b| overlaps(b)).fold(seed, |c, b| [c[0].min(b[0]), c[1].min(b[1]), c[2].max(b[2]), c[3].max(b[3])]);
++    Some(column)
++}
+ 
+ #[derive(Clone, Copy)]
+ enum SelectionAction {
+diff --git a/crates/ui-egui/src/host_chrome.rs b/crates/ui-egui/src/host_chrome.rs
+index e151791..ea3b88e 100644
+--- a/crates/ui-egui/src/host_chrome.rs
++++ b/crates/ui-egui/src/host_chrome.rs
+@@ -142,6 +142,21 @@ impl PdfCraftApp {
+                     self.set_reading_colors(colors);
+                 }
+                 HostRequest::Share => self.share_active(),
++                HostRequest::SmartZoom { x, y } => {
++                    let scale = self.ctx.as_ref().map_or(1.0, |c| c.zoom_factor()).max(0.01);
++                    if let Some(i) = self.active
++                        && x.is_finite()
++                        && y.is_finite()
++                        && let Some(doc) = self.session.get(self.views[i].id)
++                    {
++                        self.views[i].smart_zoom(&doc.info, egui::pos2(x / scale, y / scale));
++                    }
++                }
++                HostRequest::TurnPage { forward, swipe } => {
++                    if let Some(view) = self.active.and_then(|i| self.views.get_mut(i)) {
++                        view.turn_page(forward, swipe);
++                    }
++                }
+             }
+         }
+     }
+@@ -559,4 +574,103 @@ mod tests {
+         assert_eq!(name, "long.pdf");
+         assert!(bytes.starts_with(b"%PDF-"));
+     }
++
++    #[test]
++    fn a_double_tap_zooms_in_on_the_text_under_it_and_another_zooms_back_out() {
++        let mut h = phone(3);
++        let (first, _) = first_and_last_glyph(&mut h);
++        let fitted = h.state().views[0].zoom;
++        ask(&mut h, HostRequest::SmartZoom { x: first.x, y: first.y });
++        h.run_steps(4);
++        // "Page 1" is a short line: as far in as a double tap goes, four times the page's width.
++        let zoomed = h.state().views[0].zoom;
++        assert!((zoomed / fitted - 4.0).abs() < 0.05, "zoomed from {fitted} to {zoomed}");
++        // The line's start stays on screen, at the left.
++        let (first_now, _) = first_and_last_glyph(&mut h);
++        assert!(first_now.x > 0.0 && first_now.x < 140.0, "the line starts at {first_now:?}");
++        ask(&mut h, HostRequest::SmartZoom { x: first_now.x, y: first_now.y });
++        h.run_steps(4);
++        let back = h.state().views[0].zoom;
++        assert!((back - fitted).abs() < 1e-3, "back to {back}, not {fitted}");
++        assert_eq!(h.state().views[0].fit, crate::canvas::Fit::Width);
++    }
++
++    #[test]
++    fn a_double_tap_beside_the_text_zooms_in_twice() {
++        let mut h = phone(3);
++        first_and_last_glyph(&mut h);
++        let fitted = h.state().views[0].zoom;
++        let page = h.state().views[0].visible_page_rects()[0].1;
++        // Low on the page, far from its only line.
++        let at = page.left_top() + egui::vec2(page.width() * 0.5, page.height() * 0.8);
++        ask(&mut h, HostRequest::SmartZoom { x: at.x, y: at.y });
++        h.run_steps(4);
++        let zoomed = h.state().views[0].zoom;
++        assert!((zoomed / fitted - 2.0).abs() < 0.05, "zoomed from {fitted} to {zoomed}");
++    }
++
++    #[test]
++    fn a_column_is_the_lines_around_the_tap_that_share_its_width() {
++        // Two columns of three lines each; a tap in the left one zooms on the left one only.
++        let line = |x0: f32, y0: f32| pdfcraft_render::TextGlyph {
++            text: "word".into(),
++            rect: [x0, y0, x0 + 200.0, y0 + 12.0],
++            quad: [[x0, y0 + 12.0], [x0 + 200.0, y0 + 12.0], [x0 + 200.0, y0], [x0, y0]],
++            direction: [1.0, 0.0],
++        };
++        let glyphs: Vec<_> = (0..3).flat_map(|k| [line(50.0, 100.0 + 16.0 * k as f32), line(320.0, 100.0 + 16.0 * k as f32)]).collect();
++        let text = pdfcraft_render::PageText {
++            line_of: (0..6).map(|k| k as u32).collect(),
++            space_before: vec![false; 6],
++            glyphs,
++        };
++        let column = crate::canvas::text_column(&text, 120.0, 120.0).expect("a column");
++        assert_eq!(column, [50.0, 100.0, 250.0, 144.0]);
++        assert!(crate::canvas::text_column(&text, 120.0, 600.0).is_none(), "nothing near the bottom of the page");
++    }
++
++    #[test]
++    fn single_page_view_turns_pages_by_swipe_and_continuous_view_does_not() {
++        let mut h = phone(3);
++        ask(&mut h, HostRequest::TurnPage { forward: true, swipe: true });
++        h.run_steps(8);
++        assert_eq!(state(&h)["page"], 1, "continuous view scrolls; it has no pages to turn");
++        ask(&mut h, HostRequest::Command("view.continuous".into()));
++        ask(&mut h, HostRequest::Command("view.layout.single".into()));
++        assert_eq!(state(&h)["continuous"], false);
++        ask(&mut h, HostRequest::TurnPage { forward: true, swipe: true });
++        h.run_steps(8);
++        assert_eq!(state(&h)["page"], 2);
++        ask(&mut h, HostRequest::TurnPage { forward: false, swipe: false });
++        h.run_steps(8);
++        assert_eq!(state(&h)["page"], 1);
++        // Zoomed in past the screen's width, a swipe scrolls the page instead; a tap at the edge
++        // still turns it.
++        let centre = h.state().views[0].visible_page_rects()[0].1.center();
++        ask(&mut h, HostRequest::SmartZoom { x: centre.x, y: centre.y });
++        h.run_steps(4);
++        ask(&mut h, HostRequest::TurnPage { forward: true, swipe: true });
++        h.run_steps(8);
++        assert_eq!(state(&h)["page"], 1);
++        ask(&mut h, HostRequest::TurnPage { forward: true, swipe: false });
++        h.run_steps(8);
++        assert_eq!(state(&h)["page"], 2);
++    }
++
++    #[test]
++    fn the_host_sets_how_long_a_finger_holds_a_word_to_select_it() {
++        let mut h = phone(3);
++        h.state_mut().host_long_press = 1.2;
++        let (word, _) = first_and_last_glyph(&mut h);
++        press(&mut h, word);
++        // A frame is a quarter of a second here: 0.75 s, past PdfCraft's own half second and
++        // short of the host's 1.2, selects nothing yet; 1.5 s, past egui's 0.8 s for a click,
++        // does, though egui calls a press held that long a drag.
++        h.run_steps(3);
++        assert!(state(&h)["selection"].is_null(), "selected after 0.75 s: {}", state(&h));
++        h.run_steps(3);
++        assert_eq!(state(&h)["selection"]["text"], "Page", "nothing selected after 1.5 s: {}", state(&h));
++        lift(&mut h, word);
++        h.run_steps(2);
++    }
+ }
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 52c4b0f..ce5bb64 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -488,6 +488,18 @@ pub enum HostRequest {
+     Night(bool),
+     /// Hand the active document's bytes, as Save would write them, to [`HostShareFn`].
+     Share,
++    /// A double tap at this point of the page, in CSS pixels from the canvas's top-left: zoom
++    /// in on the text there, or back out ([`canvas::DocView::smart_zoom`]).
++    SmartZoom {
++        x: f32,
++        y: f32,
++    },
++    /// The next (`forward`) or previous page in single-page view: a sideways swipe (`swipe`,
++    /// which only turns a page that fits the screen's width) or a tap at the screen's edge.
++    TurnPage {
++        forward: bool,
++        swipe: bool,
++    },
+ }
+ 
+ /// Requests from the embedding page, filled by the web bridge.
+@@ -735,6 +747,9 @@ pub struct PdfCraftApp {
+     /// (`pointerType`, noted before any frame): a frame can run between a tap's `pointerdown`
+     /// and its `touchstart`, so the frame's own touch events cannot tell.
+     pub host_pointer_touch: std::sync::Arc<std::sync::atomic::AtomicBool>,
++    /// How long a finger rests on a word before it selects it (seconds): the host's own
++    /// touch-and-hold delay (`&longpress=`, Android's accessibility setting), or 0.5.
++    pub host_long_press: f64,
+     /// Where the open panel was drawn last frame, for the host's state (`panelRect`).
+     pub(crate) host_panel_rect: Option<egui::Rect>,
+     /// What that page asked for (see [`HostRequest`]).
+@@ -1131,6 +1146,7 @@ impl PdfCraftApp {
+             host_chrome: false,
+             host_side_panel: false,
+             host_pointer_touch: Default::default(),
++            host_long_press: canvas::LONG_PRESS,
+             host_panel_rect: None,
+             host_requests: Default::default(),
+             host_state: None,

@@ -1,6 +1,8 @@
+diff --git a/apps/pdfcraft-web/src/main.rs b/apps/pdfcraft-web/src/main.rs
+index c7384e1..44b58dd 100644
 --- a/apps/pdfcraft-web/src/main.rs
 +++ b/apps/pdfcraft-web/src/main.rs
-@@ -69,6 +69,9 @@
+@@ -69,6 +69,9 @@ fn main() {
                          // `&chrome=host`: the page draws the controls (a phone's toolbars).
                          if query_param("chrome").as_deref() == Some("host") {
                              app.host_chrome = true;
@@ -10,7 +12,7 @@
                              // No panel left open from last time: on a phone it covers the page.
                              app.right = None;
                              app.host_state = Some(bridge.state_fn());
-@@ -96,6 +99,22 @@
+@@ -100,6 +103,22 @@ fn main() {
      });
  }
  
@@ -33,9 +35,11 @@
  #[cfg(target_arch = "wasm32")]
  fn warn_before_unload(unsaved: std::sync::Arc<std::sync::atomic::AtomicBool>) {
      use eframe::wasm_bindgen::{JsCast, closure::Closure};
+diff --git a/crates/ui-egui/src/canvas.rs b/crates/ui-egui/src/canvas.rs
+index 5714a0b..f55fe6c 100644
 --- a/crates/ui-egui/src/canvas.rs
 +++ b/crates/ui-egui/src/canvas.rs
-@@ -370,6 +370,8 @@
+@@ -493,6 +493,8 @@ pub struct DocView {
      pub(crate) host_compose: Option<bool>,
      /// A long press selected a word: its release is not a tap that clears the selection.
      long_pressed: bool,
@@ -44,7 +48,7 @@
      viewport_h: f32,
      page_count: usize,
      /// Page heights in points (view space), for mapping text positions to scroll offsets.
-@@ -641,6 +643,7 @@
+@@ -808,6 +810,7 @@ impl DocView {
              host: false,
              host_compose: None,
              long_pressed: false,
@@ -52,15 +56,15 @@
              viewport_h: 600.0,
              page_count: info.pages.len(),
              page_heights: info.pages.iter().map(|p| p.height).collect(),
-@@ -2141,6 +2144,7 @@
-     }
-     // The Prepare a form panel is open (or a field tool is picked): fields are edited, not filled.
+@@ -2740,6 +2743,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
      let preparing = app.is_preparing();
+     // Prepare a form ▸ Calculation order: the order's steps and links on the page.
+     let calc_order = preparing && app.left_open && app.left == crate::LeftPanel::CalculationOrder;
 +    let pointer_touch = app.host_pointer_touch.load(std::sync::atomic::Ordering::Relaxed);
      // Edit a PDF: added text and images can be selected, moved and edited.
      let editing_content =
          (app.left_open && app.left == crate::LeftPanel::Tool("edit")) || matches!(app.quick_tool, QuickTool::AddText | QuickTool::EditText);
-@@ -2365,8 +2369,8 @@
+@@ -3097,8 +3101,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
      // A finger dragged across the page with the Select tool scrolls it, as on any phone or
      // tablet. The page widget below senses every drag (text selection), so the ScrollArea's
      // own drag-to-scroll never gets one. A press on a comment or a form field still goes to
@@ -71,7 +75,7 @@
      let touch_pan = tool == QuickTool::Select && !preparing && ui.input(|i| i.any_touches() && i.multi_touch().is_none());
      // Text selection runs for the Select tool and for the markup tools (highlight…).
      let selects_text = match tool {
-@@ -2908,12 +2912,18 @@
+@@ -3751,12 +3755,18 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                          view.clicks = if is_consecutive { view.clicks.saturating_add(1) } else { 1 };
                          view.last_press_time = now;
                          view.last_press_pos = Some(p);
@@ -90,19 +94,18 @@
 +                        // on the same screen, a tablet's keyboard and mouse, keeps its double click.)
 +                        let finger_only = view.host && view.press_touch;
 +                        if clicks >= 2 && over_text && !finger_only {
-                             let span = text.nearest(vx, vy).and_then(|a| match clicks {
-                                 2 => text.word_at(a),
-                                 3 => text.line_at(a),
-@@ -2991,7 +3001,7 @@
+                             let span = text.nearest(vx, vy).and_then(|a| click_unit(&text, clicks, a));
+                             if let Some((first, last)) = span {
+                                 view.selection = Some(Selection::run(i, first, last));
+@@ -3846,18 +3856,21 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                      // Only on the frame egui reports the multi-click: `view.clicks` outlives it, and
                      // acting on every frame re-selected the word as soon as a selection was cleared
                      // (a highlight made by the double-click left its word selected).
 -                    if release_clicks > 0 && clicks >= 2 && over_text && !view.host {
 +                    if release_clicks > 0 && clicks >= 2 && over_text && !(view.host && view.press_touch) {
                          if view.selection.is_none() {
-                             let span = text.nearest(vx, vy).and_then(|a| match clicks {
-                                 2 => text.word_at(a),
-@@ -3002,11 +3012,14 @@
+                             let span = text.nearest(vx, vy).and_then(|a| click_unit(&text, clicks, a));
+                             if let Some((first, last)) = span {
                                  view.selection = Some(Selection::run(i, first, last));
                              }
                          }
@@ -119,9 +122,11 @@
                          let shift = ui.input(|inp| inp.modifiers.shift);
                          match (view.selection.as_mut().filter(|s| shift && s.page == i).map(|s| &mut s.span), text.nearest(vx, vy)) {
                              (Some(Span::Run { head, .. }), Some(h)) => *head = h,
+diff --git a/crates/ui-egui/src/host_chrome.rs b/crates/ui-egui/src/host_chrome.rs
+index 54b91f6..e151791 100644
 --- a/crates/ui-egui/src/host_chrome.rs
 +++ b/crates/ui-egui/src/host_chrome.rs
-@@ -237,12 +237,13 @@
+@@ -237,12 +237,13 @@ impl PdfCraftApp {
              "night": self.reading_colors.mode_name() == "white-on-black",
              "organize": active.is_some_and(|v| v.organize),
              "editable": editable,
@@ -137,7 +142,7 @@
      pub(crate) fn host_chrome_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
          let t = theme::Tokens::get(ctx);
          // No floating quick-action bar to keep the pages clear of: a phone's width is the page's.
-@@ -250,14 +251,33 @@
+@@ -250,14 +251,33 @@ impl PdfCraftApp {
              view.side = HOST_SIDE;
              view.host = true;
          }
@@ -178,7 +183,7 @@
          }
          egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.pasteboard)).show(ui, |ui| match self.active {
              Some(index) => canvas::document_area(self, index, ui),
-@@ -450,6 +470,42 @@
+@@ -450,6 +470,42 @@ mod tests {
          assert_eq!(state(&h)["undo"], false, "and no stroke was drawn");
      }
  
@@ -221,9 +226,11 @@
      #[test]
      fn the_host_sets_colours_searches_writes_comments_and_shares() {
          let mut h = phone(2);
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 88d4e6c..52c4b0f 100644
 --- a/crates/ui-egui/src/lib.rs
 +++ b/crates/ui-egui/src/lib.rs
-@@ -638,6 +638,15 @@
+@@ -728,6 +728,15 @@ pub struct PdfCraftApp {
      /// dialogs and, as a sheet from the bottom, the open panel; never its own tab strip,
      /// toolbars, tool strip or rail.
      pub host_chrome: bool,
@@ -239,7 +246,7 @@
      /// What that page asked for (see [`HostRequest`]).
      pub host_requests: HostRequests,
      /// Reports what that page needs to draw its controls (see [`HostStateFn`]).
-@@ -962,6 +971,9 @@
+@@ -1120,6 +1129,9 @@ impl PdfCraftApp {
              host_full_screen: None,
              host_leave_full_screen: Default::default(),
              host_chrome: false,

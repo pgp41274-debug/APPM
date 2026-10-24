@@ -1,9 +1,12 @@
+diff --git a/crates/ui-egui/src/editing.rs b/crates/ui-egui/src/editing.rs
+index 5b477ee..e108045 100644
 --- a/crates/ui-egui/src/editing.rs
 +++ b/crates/ui-egui/src/editing.rs
-@@ -1521,6 +1521,20 @@
+@@ -1708,6 +1708,20 @@ mod host_close_tests {
+         assert_eq!(taken(&reports), [(sent("f4"), None)], "a password prompt another file replaced");
      }
  
-     #[test]
++    #[test]
 +    fn a_file_the_page_sends_comes_to_the_front() {
 +        let (mut app, reports) = app();
 +        app.open_bytes("picked.pdf", None, form()).unwrap();
@@ -17,13 +20,14 @@
 +        assert!(taken(&reports).is_empty());
 +    }
 +
-+    #[test]
+     #[test]
      fn an_unlocked_file_keeps_its_page_id_until_its_tab_closes() {
          let (mut app, reports) = app();
-         app.open_bytes_with_focus("locked.pdf", None, locked_form(), true, sent("f1")).unwrap();
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 6ff60d2..16e3d2f 100644
 --- a/crates/ui-egui/src/lib.rs
 +++ b/crates/ui-egui/src/lib.rs
-@@ -1077,6 +1077,19 @@
+@@ -1255,6 +1255,19 @@ impl PdfCraftApp {
          Ok(())
      }
  
@@ -43,7 +47,7 @@
      /// The document just opened after `opened` tabs, or else the one waiting behind the password
      /// prompt, came from the embedding page's file `id` ([`HostInbox`]).
      fn take_host_id(&mut self, opened: usize, id: String) {
-@@ -2551,14 +2564,7 @@
+@@ -3324,14 +3337,7 @@ impl eframe::App for PdfCraftApp {
                      self.notify_fmt("Couldn't open {name}: {e}", &[("name", &name), ("e", &e)]);
                  }
              }

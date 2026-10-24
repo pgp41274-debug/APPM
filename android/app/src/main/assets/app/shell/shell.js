@@ -18,7 +18,20 @@
   // them lay them out; PdfCraft draws the page. A tablet (600 dp or wider) has room to dock a
   // panel beside the page instead of raising it from the bottom, and for roomier bars and sheets.
   const TABLET = Math.min(screen.width, screen.height) >= 600;
-  const APP_URL = `../pdfcraft/index.html?host=parent&chrome=host${TABLET ? '&panel=side' : ''}`;
+  // Android's touch-and-hold delay and double-tap time (Accessibility settings change them),
+  // for holding a word to select it and telling a double tap from two taps.
+  const TOUCH = touchTimings();
+  // A pen (an S Pen) used here before: PdfCraft leaves the marking to it from the start, and a
+  // finger only scrolls (phone.js notes the first pen it sees).
+  const PEN_KEY = 'shell.pen';
+  const penBefore = () => {
+    try {
+      return localStorage.getItem(PEN_KEY) === '1';
+    } catch (e) {
+      return false;
+    }
+  };
+  const appUrl = () => `../pdfcraft/index.html?host=parent&chrome=host${TABLET ? '&panel=side' : ''}&longpress=${TOUCH.longPress}${penBefore() ? '&pen=1' : ''}`;
   // A slow phone compiles the 40 MB module for a while; only then say something is wrong.
   const STARTUP_TIMEOUT_MS = 45000;
   // Bytes per bridge call, a multiple of 3 so every slice's base64 decodes on its own. A file
@@ -34,7 +47,7 @@
   let opening = Promise.resolve();
   let handing = Promise.resolve();
 
-  // PdfCraft 0.7.1's default workspace (its saved "docking" setting): Tools beside the page.
+  // PdfCraft's default workspace (its saved "docking" setting, the same from 0.7.1 to 0.13.0): Tools beside the page.
   const DEFAULT_DOCKING = {
     hidden: [['inspector', { anchor: 'canvas', floating: null, placement: { Split: 'Right' }, sibling: ['canvas'],
       size: { FixedSecond: 330.0 }, stack: null }]],
@@ -93,7 +106,7 @@
 
   function load() {
     frame.src = 'about:blank';
-    frame.src = APP_URL;
+    frame.src = appUrl();
     watchdog = setTimeout(() => {
       if (!ready) fail(lastError || 'PdfCraft is taking unusually long to start.', true);
     }, STARTUP_TIMEOUT_MS);
@@ -426,13 +439,38 @@
     if (frame.contentWindow) frame.contentWindow.postMessage({ type: 'pdfcraft:leaveFullScreen' }, origin);
   }
 
+  /** Android's touch timings (ms), or its defaults outside the app. */
+  function touchTimings() {
+    const timings = { longPress: 400, doubleTap: 300 };
+    try {
+      const t = android && android.touchTimings ? JSON.parse(android.touchTimings()) : {};
+      for (const k of Object.keys(timings)) if (Number.isFinite(t[k]) && t[k] > 0) timings[k] = t[k];
+    } catch (e) {
+      // Android's defaults, then.
+    }
+    return timings;
+  }
+
+  /** A long press's buzz, where Android gives one. */
+  function haptic() {
+    if (android && android.haptic) android.haptic();
+  }
+
   /** Put text on the clipboard: Android's, or the browser's outside the app. */
   function copyText(text) {
     if (android && android.copyText) android.copyText(String(text));
     else if (navigator.clipboard) navigator.clipboard.writeText(String(text)).catch(() => {});
   }
 
-  window.shell = { incoming, leaveFullScreen, copyText, controls: true, tablet: TABLET };
+  function rememberPen() {
+    try {
+      localStorage.setItem(PEN_KEY, '1');
+    } catch (e) {
+      // No storage: the next start waits for the pen again.
+    }
+  }
+
+  window.shell = { incoming, leaveFullScreen, copyText, haptic, rememberPen, touch: TOUCH, controls: true, tablet: TABLET };
   seedPhoneDefaults();
   start();
 })();

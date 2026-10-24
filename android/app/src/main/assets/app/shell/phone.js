@@ -8,8 +8,11 @@
 //   home:    what to do (open, create) and the open files
 //   reading: top    ← home · Undo (Redo) · Search · Share · ⋮ (the file: view settings, panels, ...)
 //            bottom Edit PDF · Comment · Highlight · Draw · Fill & Sign · More tools
-//            a tap on the page hides the bars; a finger held on a word selects it, with handles
-//            to widen it and a card of what to do with it
+//            as in Acrobat's phone app: a tap on the page hides the bars; a double tap zooms in on
+//            the text there, and another zooms back out; in single-page view a sideways swipe or
+//            a tap at the screen's edge turns the page; a finger held on a word selects it (with
+//            Android's touch-and-hold delay and buzz), with handles to widen it and a card of
+//            what to do with it; the scrubber at the right edge drags through the pages
 //   a mode:  Edit PDF, Comment, Highlight, Draw or Fill & Sign: ✓ (done) at the top left, the
 //            mode's tools along the bottom with its colour (and thickness), a hint on the page
 //   search:  the top bar turns into the search box
@@ -73,6 +76,16 @@
   ];
 
   // Shown on the page as a tool comes on.
+  // With a pen in use (an S Pen), as in Samsung Notes and Xodo: the pen marks the page and
+  // selects text at once, one finger scrolls, and the pen's side button held erases a drawing.
+  const PEN_HINT = 'Mark with the pen. One finger scrolls';
+  const PEN_HINTS = {
+    'comment.highlight': 'Run the pen over text to highlight. One finger scrolls',
+    'comment.underline': 'Run the pen over text to underline. One finger scrolls',
+    'comment.strikeout': 'Run the pen over text to strike it out. One finger scrolls',
+    'comment.ink': 'Draw with the pen, hold its button to erase. One finger scrolls',
+    'comment.eraser': 'Rub a drawing out with the pen. One finger scrolls',
+  };
   const HINTS = {
     'comment.highlight': 'Drag over text to highlight',
     'comment.underline': 'Drag over text to underline',
@@ -147,6 +160,9 @@
   let hintTimer = 0;
   let repickAt = 0;
   let dragging = null; // the selection handle being dragged
+  let fingersDown = 0; // fingers on the page
+  let scrubbing = false; // a finger is on the scrubber
+  let scrubTimer = 0;
   let toldUneditable = false; // Edit PDF said this file's text can't be edited
 
   // ---- talking to PdfCraft ----
@@ -265,6 +281,10 @@
     el('button', { class: 'icon-btn', 'aria-label': 'Close', onclick: () => panel(null) }, icon('chevron-down')));
 
   const pill = el('button', { id: 'pagepill', hidden: true, onclick: () => gotoSheet() });
+  // The scrubber: a tab at the right edge, as in Acrobat's phone app, shown while the pages go
+  // by. Dragged, it goes through the document; tapped, it asks for a page.
+  const scrubThumb = el('div', { class: 'thumb' }, icon('chevron-up'), icon('chevron-down'));
+  const scrubber = el('div', { id: 'scrubber', hidden: true, 'aria-hidden': 'true' }, scrubThumb);
   const hint = el('div', { id: 'hint', role: 'status', hidden: true });
 
   // The comment being written: PdfCraft pinned it, this box writes it.
@@ -326,7 +346,7 @@
   const scrim = el('div', { id: 'scrim', hidden: true, onclick: () => closeSheet() });
   const sheet = el('div', { id: 'sheet', role: 'dialog', 'aria-modal': 'true', hidden: true });
 
-  document.body.append(topbar, modebar, searchbar, bottombar, toolbar, panelbar, pill, hint, composer, selCard, ...handles,
+  document.body.append(topbar, modebar, searchbar, bottombar, toolbar, panelbar, pill, scrubber, hint, composer, selCard, ...handles,
     homeScreen, scrim, sheet);
   // `phone`: the host draws the controls (phones and tablets); `tablet`: 600 dp or wider.
   body.classList.add('phone', 'home');
@@ -370,14 +390,23 @@
     if (searching) renderFind(s);
     renderComposer(s, before);
     renderSelection(s);
+    // A finger held on a word selected it: Android's long-press buzz, as everywhere else.
+    if (s.selection && !(before && before.selection) && fingersDown > 0) shell.haptic && shell.haptic();
     if (doc && s.page !== lastPage) {
       lastPage = s.page;
       showPill();
     }
     if (!doc) pill.hidden = true;
+    if (!doc || mode || covering) hideScrubber();
+    // The first pen PdfCraft sees: from now on the pen marks and a finger scrolls, this time and
+    // the next.
+    if (s.pen && !(before && before.pen)) {
+      if (shell.rememberPen) shell.rememberPen();
+      if (mode) showHint(PEN_HINT);
+    }
     if (s.tool !== lastTool) {
       lastTool = s.tool;
-      if (mode && HINTS[s.tool]) showHint(HINTS[s.tool]);
+      if (mode && HINTS[s.tool]) showHint(s.pen && PEN_HINTS[s.tool] ? PEN_HINTS[s.tool] : HINTS[s.tool]);
     }
     if (sheet.dataset.kind === 'file') fileSheet(true);
     if (sheet.dataset.kind === 'view') viewSheet(true);
@@ -409,12 +438,122 @@
     if (state) render(state);
   }
 
-  function showPill() {
+  function showPill(page) {
     if (!state || !state.pages) return;
-    pill.textContent = `${state.page} / ${state.pages}`;
+    pill.textContent = `${page || state.page} / ${state.pages}`;
     pill.hidden = false;
     clearTimeout(pillTimer);
-    pillTimer = setTimeout(() => { pill.hidden = true; }, 2000);
+    if (!scrubbing) pillTimer = setTimeout(() => { pill.hidden = true; }, 2000);
+    showScrubber();
+  }
+
+  // ---- the scrubber ----
+
+  /** The track the scrubber's tab runs along: between the bars, or the screen's height without them. */
+  function scrubTrack() {
+    const bars = !immersive && !(state && state.fullScreen);
+    const top = (bars ? topbar.getBoundingClientRect().bottom : 0) + 12;
+    const foot = bars ? (bottombar.hidden ? toolbar : bottombar).getBoundingClientRect().top : window.innerHeight;
+    return { top, height: Math.max(0, foot - 12 - top) };
+  }
+
+  /** Where page `page` (1-based) puts the tab, as a share of the track. */
+  const pageShare = (page) => (state.pages > 1 ? (page - 1) / (state.pages - 1) : 0);
+
+  function placeThumb(share) {
+    const t = scrubTrack();
+    scrubber.style.top = `${t.top}px`;
+    scrubber.style.height = `${t.height}px`;
+    const room = Math.max(0, t.height - (scrubThumb.offsetHeight || 48));
+    scrubThumb.style.transform = `translateY(${Math.round(share * room)}px)`;
+  }
+
+  /** Long documents only (three pages or more, as in Acrobat), while reading. */
+  function showScrubber() {
+    const covering = !!(state && state.panel) && !shell.tablet;
+    if (!state || state.pages < 3 || home || mode || searching || covering) return hideScrubber();
+    scrubber.hidden = false;
+    if (!scrubbing) placeThumb(pageShare(state.page));
+    clearTimeout(scrubTimer);
+    if (!scrubbing) scrubTimer = setTimeout(() => { scrubber.hidden = true; }, 2500);
+  }
+
+  function hideScrubber() {
+    if (scrubbing) return;
+    clearTimeout(scrubTimer);
+    scrubber.hidden = true;
+  }
+
+  {
+    let start = null;
+    let sent = 0;
+    let queued = 0;
+    const pageAt = (y) => {
+      const t = scrubTrack();
+      const room = Math.max(1, t.height - scrubThumb.offsetHeight);
+      const share = Math.max(0, Math.min(1, (y - start.grab - t.top) / room));
+      return { share, page: 1 + Math.round(share * (state.pages - 1)) };
+    };
+    scrubThumb.addEventListener('pointerdown', (e) => {
+      if (!state || !state.pages) return;
+      e.preventDefault();
+      scrubThumb.setPointerCapture(e.pointerId);
+      scrubbing = true;
+      clearTimeout(scrubTimer);
+      clearTimeout(pillTimer);
+      start = { y: e.clientY, grab: e.clientY - scrubThumb.getBoundingClientRect().top, moved: false };
+      sent = state.page;
+      scrubThumb.classList.add('held');
+    });
+    scrubThumb.addEventListener('pointermove', (e) => {
+      if (!scrubbing || !start) return;
+      if (!start.moved && Math.abs(e.clientY - start.y) < 6) return;
+      start.moved = true;
+      const at = pageAt(e.clientY);
+      placeThumb(at.share);
+      showPill(at.page);
+      // One page change a frame at most: PdfCraft draws each page it is sent to.
+      if (at.page !== sent && !queued) {
+        queued = requestAnimationFrame(() => {
+          queued = 0;
+          const now = pageAt(e.clientY).page;
+          if (now !== sent) {
+            sent = now;
+            post('pdfcraft:gotoPage', { page: now });
+          }
+        });
+      }
+    });
+    const drop = (e) => {
+      if (!scrubbing) return;
+      const tapped = start && !start.moved && e.type === 'pointerup';
+      if (start && start.moved && e.type === 'pointerup') {
+        const last = pageAt(e.clientY).page;
+        if (last !== sent) post('pdfcraft:gotoPage', { page: last });
+      }
+      scrubbing = false;
+      start = null;
+      scrubThumb.classList.remove('held');
+      if (tapped) {
+        // Opened on the tap's own click, which a finger's tap delivers to whatever is under it
+        // by then: opened sooner, the sheet's scrim would take that click and close it again.
+        clearTimeout(tapTimer);
+        tapTimer = setTimeout(openGoto, 400);
+      } else {
+        showPill();
+      }
+    };
+    const openGoto = () => {
+      if (!tapTimer) return;
+      clearTimeout(tapTimer);
+      tapTimer = 0;
+      hideScrubber();
+      gotoSheet();
+    };
+    let tapTimer = 0;
+    scrubThumb.addEventListener('pointerup', drop);
+    scrubThumb.addEventListener('pointercancel', drop);
+    scrubThumb.addEventListener('click', openGoto);
   }
 
   function showHint(text) {
@@ -775,6 +914,7 @@
     immersive = on;
     body.classList.toggle('immersive', on);
     if (!on) showPill();
+    else if (!scrubber.hidden) placeThumb(pageShare(state.page));
   }
 
   function watchTaps() {
@@ -788,25 +928,63 @@
     doc.__phoneTaps = true;
     let down = null;
     let pending = 0;
-    let fingers = 0;
+    let lastTap = null; // the tap a second one, soon and close by, makes a double tap
+    // A pen near the screen (touching or hovering, and a moment after): a finger's touch then is
+    // the hand holding it, and PdfCraft drops it too.
+    let penAt = -Infinity;
+    let penDown = false;
+    const penNear = (e) => penDown || e.timeStamp - penAt < 300;
+    const palms = new Set();
+    const notePen = (e) => {
+      if (e.pointerType !== 'pen') return;
+      penAt = e.timeStamp;
+      if (e.type === 'pointerdown') penDown = true;
+      else if (e.type === 'pointerup' || e.type === 'pointercancel') penDown = false;
+    };
+    doc.addEventListener('pointermove', notePen, true);
     doc.addEventListener('pointerdown', (e) => {
-      fingers++;
-      clearTimeout(pending); // a second tap: a double tap selects a word instead
+      const palm = e.pointerType === 'touch' && penNear(e);
+      notePen(e);
+      if (palm) {
+        palms.add(e.pointerId);
+        return;
+      }
+      if (e.pointerType === 'touch') fingersDown++;
+      // A second tap (of a double tap) waits for its own release.
+      clearTimeout(pending);
       // A finger's tap only. With text selected, a tap lets it go (below); otherwise, while
       // reading, it hides the bars. A tap that places a comment or goes to a tool keeps them.
       const free = state && state.active && !home && !mode && !searching && !state.busy && !state.composer && sheet.hidden;
       const selecting = free && !!state.selection;
       const reading = free && state.tool === 'select' && !state.selection && !state.panel && !state.fullScreen;
-      down = fingers === 1 && e.pointerType === 'touch' && (reading || selecting)
-        ? { x: e.clientX, y: e.clientY, t: e.timeStamp, selecting } : null;
+      // A pen taps as a finger does; it drags to select text, so it never swipes.
+      const pen = e.pointerType === 'pen';
+      down = (pen ? fingersDown === 0 : fingersDown === 1 && e.pointerType === 'touch') && (reading || selecting)
+        ? { x: e.clientX, y: e.clientY, t: e.timeStamp, selecting, pen } : null;
+      if (!down) lastTap = null;
     }, true);
     const up = (e) => {
-      fingers = Math.max(0, fingers - 1);
+      notePen(e);
+      if (palms.delete(e.pointerId)) return;
+      if (e.pointerType === 'touch') fingersDown = Math.max(0, fingersDown - 1);
       const d = down;
       down = null;
       if (!d || e.type !== 'pointerup') return;
-      if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 12 || e.timeStamp - d.t > 350) return;
+      const dx = e.clientX - d.x;
+      const dy = e.clientY - d.y;
+      // Single-page view: a quick sideways swipe turns the page (PdfCraft keeps a page zoomed in
+      // past the screen's width for scrolling).
+      if (!d.selecting && !d.pen && !state.continuous && Math.abs(dx) > 60 && Math.abs(dx) > 1.5 * Math.abs(dy) && e.timeStamp - d.t < 700) {
+        lastTap = null;
+        post('pdfcraft:turnPage', { forward: dx < 0, swipe: true });
+        return;
+      }
+      if (Math.hypot(dx, dy) > 12 || e.timeStamp - d.t > 350) {
+        lastTap = null;
+        return;
+      }
       if (d.selecting) {
+        lastTap = null;
         // A tap anywhere but on the selected words lets the selection go, as in any PDF viewer
         // (Back does too). A tap on them leaves it; a long press is how another word is chosen.
         const sel = state && state.selection;
@@ -815,7 +993,24 @@
         if (sel && !inside) post('pdfcraft:selection', { action: 'clear' });
         return;
       }
-      pending = setTimeout(() => setImmersive(!immersive), 320);
+      // A double tap zooms in on the text under it, or back out (Acrobat's smart zoom).
+      const wait = shell.touch ? shell.touch.doubleTap : 300;
+      if (lastTap && d.t - lastTap.t <= wait && Math.hypot(d.x - lastTap.x, d.y - lastTap.y) <= 48) {
+        lastTap = null;
+        post('pdfcraft:smartZoom', { x: e.clientX, y: e.clientY });
+        return;
+      }
+      lastTap = { x: e.clientX, y: e.clientY, t: e.timeStamp };
+      // A tap at the screen's left or right edge turns the page in single-page view; anywhere
+      // else it hides or shows the bars. Either waits to be sure no second tap follows.
+      const width = doc.documentElement.clientWidth || window.innerWidth;
+      const edge = !state.continuous && (e.clientX < width * 0.15 || e.clientX > width * 0.85);
+      const forward = e.clientX > width / 2;
+      pending = setTimeout(() => {
+        lastTap = null;
+        if (edge) post('pdfcraft:turnPage', { forward, swipe: false });
+        else setImmersive(!immersive);
+      }, wait + 20);
     };
     doc.addEventListener('pointerup', up, true);
     doc.addEventListener('pointercancel', up, true);

@@ -4,7 +4,7 @@ plugins {
 
 // PdfCraft's browser build, produced by scripts/build-web.sh (never committed).
 val webAssets = rootProject.file("../build/web-assets")
-val pdfcraftVersion = webAssets.resolve("app/pdfcraft/VERSION").takeIf { it.isFile }?.readText()?.trim() ?: "0.7.1"
+val pdfcraftVersion = webAssets.resolve("app/pdfcraft/VERSION").takeIf { it.isFile }?.readText()?.trim() ?: "0.13.0"
 
 // A fixed, non-secret key so every build installs as an update over the last one. Point
 // PDFCRAFT_KEYSTORE (+ _PASSWORD, _ALIAS, _KEY_PASSWORD) at a private key to replace it.

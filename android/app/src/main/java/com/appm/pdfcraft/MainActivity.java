@@ -21,6 +21,7 @@ import android.provider.DocumentsContract;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -948,6 +949,13 @@ public final class MainActivity extends ComponentActivity {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
                 Toast.makeText(getApplicationContext(), "Copied", Toast.LENGTH_SHORT).show();
             }
+        });
+    }
+
+    void haptic() {
+        // The view's own setting: no buzz where the user turned touch feedback off.
+        runOnUiThread(() -> {
+            if (web != null) web.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
         });
     }
 

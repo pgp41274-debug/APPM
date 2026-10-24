@@ -1,5 +1,5 @@
 diff --git a/apps/pdfcraft-web/src/main.rs b/apps/pdfcraft-web/src/main.rs
-index a46a467..cec77c7 100644
+index 73d14f4..942057f 100644
 --- a/apps/pdfcraft-web/src/main.rs
 +++ b/apps/pdfcraft-web/src/main.rs
 @@ -66,9 +66,10 @@ fn main() {
@@ -12,9 +12,9 @@ index a46a467..cec77c7 100644
                          app.host_dirty = Some(bridge.dirty_fn());
 +                        app.host_closed = Some(bridge.closed_fn());
                          bridge.post_ready();
-                     }
-                     Ok(Box::new(app))
-@@ -123,10 +124,19 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+                     } else if query_param("host").as_deref() == Some("parent") {
+                         eframe::web_sys::console::warn_1(
+@@ -127,10 +128,19 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
  /// `type`:
  ///
  /// - `pdfcraft:ready` (to the parent): the app is listening; send files now.
@@ -38,7 +38,7 @@ index a46a467..cec77c7 100644
  /// - `pdfcraft:dirty` (to the parent): `{ dirty }` whenever unsaved work appears or goes away.
  /// - `pdfcraft:failed` (to the parent): `{ error }` when the app couldn't start.
  ///
-@@ -176,7 +186,7 @@ mod host {
+@@ -187,7 +197,7 @@ mod host {
          }
  
          /// Hear `pdfcraft:open` from the parent and queue the file like a `?file=` download.
@@ -47,7 +47,7 @@ index a46a467..cec77c7 100644
              let parent = self.parent.clone();
              let origin = self.origin.clone();
              let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
-@@ -188,6 +198,7 @@ mod host {
+@@ -199,6 +209,7 @@ mod host {
                      return;
                  }
                  let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "document.pdf".to_string());
@@ -55,7 +55,7 @@ index a46a467..cec77c7 100644
                  let Ok(bytes) = js_sys::Reflect::get(&data, &JsValue::from_str("bytes")) else { return };
                  let bytes = if let Some(array) = bytes.dyn_ref::<js_sys::Uint8Array>() {
                      array.to_vec()
-@@ -197,7 +208,7 @@ mod host {
+@@ -208,7 +219,7 @@ mod host {
                      return;
                  };
                  if let Ok(mut q) = inbox.lock() {
@@ -64,7 +64,7 @@ index a46a467..cec77c7 100644
                  }
                  ctx.request_repaint();
              });
-@@ -209,15 +220,35 @@ mod host {
+@@ -220,15 +231,35 @@ mod host {
  
          pub fn save_fn(&self) -> pdfcraft_ui_egui::HostSaveFn {
              let bridge = self.clone();
@@ -105,10 +105,10 @@ index a46a467..cec77c7 100644
              let bridge = self.clone();
              let mut last = false;
 diff --git a/crates/ui-egui/src/editing.rs b/crates/ui-egui/src/editing.rs
-index 6410898..661ac10 100644
+index 5b821b6..5b477ee 100644
 --- a/crates/ui-egui/src/editing.rs
 +++ b/crates/ui-egui/src/editing.rs
-@@ -617,11 +617,11 @@ impl PdfCraftApp {
+@@ -667,11 +667,11 @@ impl PdfCraftApp {
                      return false;
                  }
              };
@@ -123,7 +123,7 @@ index 6410898..661ac10 100644
                  None => download(&name, &bytes),
              };
              match delivered {
-@@ -1437,3 +1437,98 @@ mod content_page_tests {
+@@ -1625,3 +1625,98 @@ mod content_page_tests {
          assert_eq!(content_page(&Edit::SetInfo { key: "Title".into(), value: "x".into() }), None);
      }
  }
@@ -223,10 +223,10 @@ index 6410898..661ac10 100644
 +    }
 +}
 diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
-index 2d4f5b0..8d6a6a8 100644
+index af9912f..6ff60d2 100644
 --- a/crates/ui-egui/src/lib.rs
 +++ b/crates/ui-egui/src/lib.rs
-@@ -363,6 +363,11 @@ pub struct PageClip {
+@@ -398,6 +398,11 @@ pub struct PageClip {
  /// Files delivered asynchronously: (name, bytes).
  pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
  
@@ -238,7 +238,7 @@ index 2d4f5b0..8d6a6a8 100644
  /// Files that failed to arrive asynchronously (a browser `?file=` URL that couldn't be fetched):
  /// `(name, error)`, reported to the user on the next frame (#173).
  pub type FailedInbox = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
-@@ -380,14 +385,24 @@ pub enum OsEvent {
+@@ -415,14 +420,24 @@ pub enum OsEvent {
  /// Returns the [`OsEvent`]s that arrived since it was last called (set by the desktop app).
  pub type OsEventsFn = Box<dyn FnMut() -> Vec<OsEvent>>;
  
@@ -267,7 +267,7 @@ index 2d4f5b0..8d6a6a8 100644
  pub struct PasswordPrompt {
      pub name: String,
      pub path: Option<String>,
-@@ -404,6 +419,9 @@ pub struct PasswordPrompt {
+@@ -441,6 +456,9 @@ pub struct PasswordPrompt {
      then: Option<&'static str>,
      /// A link destination to apply after the linked PDF is unlocked.
      after_open: Option<pdfcraft_render::RemoteDestination>,
@@ -276,8 +276,8 @@ index 2d4f5b0..8d6a6a8 100644
 +    host_id: Option<String>,
  }
  
- /// Asks for the permissions password of an open document whose security restricts it, which
-@@ -548,6 +566,12 @@ pub struct PdfCraftApp {
+ #[cfg(not(target_arch = "wasm32"))]
+@@ -638,6 +656,12 @@ pub struct PdfCraftApp {
      pub host_save: Option<HostSaveFn>,
      /// Reports unsaved work to the embedding page (web, see [`HostDirtyFn`]).
      pub host_dirty: Option<HostDirtyFn>,
@@ -289,8 +289,8 @@ index 2d4f5b0..8d6a6a8 100644
 +    host_ids: std::collections::HashMap<DocId, String>,
      /// A pending "save changes?" question (closing a dirty tab or quitting).
      pub close_request: Option<CloseRequest>,
-     /// Save to this path instead of asking (tests and automation).
-@@ -858,6 +882,9 @@ impl PdfCraftApp {
+     /// The button of the "save changes?" question the keyboard has chosen; Save when it opens.
+@@ -1016,6 +1040,9 @@ impl PdfCraftApp {
              os_events: None,
              host_save: None,
              host_dirty: None,
@@ -298,9 +298,9 @@ index 2d4f5b0..8d6a6a8 100644
 +            host_inbox: Default::default(),
 +            host_ids: Default::default(),
              close_request: None,
-             save_override: None,
-             props_draft: None,
-@@ -1017,19 +1044,68 @@ impl PdfCraftApp {
+             save_prompt_button: Default::default(),
+             #[cfg(not(target_arch = "wasm32"))]
+@@ -1195,19 +1222,68 @@ impl PdfCraftApp {
      /// Open a document and make it the active tab. Encrypted files raise the password prompt.
      pub fn open_bytes(&mut self, name: &str, path: Option<String>, bytes: Vec<u8>) -> Result<(), String> {
          self.startup_superseded = true;
@@ -372,17 +372,25 @@ index 2d4f5b0..8d6a6a8 100644
 +        }
      }
  
-     fn try_open(
-@@ -1046,7 +1122,7 @@ impl PdfCraftApp {
-             Ok(id) => id,
-             Err(e @ (OpenError::NeedsPassword | OpenError::WrongPassword)) => {
+     #[cfg(not(target_arch = "wasm32"))]
+@@ -1327,6 +1403,7 @@ impl PdfCraftApp {
+                         recovered: pending.recovered,
+                         then: pending.then,
+                         after_open: pending.after_open,
++                        host_id: None,
+                     });
+                 }
+                 Err(error) => self.notify_fmt("Couldn't open {name}: {e}", &[("name", &pending.name), ("e", &error.to_string())]),
+@@ -1349,7 +1426,7 @@ impl PdfCraftApp {
                  let error = matches!(e, OpenError::WrongPassword).then(|| "Incorrect password. Try again.".to_string());
+                 #[cfg(not(target_arch = "wasm32"))]
+                 let stamp = path.as_deref().and_then(file_watch::Stamp::at);
 -                self.password_prompt = Some(PasswordPrompt {
 +                self.set_password_prompt(Some(PasswordPrompt {
                      name: name.to_string(),
                      path,
                      bytes,
-@@ -1056,12 +1132,13 @@ impl PdfCraftApp {
+@@ -1361,7 +1438,8 @@ impl PdfCraftApp {
                      recovered: None,
                      then: None,
                      after_open: None,
@@ -392,19 +400,26 @@ index 2d4f5b0..8d6a6a8 100644
                  return Ok(());
              }
              Err(e) => return Err(e.to_string()),
-         };
+@@ -1378,7 +1456,7 @@ impl PdfCraftApp {
+         activate: bool,
+     ) -> Result<DocId, String> {
+         let id = self.session.commit_open(prepared);
 -        self.password_prompt = None;
 +        self.set_password_prompt(None);
          // The reading-colours preference is app-wide: a newly opened document starts with it.
          // Idempotent: the engine returns `false` when the document has the setting already.
          self.session.set_reading_colors(id, self.reading_colors);
-@@ -1258,13 +1335,21 @@ impl PdfCraftApp {
+@@ -1695,6 +1773,7 @@ impl PdfCraftApp {
              if let Some(meta) = p.recovered {
                  self.recoverable.push(meta);
              }
 +            self.report_closed(p.host_id.as_deref(), None);
              return;
          };
+         #[cfg(not(target_arch = "wasm32"))]
+@@ -1720,8 +1799,12 @@ impl PdfCraftApp {
+         #[cfg(not(target_arch = "wasm32"))]
+         let (path_for_watch, stamp_for_watch) = (p.path.clone(), p.stamp);
          let after_open = p.after_open.clone();
 +        let opened = self.views.len();
          match self.try_open(&p.name, p.path, p.bytes, Some(&pw), p.activate) {
@@ -415,13 +430,18 @@ index 2d4f5b0..8d6a6a8 100644
 +            }
              // A recovered encrypted document is open once its prompt is gone.
              Ok(()) if self.password_prompt.is_none() => {
+                 #[cfg(not(target_arch = "wasm32"))]
+@@ -1734,6 +1817,9 @@ impl PdfCraftApp {
+                 {
+                     self.watch.known_as(id, stamp_for_watch);
+                 }
 +                if let Some(id) = p.host_id {
 +                    self.take_host_id(opened, id);
 +                }
                  if let Some(destination) = after_open {
                      self.apply_remote_destination(destination);
                  }
-@@ -1275,13 +1360,14 @@ impl PdfCraftApp {
+@@ -1744,13 +1830,14 @@ impl PdfCraftApp {
                      self.execute(command);
                  }
              }
@@ -438,7 +458,7 @@ index 2d4f5b0..8d6a6a8 100644
                  }
              }
          }
-@@ -1453,6 +1539,8 @@ impl PdfCraftApp {
+@@ -2016,6 +2103,8 @@ impl PdfCraftApp {
              self.closed_tabs.push(path);
          }
          self.forget_recovery(id);
@@ -447,7 +467,7 @@ index 2d4f5b0..8d6a6a8 100644
          self.session.close(id);
          self.active = match self.active {
              _ if self.views.is_empty() => None,
-@@ -2459,7 +2547,15 @@ impl eframe::App for PdfCraftApp {
+@@ -3231,7 +3320,15 @@ impl eframe::App for PdfCraftApp {
              let startup = self.startup_inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
              for (name, bytes) in startup {
                  let activate = !self.startup_superseded;

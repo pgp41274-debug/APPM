@@ -98,6 +98,9 @@ const mockBridge = () => {
     endPrint(id) { window.__print.done = true; },
     toast(m) { window.__calls.push(['toast', m]); },
     copyText(t) { window.__calls.push(['copyText', t]); },
+    // A touch-and-hold delay longer than Android's default, so the test sees it reach PdfCraft.
+    touchTimings() { return JSON.stringify({ longPress: 450, doubleTap: 300 }); },
+    haptic() { window.__calls.push(['haptic']); },
     info() { return JSON.stringify({ app: 'test', android: '-', device: 'Playwright', webview: navigator.userAgent }); },
     updateWebView() {},
   };
@@ -692,6 +695,9 @@ try {
     const handlesShown = await shown('#handle-start') && await shown('#handle-end');
     check('a finger held on a word selects it, with handles and a card of actions', selected && card && handlesShown,
       JSON.stringify({ selected, card, handlesShown, sel: (await st()).selection }));
+    check('... with Android\'s long-press buzz, and Android\'s touch-and-hold delay passed to PdfCraft',
+      await p.evaluate(() => window.__calls.some((c) => c[0] === 'haptic'))
+      && p.frames().some((f) => f.url().includes('longpress=450')), p.frames().map((f) => f.url()).join(' '));
     await p.screenshot({ path: path.join(shots, 'phone-2-selection.png') });
     await p.tap('#sel-highlight');
     check('... Highlight on the card highlights the words', await settle(() => !window.__state.selection && window.__state.undo === true)
@@ -727,6 +733,9 @@ try {
     ]);
     const [wx, wy] = [fb.x + fb.width * onWord[0], fb.y + fb.height * onWord[1]];
     const taps = {};
+    // The shell's double tap zooms (tested below): kept out of this check, which is about what
+    // PdfCraft makes of quick taps, so the word stays under the finger.
+    await p.evaluate(() => { window.shell.touch.doubleTap = 0; });
     // More than once each: a miss that depends on where a frame falls shows up now and then.
     for (const [i, n] of [1, 2, 3, 4, 2, 3, 3, 4].entries()) {
       for (let k = 0; k < n; k++) {
@@ -743,6 +752,7 @@ try {
       await sleep(600);
     }
     const downs = await p.evaluate(() => window.__downs);
+    await p.evaluate(() => { window.shell.touch.doubleTap = 300; });
     if (process.env.TAP_SLOW) await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 });
     check('quick taps on a word select nothing: only a held finger does', Object.values(taps).every((t) => t === null),
       JSON.stringify({ taps, msDown: downs }));
@@ -938,6 +948,106 @@ try {
     const back = await settle(() => !document.body.classList.contains('immersive'), 4000);
     check('a tap on the page hides the bars, another brings them back', hid && back, JSON.stringify({ hid, back }));
 
+    // Acrobat's smart zoom: a double tap zooms in on the text under it, another zooms back out;
+    // neither hides the bars.
+    const touchTap = (x, y) => Promise.all([
+      cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] }),
+      cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }),
+    ]);
+    const doubleTap = async (x, y) => {
+      await touchTap(x, y);
+      await sleep(90);
+      await touchTap(x, y);
+    };
+    await sleep(600);
+    const fitted = (await st()).zoom;
+    {
+      const b = await p.locator('#app').boundingBox();
+      await doubleTap(b.x + b.width * 0.4, b.y + b.height * 0.4);
+    }
+    let zoomedIn = false;
+    for (let k = 0; k < 30 && !zoomedIn; k++) {
+      zoomedIn = (await st()).zoom > fitted * 1.2;
+      if (!zoomedIn) await sleep(100);
+    }
+    await sleep(500);
+    const keptBars = await p.evaluate(() => !document.body.classList.contains('immersive'));
+    await p.screenshot({ path: path.join(shots, 'phone-10b-smart-zoom.png') });
+    {
+      const b = await p.locator('#app').boundingBox();
+      await doubleTap(b.x + b.width * 0.5, b.y + b.height * 0.4);
+    }
+    let zoomedOut = false;
+    for (let k = 0; k < 30 && !zoomedOut; k++) {
+      zoomedOut = Math.abs((await st()).zoom - fitted) <= 1;
+      if (!zoomedOut) await sleep(100);
+    }
+    await sleep(500);
+    check('a double tap zooms in on the text, another zooms back out, and the bars stay', zoomedIn && zoomedOut && keptBars
+      && await p.evaluate(() => !document.body.classList.contains('immersive')), JSON.stringify({ fitted, zoomedIn, zoomedOut, keptBars, now: (await st()).zoom }));
+
+    // The scrubber at the right edge: shown as the pages go by; dragged to the foot of its track,
+    // it goes to the last pages; tapped, it asks for a page.
+    await p.evaluate(() => document.getElementById('app').contentWindow.postMessage({ type: 'pdfcraft:gotoPage', page: 2 }, location.origin));
+    const scrubShown = await settle(() => window.__state.page === 2, 4000) && await shown('#scrubber .thumb');
+    let scrubbed = false;
+    if (scrubShown) {
+      const t = await p.locator('#scrubber .thumb').boundingBox();
+      const track = await p.locator('#scrubber').boundingBox();
+      const [x, y0] = [t.x + t.width / 2, t.y + t.height / 2];
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y: y0 }] });
+      for (let k = 1; k <= 8; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y0 + (track.y + track.height - y0) * k / 8 }] });
+        await sleep(40);
+      }
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      scrubbed = await settle(() => window.__state.page >= 11, 4000);
+      await p.screenshot({ path: path.join(shots, 'phone-10c-scrubber.png') });
+    }
+    check('the scrubber shows as the pages go by and drags to the end of the document', scrubShown && scrubbed,
+      JSON.stringify({ scrubShown, scrubbed, page: (await st()).page }));
+    await p.evaluate(() => document.getElementById('app').contentWindow.postMessage({ type: 'pdfcraft:gotoPage', page: 3 }, location.origin));
+    await settle(() => window.__state.page === 3, 4000);
+    if (await shown('#scrubber .thumb')) {
+      const t = await p.locator('#scrubber .thumb').boundingBox();
+      await touchTap(t.x + t.width / 2, t.y + t.height / 2);
+    }
+    check('... and a tap on it asks for a page', await settle(() => !document.getElementById('sheet').hidden && !!document.querySelector('#sheet .goto input'), 3000)
+      && await (async () => { await sleep(600); return p.evaluate(() => !document.getElementById('sheet').hidden); })());
+    await p.evaluate(() => window.shell.back());
+    await settle(() => document.getElementById('sheet').hidden);
+
+    // Single-page view, as in Acrobat: a sideways swipe turns the page, and so does a tap at the
+    // screen's edge.
+    const tellApp = (msg) => p.evaluate((m) => document.getElementById('app').contentWindow.postMessage(m, location.origin), msg);
+    await tellApp({ type: 'pdfcraft:command', id: 'view.continuous' });
+    await tellApp({ type: 'pdfcraft:command', id: 'view.layout.single' });
+    const single = await settle(() => window.__state.continuous === false, 4000);
+    await sleep(800);
+    const before = (await st()).page;
+    {
+      const b = await p.locator('#app').boundingBox();
+      const y = b.y + b.height * 0.5;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: b.x + b.width * 0.8, y }] });
+      for (let k = 1; k <= 6; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: b.x + b.width * (0.8 - 0.1 * k), y }] });
+        await sleep(25);
+      }
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    }
+    const swiped = await settle(() => window.__state.page === 4, 4000);
+    await sleep(600);
+    {
+      const b = await p.locator('#app').boundingBox();
+      await touchTap(b.x + b.width * 0.06, b.y + b.height * 0.5);
+    }
+    const edged = await settle(() => window.__state.page === 3, 4000);
+    await sleep(500);
+    check('single-page view: a swipe turns to the next page, a tap at the left edge back', single && swiped && edged
+      && await p.evaluate(() => !document.body.classList.contains('immersive')), JSON.stringify({ single, before, swiped, edged, page: (await st()).page }));
+    await tellApp({ type: 'pdfcraft:command', id: 'view.continuous' });
+    await settle(() => window.__state.continuous === true, 4000);
+
     // ⋮ ▸ Pages opens the thumbnails over the page; its bar closes them.
     await p.tap('#more');
     await settle(() => !document.getElementById('sheet').hidden);
@@ -1009,6 +1119,104 @@ try {
     const toolNow = await p.evaluate(() => window.__state.tool);
     check('Edit PDF outlines the paragraphs it can edit', editing && editable === 2 && outlined > plain + 200,
       JSON.stringify({ editing, editable, toolNow, plain, outlined }));
+    await ctx.close();
+  }
+
+  // 9g2. A pen (an S Pen), as Samsung Notes and Xodo take one: it selects and highlights text as
+  // it moves, with no hold first; once a pen is used a finger only scrolls (next time too); and a
+  // hand resting on the screen while the pen hovers is ignored.
+  {
+    const ctx = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+    await ctx.addInitScript(mockBridge);
+    incoming.set('f1', showcase);
+    const p = await ctx.newPage();
+    await p.goto(`${base}/app/shell/index.html`);
+    await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+    await p.waitForFunction(() => window.__state && window.__state.pages === 12, null, { timeout: 30000 }).catch(() => {});
+    await sleep(1500);
+    const cdp = await ctx.newCDPSession(p);
+    const st = () => p.evaluate(() => window.__state);
+    const settle = (fn, ms = 8000) => p.waitForFunction(fn, null, { timeout: ms }).then(() => true, () => false);
+    const fb = await p.locator('#app').boundingBox();
+    const penEvent = (type, x, y, down) => cdp.send('Input.dispatchMouseEvent', {
+      type, x, y, pointerType: 'pen', button: down || type !== 'mouseMoved' ? 'left' : 'none', buttons: down ? 1 : 0, clickCount: 1,
+    });
+    const penStroke = async (fy) => {
+      const [x0, x1, y] = [fb.x + fb.width * 0.15, fb.x + fb.width * 0.7, fb.y + fb.height * fy];
+      await penEvent('mouseMoved', x0, y, false);
+      await penEvent('mousePressed', x0, y, true);
+      for (let k = 1; k <= 6; k++) {
+        await penEvent('mouseMoved', x0 + (x1 - x0) * k / 6, y, true);
+        await sleep(30);
+      }
+      await penEvent('mouseReleased', x1, y, false);
+    };
+    let row = 0.37;
+    let selected = false;
+    for (const fy of [0.37, 0.33, 0.4, 0.42, 0.3]) {
+      await penStroke(fy);
+      selected = await settle(() => !!(window.__state.selection && window.__state.selection.text), 3000);
+      if (selected) {
+        row = fy;
+        break;
+      }
+    }
+    check('a pen run over text selects it at once, with no hold', selected, JSON.stringify((await st()).selection));
+    check('... and the shell remembers that a pen is used here', (await st()).pen === true
+      && await p.evaluate(() => localStorage.getItem('shell.pen') === '1'));
+    await p.evaluate(() => window.shell.back());
+    await settle(() => !window.__state.selection, 3000);
+
+    await p.tap('#bottombar [data-item="highlight"]');
+    await settle(() => window.__state.tool === 'comment.highlight');
+    const hint = await p.evaluate(() => document.getElementById('hint').textContent);
+    await sleep(2500); // the hint has gone, and the pen's first sight of the page with it
+    await penStroke(row);
+    const highlighted = await settle(() => window.__state.undo === true, 4000);
+    check('with the highlighter, the pen highlights what it runs over, and the hint says so', highlighted && hint.includes('pen'),
+      JSON.stringify({ highlighted, hint }));
+    const fingerDrag = async () => {
+      const x = fb.x + fb.width * 0.5;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y: fb.y + fb.height * 0.85 }] });
+      for (let k = 1; k <= 8; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: fb.y + fb.height * (0.85 - 0.09 * k) }] });
+        await sleep(30);
+      }
+      await sleep(150);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    };
+    await sleep(500);
+    const pageBefore = (await st()).page;
+    for (let k = 0; k < 4; k++) await fingerDrag();
+    const scrolled = await settle(() => window.__state.page > 1, 4000);
+    check('... and one finger scrolls the page instead of marking it', scrolled && (await st()).tool === 'comment.highlight',
+      JSON.stringify({ pageBefore, page: (await st()).page }));
+
+    // A hand on the glass while the pen hovers over it is the hand holding the pen.
+    await sleep(1500);
+    const pageThen = (await st()).page;
+    for (let k = 0; k < 3; k++) {
+      await penEvent('mouseMoved', fb.x + fb.width * 0.3, fb.y + fb.height * 0.3, false);
+      const x = fb.x + fb.width * 0.6;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y: fb.y + fb.height * 0.85 }] });
+      for (let j = 1; j <= 8; j++) {
+        await penEvent('mouseMoved', fb.x + fb.width * 0.3, fb.y + fb.height * 0.3 + j, false);
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: fb.y + fb.height * (0.85 - 0.09 * j) }] });
+        await sleep(30);
+      }
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    }
+    await sleep(1500);
+    check('a hand on the screen while the pen hovers is ignored', (await st()).page === pageThen,
+      JSON.stringify({ pageThen, page: (await st()).page }));
+
+    // Started again, PdfCraft knows from the first touch that the pen marks and a finger scrolls.
+    const p2 = await ctx.newPage();
+    await p2.goto(`${base}/app/shell/index.html`);
+    await p2.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 }).catch(() => {});
+    check('... and the next start remembers the pen', p2.frames().some((f) => f.url().includes('pen=1')),
+      p2.frames().map((f) => f.url()).join(' '));
+    await p.screenshot({ path: path.join(shots, 'phone-15-pen.png') });
     await ctx.close();
   }
 

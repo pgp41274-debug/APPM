@@ -2,6 +2,7 @@ package com.appm.pdfcraft;
 
 import android.content.pm.PackageInfo;
 import android.os.Build;
+import android.view.ViewConfiguration;
 import android.webkit.JavascriptInterface;
 
 import androidx.webkit.WebViewCompat;
@@ -187,6 +188,29 @@ final class ShellBridge {
     @JavascriptInterface
     public void toast(String message) {
         activity.toast(message);
+    }
+
+    /**
+     * Android's touch timings, in milliseconds: how long a finger rests before a press is a long
+     * press (Settings ▸ Accessibility ▸ Touch & hold delay), and the most time between the taps
+     * of a double tap.
+     */
+    @JavascriptInterface
+    public String touchTimings() {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("longPress", ViewConfiguration.getLongPressTimeout());
+            o.put("doubleTap", ViewConfiguration.getDoubleTapTimeout());
+        } catch (JSONException ignored) {
+            // put() with String keys never throws here.
+        }
+        return o.toString();
+    }
+
+    /** The buzz Android gives a long press (a word selected by holding a finger on it). */
+    @JavascriptInterface
+    public void haptic() {
+        activity.haptic();
     }
 
     /** Versions for the shell's error screen. */
