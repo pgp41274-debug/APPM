@@ -1082,6 +1082,15 @@ try {
       await sleep(1200);
       dragged = (await st()).page;
     }
+    // What the page saw of the swipe, for the check's report.
+    await p.evaluate(() => {
+      const d = document.getElementById('app').contentDocument;
+      window.__swipe = [];
+      for (const k of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel']) {
+        d.addEventListener(k, (e) => window.__swipe.length < 40 && window.__swipe.push(`${k.slice(7)} ${Math.round(e.clientX)} ${Math.round(e.timeStamp)}`), true);
+      }
+    });
+    const stateBeforeSwipe = await st();
     {
       const b = await p.locator('#app').boundingBox();
       const y = b.y + b.height * 0.5;
@@ -1093,6 +1102,7 @@ try {
       await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
     }
     const swiped = await settle(() => window.__state.page === 4, 4000);
+    const swipeSeen = await p.evaluate(() => window.__swipe.join(', '));
     await sleep(600);
     {
       const b = await p.locator('#app').boundingBox();
@@ -1102,7 +1112,7 @@ try {
     await sleep(500);
     check('single-page view: a slow sideways drag turns no page', dragged === before, JSON.stringify({ before, dragged }));
     check('single-page view: a swipe turns to the next page, a tap at the left edge back', single && swiped && edged
-      && await p.evaluate(() => !document.body.classList.contains('immersive')), JSON.stringify({ single, before, swiped, edged, page: (await st()).page }));
+      && await p.evaluate(() => !document.body.classList.contains('immersive')), JSON.stringify({ single, before, swiped, edged, page: (await st()).page, selection: stateBeforeSwipe.selection, tool: stateBeforeSwipe.tool, dpr: await p.evaluate(() => devicePixelRatio), swipeSeen }));
     await tellApp({ type: 'pdfcraft:command', id: 'view.continuous' });
     await settle(() => window.__state.continuous === true, 4000);
 
