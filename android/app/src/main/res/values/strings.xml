@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PdfCraft</string>
+    <string name="kept_running">PdfCraft is still open in the background, but Android may close it at any time. Save to keep your changes.</string>
+    <string name="restarted">PdfCraft stopped unexpectedly (usually from low memory) and was restarted.</string>
+    <string name="keeps_stopping">PdfCraft keeps stopping before it can start. Updating Android System WebView often fixes this.</string>
+    <string name="no_webview">PdfCraft runs in Android System WebView, which isn\'t available right now. It may be updating, or turned off in Settings.</string>
+    <string name="update_webview">Update Android System WebView</string>
+    <string name="try_again">Try again</string>
+    <string name="not_shared">Couldn\'t open %1$s: the app that sent it gave a file path, which PdfCraft isn\'t allowed to read. Share the file instead.</string>
+    <string name="no_picker">No app on this device can pick files.</string>
+    <string name="no_browser">No app can open %1$s</string>
+    <string name="no_printing">Printing isn\'t available on this device.</string>
+    <string name="print_failed">Couldn\'t print: %1$s</string>
+    <string name="export_cancelled">Export cancelled.</string>
+    <string name="save_as_cancelled">%1$s (Save As was cancelled)</string>
+    <string name="saved">Saved %1$s</string>
+    <string name="saved_to">Saved to %1$s</string>
+    <string name="saved_instead">Couldn\'t write the original file; saved to %1$s</string>
+    <string name="save_failed">Couldn\'t save %1$s: %2$s</string>
+    <string name="save_failed_reopened">Couldn\'t save %1$s: %2$s. It is open again in a new tab, and stays there until you save or close it.</string>
+    <string name="save_resumed">Finished a save that was interrupted: %1$s</string>
+    <string name="save_undone">A save to %1$s was interrupted and its changes were lost. The file is back as it was before.</string>
+    <string name="save_undone_copy">A save to %1$s was interrupted and its changes were lost. The file as it was before is in %2$s.</string>
+    <string name="save_undone_later">A save to %1$s was interrupted. PdfCraft will put the file back as it was the next time it starts.</string>
+    <string name="save_lost">Android closed PdfCraft while you were choosing where to save, and that save was lost. Please save again.</string>
+</resources>

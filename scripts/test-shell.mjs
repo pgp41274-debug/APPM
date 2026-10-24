@@ -1,0 +1,1395 @@
+#!/usr/bin/env node
+// End-to-end test of the Android shell around PdfCraft's wasm build, run in Chromium (the
+// engine inside Android System WebView) on an emulated Pixel 7, with a stand-in for the Java
+// bridge (window.AndroidShell). Serves the APK's assets the way MainActivity does.
+//
+// Usage: NODE_PATH="$(npm root -g)" node scripts/test-shell.mjs [screenshot dir]
+// Needs build/web-assets (scripts/build-web.sh) and the playwright package with Chromium.
+import { createRequire } from 'node:module';
+import fs from 'node:fs';
+import http from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
+
+const require = createRequire(import.meta.url);
+const { chromium, devices } = require('playwright');
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const shots = path.resolve(process.argv[2] || path.join(root, 'build/test-shots'));
+fs.mkdirSync(shots, { recursive: true });
+const assetDirs = [path.join(root, 'android/app/src/main/assets'), path.join(root, 'build/web-assets')];
+const MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.wasm': 'application/wasm',
+  '.png': 'image/png', '.css': 'text/css', '.svg': 'image/svg+xml', '.json': 'application/json',
+};
+
+// ---- a server shaped like MainActivity's WebViewAssetLoader ----
+const incoming = new Map();
+const served = [];
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname.startsWith('/incoming/')) {
+    const id = decodeURIComponent(url.pathname.slice('/incoming/'.length));
+    const bytes = incoming.get(id);
+    incoming.delete(id);
+    served.push(id);
+    if (!bytes) return res.writeHead(404).end('no such file');
+    return res.writeHead(200, { 'Content-Type': 'application/pdf' }).end(bytes);
+  }
+  const rel = path.normalize(decodeURIComponent(url.pathname)).replace(/^([/\\])+/, '');
+  if (rel.includes('..')) return res.writeHead(404).end();
+  for (const dir of assetDirs) {
+    const file = path.join(dir, rel);
+    if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+      res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+      return fs.createReadStream(file).pipe(res);
+    }
+  }
+  res.writeHead(404).end();
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+
+// ---- the stand-in for ShellBridge.java ----
+const mockBridge = () => {
+  if (window.top !== window) {
+    // What PdfCraft's frame hears from the shell: the pdfcraft:open messages.
+    window.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'pdfcraft:open' && window.top.__opened) window.top.__opened.push({ name: e.data.name, id: e.data.id });
+    });
+    return;
+  }
+  window.__calls = [];
+  // What PdfCraft reports for a phone's controls (pdfcraft:state), latest first.
+  window.__state = null;
+  window.addEventListener('message', (e) => {
+    if (e.data && e.data.type === 'pdfcraft:state') window.__state = JSON.parse(e.data.state);
+  });
+  window.__pending = [{ id: 'f1', name: 'showcase.pdf' }];
+  window.__opened = [];
+  window.__saves = [];
+  window.__ended = [];
+  window.__print = null;
+  window.AndroidShell = {
+    pending() { const p = window.__pending; window.__pending = []; window.__calls.push(['pending', p.length]); return JSON.stringify(p); },
+    appReady() { window.__calls.push(['appReady']); },
+    beginSave(name, mime, saveAs, kind, id, doc) {
+      window.__saves.push({ name, mime, saveAs, kind, id, doc, data: '', done: false });
+      return String(window.__saves.length - 1);
+    },
+    appendChunk(id, b64) { window.__saves[+id].data += b64; return true; },
+    endSave(id) { window.__saves[+id].done = true; window.__ended.push(+id); window.__calls.push(['endSave', window.__saves[+id].name]); return true; },
+    abortSave(id) { window.__calls.push(['abortSave', id]); },
+    closed(id, doc) { window.__calls.push(['closed', id, doc]); },
+    setDirty(d) { window.__calls.push(['setDirty', d]); },
+    setFullScreen(on) { window.__calls.push(['setFullScreen', on]); },
+    openExternal(u) { window.__calls.push(['openExternal', u]); },
+    beginPrint(name) { window.__print = { name, pages: [], done: false }; return 'p1'; },
+    beginSheet(id, w, h, turned) { window.__print.pages.push({ w, h, turned, data: '' }); return true; },
+    appendSheet(id, b64) { window.__print.pages.at(-1).data += b64; return true; },
+    endSheet(id) {
+      const p = window.__print.pages.at(-1);
+      p.png = p.data.startsWith('iVBORw0KGgo') && p.data.length > 100;
+      delete p.data;
+      return true;
+    },
+    abortPrint(id) { window.__calls.push(['abortPrint', id]); },
+    endPrint(id) { window.__print.done = true; },
+    toast(m) { window.__calls.push(['toast', m]); },
+    copyText(t) { window.__calls.push(['copyText', t]); },
+    // A touch-and-hold delay longer than Android's default, so the test sees it reach PdfCraft.
+    touchTimings() { return JSON.stringify({ longPress: 450, doubleTap: 300 }); },
+    haptic() { window.__calls.push(['haptic']); },
+    info() { return JSON.stringify({ app: 'test', android: '-', device: 'Playwright', webview: navigator.userAgent }); },
+    updateWebView() {},
+  };
+};
+
+const results = [];
+function check(name, ok, detail = '') {
+  results.push({ name, ok: !!ok });
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`);
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** A one-page PDF of plain Helvetica lines: text PdfCraft's Edit text can edit. */
+function plainPdf(lines) {
+  const text = lines.map((l) => `(${l}) Tj 0 -40 Td`).join(' ');
+  const stream = `BT /F1 24 Tf 72 700 Td ${text} ET`;
+  const objs = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [4 0 R] /Count 1 >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 3 0 R >> >> >>',
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [];
+  objs.forEach((o, i) => {
+    offsets.push(pdf.length);
+    pdf += `${i + 1} 0 obj\n${o}\nendobj\n`;
+  });
+  const xref = pdf.length;
+  pdf += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+  for (const o of offsets) pdf += `${String(o).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(pdf, 'latin1');
+}
+
+// ---- reading screenshots (8-bit RGB or RGBA PNGs, as Chromium writes them) ----
+function decodePng(png) {
+  let width = 0;
+  let height = 0;
+  let channels = 0;
+  const idat = [];
+  for (let pos = 8; pos < png.length; pos += 12 + png.readUInt32BE(pos)) {
+    const type = png.toString('latin1', pos + 4, pos + 8);
+    const data = png.subarray(pos + 8, pos + 8 + png.readUInt32BE(pos));
+    if (type === 'IHDR') {
+      [width, height, channels] = [data.readUInt32BE(0), data.readUInt32BE(4), { 2: 3, 6: 4 }[data[9]]];
+      if (data[8] !== 8 || !channels || data[12] !== 0) throw new Error('not an 8-bit RGB(A) PNG');
+    } else if (type === 'IDAT') idat.push(data);
+  }
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const stride = width * channels;
+  const rgb = Buffer.alloc(width * height * 3);
+  let prev = Buffer.alloc(stride);
+  for (let y = 0; y < height; y++) {
+    const filter = raw[y * (stride + 1)];
+    const row = Buffer.from(raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)));
+    for (let i = 0; i < stride; i++) {
+      const a = i < channels ? 0 : row[i - channels];
+      const b = prev[i];
+      const c = i < channels ? 0 : prev[i - channels];
+      if (filter === 1) row[i] += a;
+      else if (filter === 2) row[i] += b;
+      else if (filter === 3) row[i] += (a + b) >> 1;
+      else if (filter === 4) {
+        const pa = Math.abs(b - c);
+        const pb = Math.abs(a - c);
+        const pc = Math.abs(a + b - 2 * c);
+        row[i] += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+      }
+    }
+    for (let x = 0; x < width; x++) row.copy(rgb, (y * width + x) * 3, x * channels, x * channels + 3);
+    prev = row;
+  }
+  return { width, height, rgb };
+}
+
+// The bounding box, in screenshot pixels, of the largest 4-connected patch of pixels that
+// `match(r, g, b)` accepts at or below row `top`, of those that `keep(box)` accepts.
+function largestPatch({ width, height, rgb }, top, match, keep = () => true) {
+  const seen = new Uint8Array(width * height);
+  const take = (x, y) => {
+    const i = y * width + x;
+    if (x < 0 || x >= width || y < top || y >= height || seen[i] || !match(rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2])) return false;
+    seen[i] = 1;
+    return true;
+  };
+  let best = null;
+  for (let y = top; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!take(x, y)) continue;
+      const patch = { n: 0, x0: x, x1: x, y0: y, y1: y };
+      for (const stack = [[x, y]]; stack.length;) {
+        const [px, py] = stack.pop();
+        patch.n++;
+        [patch.x0, patch.x1, patch.y0, patch.y1] = [Math.min(patch.x0, px), Math.max(patch.x1, px), Math.min(patch.y0, py), Math.max(patch.y1, py)];
+        for (const [nx, ny] of [[px + 1, py], [px - 1, py], [px, py + 1], [px, py - 1]]) if (take(nx, ny)) stack.push([nx, ny]);
+      }
+      if ((!best || patch.n > best.n) && keep(patch)) best = patch;
+    }
+  }
+  return best;
+}
+
+// A phone-sized window at a Pixel 7's real device scale factor. Playwright's emulated
+// deviceScaleFactor is not enough: under it Chromium reports devicePixelContentBoxSize in CSS
+// pixels, so eframe would size its canvas at 1x and draw a blurry, oversized interface that no
+// phone shows.
+const PHONE = { width: 412, height: 915, scale: 2.625 };
+const launch = (width, height, scale = PHONE.scale) => chromium.launch({
+  args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist',
+    `--force-device-scale-factor=${scale}`, `--window-size=${width},${height}`],
+});
+const browser = await launch(PHONE.width, PHONE.height);
+try {
+  // A real multi-page PDF to open: PdfCraft's own demo page, printed by Chromium.
+  const maker = await browser.newPage();
+  await maker.goto('file://' + path.join(root, 'build/src/pdfcraft/assets/demo/showcase.html'));
+  const showcase = await maker.pdf({ format: 'A4', printBackground: true });
+  incoming.set('f1', showcase);
+  await maker.close();
+
+  // ONLY_TABLET=1 runs just the tablet checks (9h): a quicker loop while working on that layout.
+  // ONLY_PHONE=1 runs just 9f and 9g (the phone's controls).
+  if (!process.env.ONLY_TABLET && !process.env.ONLY_PHONE) {
+  incoming.set('f2', fs.readFileSync(path.join(root, 'build/src/pdfcraft/crates/ui-egui/tests/data/form.pdf')));
+
+  const context = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+  await context.addInitScript(mockBridge);
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+
+  // 1. Start-up: PdfCraft reports ready and the loading screen goes away.
+  const t0 = Date.now();
+  await page.goto(`${base}/app/shell/index.html`);
+  await page.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+  check('PdfCraft starts and says pdfcraft:ready', await page.evaluate(() => document.getElementById('error').hidden),
+    `${((Date.now() - t0) / 1000).toFixed(1)} s`);
+  const app = page.frames().find((f) => f.url().includes('/app/pdfcraft/index.html'));
+  check('PdfCraft runs in the frame with ?host=parent', app && app.url().includes('host=parent'));
+  const seeded = await page.evaluate(() => JSON.parse(localStorage.getItem('pdfcraft') || '{}').docking_left_open);
+  check('a phone starts with the Tools panel closed', seeded === false, String(seeded));
+
+  // 2. "Open with": the queued file is fetched from /incoming/ and opened.
+  await page.waitForFunction(() => window.__calls.some((c) => c[0] === 'pending'));
+  await sleep(4000);
+  check('a file queued by Android is fetched from /incoming/', served.includes('f1'));
+  const opened = await page.evaluate(() => window.__opened);
+  check('the open message carries Android\'s id for the file', opened.some((o) => o.name === 'showcase.pdf' && o.id === 'f1'),
+    JSON.stringify(opened));
+  check('a (re)started PdfCraft is reported to Android', await page.evaluate(() => window.__calls.some((c) => c[0] === 'appReady')));
+  await page.screenshot({ path: path.join(shots, '1-opened-portrait.png') });
+
+  const canvas = page.frameLocator('#app').locator('canvas');
+  const box = await canvas.boundingBox();
+  const focus = () => page.mouse.click(box.x + box.width / 2, box.y + box.height * 0.6);
+
+  // 3. An edit (Ctrl+K palette ▸ "Rotate pages clockwise") marks the document unsaved.
+  await focus();
+  await page.keyboard.press('Control+k');
+  await sleep(600);
+  await page.keyboard.type('Rotate pages clockwise', { delay: 20 });
+  await sleep(600);
+  await page.screenshot({ path: path.join(shots, '2-command-palette.png') });
+  await page.keyboard.press('Enter');
+  await sleep(1500);
+  const dirty = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'setDirty').map((c) => c[1]));
+  check('unsaved work reaches Android (setDirty)', dirty.includes(true), JSON.stringify(dirty));
+
+  // 4. Save (Ctrl+S) hands the PDF bytes to Android, in slices.
+  await focus();
+  await page.keyboard.press('Control+s');
+  await page.waitForFunction(() => window.__saves.some((s) => s.done && s.kind === 'save'), null, { timeout: 20000 }).catch(() => {});
+  const save = await page.evaluate(() => {
+    const s = window.__saves.find((x) => x.done && x.kind === 'save');
+    return s && { name: s.name, saveAs: s.saveAs, id: s.id, doc: s.doc, size: atob(s.data).length, head: atob(s.data.slice(0, 12)) };
+  });
+  check('Save sends the document to Android as a PDF', save && save.head.startsWith('%PDF-') && save.name === 'showcase.pdf' && !save.saveAs,
+    JSON.stringify(save));
+  check('Save of the "Open with" file sends its id back, with PdfCraft\'s document number',
+    save && save.id === 'f1' && /^\d+$/.test(save.doc), JSON.stringify(save && { id: save.id, doc: save.doc }));
+  await sleep(800);
+  const clean = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'setDirty').map((c) => c[1]));
+  check('after saving, the document is clean again', clean[clean.length - 1] === false, JSON.stringify(clean));
+
+  // 5. Save As (Ctrl+Shift+S) is flagged so Android asks where.
+  await focus();
+  await page.keyboard.press('Control+Shift+s');
+  await page.waitForFunction(() => window.__saves.some((s) => s.done && s.saveAs), null, { timeout: 20000 }).catch(() => {});
+  check('Save As is marked saveAs', await page.evaluate(() => window.__saves.some((s) => s.done && s.saveAs && s.kind === 'save')));
+
+  // 5b. A document PdfCraft made itself (palette ▸ "New blank PDF") has no id from Android: its
+  // Save names it by PdfCraft's document number instead, so it never takes another file's place.
+  await focus();
+  await page.keyboard.press('Control+k');
+  await sleep(600);
+  await page.keyboard.type('New blank PDF', { delay: 20 });
+  await sleep(600);
+  await page.keyboard.press('Enter');
+  await sleep(1500);
+  await focus();
+  await page.keyboard.press('Control+s');
+  await page.waitForFunction(() => window.__saves.some((s) => s.done && s.name === 'Untitled.pdf'), null, { timeout: 20000 }).catch(() => {});
+  const fresh = await page.evaluate(() => {
+    const s = window.__saves.find((x) => x.done && x.name === 'Untitled.pdf');
+    return s && { id: s.id, doc: s.doc, saveAs: s.saveAs };
+  });
+  check('Save of a document with no id sends only PdfCraft\'s document number',
+    fresh && fresh.id === '' && /^\d+$/.test(fresh.doc) && fresh.doc !== (save && save.doc) && !fresh.saveAs, JSON.stringify(fresh));
+  // Close it again ("Close file"), so showcase.pdf is the document in front. Android hears of
+  // the close by the number the save carried, and lets go of the file that save went to.
+  await focus();
+  await page.keyboard.press('Control+k');
+  await sleep(600);
+  await page.keyboard.type('Close file', { delay: 20 });
+  await sleep(600);
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => window.__calls.some((c) => c[0] === 'closed'), null, { timeout: 5000 }).catch(() => {});
+  const closedTab = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'closed'));
+  check('closing a tab reports pdfcraft:closed with its document number',
+    fresh && closedTab.length === 1 && closedTab[0][1] === '' && closedTab[0][2] === fresh.doc, JSON.stringify(closedTab));
+
+  // 5c. Two quick saves reach Android in the order PdfCraft made them, even when the older one
+  // is far bigger and takes longer to read.
+  await app.evaluate(() => {
+    for (const size of [24 << 20, 1024]) {
+      const bytes = new Uint8Array(size);
+      bytes.set([37, 80, 68, 70, 45]); // %PDF-
+      parent.postMessage({ type: 'pdfcraft:save', name: 'order.pdf', saveAs: false, bytes: bytes.buffer, id: 'f1', doc: 1 },
+        location.origin, [bytes.buffer]);
+    }
+  });
+  await page.waitForFunction(() => window.__saves.filter((s) => s.done && s.name === 'order.pdf').length === 2, null, { timeout: 30000 })
+    .catch(() => {});
+  const order = await page.evaluate(() =>
+    window.__ended.map((i) => window.__saves[i]).filter((s) => s.name === 'order.pdf').map((s) => s.data.length));
+  check('two quick saves reach Android in order', order.length === 2 && order[0] > order[1], JSON.stringify(order));
+
+  // 5d. A close reaches Android only after the saves PdfCraft made of the document before it,
+  // even one that takes long to read: Android must not let go of the file that save goes to.
+  await app.evaluate(() => {
+    const bytes = new Uint8Array(24 << 20);
+    bytes.set([37, 80, 68, 70, 45]); // %PDF-
+    parent.postMessage({ type: 'pdfcraft:save', name: 'closing.pdf', saveAs: false, bytes: bytes.buffer, id: 'f7', doc: 7 },
+      location.origin, [bytes.buffer]);
+    parent.postMessage({ type: 'pdfcraft:closed', id: 'f7', doc: 7 }, location.origin);
+  });
+  await page.waitForFunction(() => window.__calls.some((c) => c[0] === 'closed' && c[1] === 'f7'), null, { timeout: 30000 })
+    .catch(() => {});
+  const closing = await page.evaluate(() =>
+    window.__calls.filter((c) => (c[0] === 'endSave' && c[1] === 'closing.pdf') || (c[0] === 'closed' && c[1] === 'f7')));
+  check('a close reaches Android after the save made before it',
+    closing.length === 2 && closing[0][0] === 'endSave' && closing[1][2] === '7', JSON.stringify(closing));
+
+  // 6. Other downloads (PdfCraft's download(): <a download> on a revoked blob: URL) go to Android.
+  await app.evaluate(() => {
+    const blob = new Blob(['a,b\n1,2\n'], { type: 'application/pdf' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'measurements.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+  await sleep(500);
+  const exp = await page.evaluate(() => {
+    const s = window.__saves.find((x) => x.kind === 'export');
+    return s && { name: s.name, done: s.done, text: atob(s.data) };
+  });
+  check('blob: downloads are handed to Android as exports', exp && exp.done && exp.name === 'measurements.csv' && exp.text === 'a,b\n1,2\n',
+    JSON.stringify(exp));
+
+  // 7. Links open in the browser, never inside the app's frame.
+  await app.evaluate(() => {
+    window.open('https://github.com/storytold/pdfcraft/releases', '_blank');
+    window.open('https://github.com/storytold/pdfcraft', '_self');
+  });
+  const links = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'openExternal').map((c) => c[1]));
+  check('window.open links go to Android (new tab and _self)', links.length === 2, JSON.stringify(links));
+  check('PdfCraft stays loaded after a _self link', app.url().includes('/app/pdfcraft/index.html'));
+
+  // 8. Dialogs. On a phone a dialog's card fits what it shows, also when that grows while the
+  // dialog is open: Properties opened on its short Security tab and switched to Description gets
+  // the card Description opens with, and then keeps still.
+  const command = async (name) => {
+    await focus();
+    await page.keyboard.press('Control+k');
+    await sleep(600);
+    await page.keyboard.type(name, { delay: 20 });
+    await sleep(600);
+    await page.keyboard.press('Enter');
+    await sleep(1500);
+  };
+  // The card, in points: all the pure white left, as the backdrop dims the rest of the screen.
+  const cardOn = async (file) => {
+    const shot = decodePng(await page.screenshot({ path: path.join(shots, file) }));
+    const scale = shot.width / await page.evaluate(() => innerWidth);
+    const b = largestPatch(shot, 0, (r, g, bl) => r > 250 && g > 250 && bl > 250);
+    return b && { x: b.x0 / scale, y: b.y0 / scale, w: (b.x1 - b.x0 + 1) / scale, h: (b.y1 - b.y0 + 1) / scale };
+  };
+  await command('Document properties');
+  const described = await cardOn('2b-properties-description.png');
+  await page.keyboard.press('Escape');
+  await sleep(800);
+  await command('Security properties');
+  const secured = await cardOn('2c-properties-security.png');
+  // The tabs run along the top of the card, Description first.
+  if (secured) await page.mouse.click(secured.x + 60, secured.y + 75);
+  await sleep(1500);
+  const switched = await cardOn('2d-properties-security-then-description.png');
+  // More frames (the pointer moving over the backdrop) for a card that is still on the move.
+  for (let i = 0; i < 20; i++) { await page.mouse.move(4 + (i % 2), 4); await sleep(50); }
+  const settled = await cardOn('2e-properties-settled.png');
+  const size = (c) => c && `${c.w.toFixed(0)} x ${c.h.toFixed(0)}`;
+  check('a dialog\'s card grows to fit what it shows (Properties: Security, then Description)',
+    described && secured && switched && settled && secured.h < described.h - 40 && Math.abs(switched.h - described.h) < 2
+      && ['x', 'y', 'w', 'h'].every((k) => Math.abs(settled[k] - switched[k]) < 1),
+    `Description ${size(described)} pt, Security ${size(secured)}, then Description ${size(switched)} and ${size(settled)} later`);
+  await page.keyboard.press('Escape');
+  await sleep(800);
+
+  // Print: PdfCraft's own Print button sends its print sheets to Android's print framework
+  // instead of a no-op print(). Nothing stands in for PdfCraft: without its sheets this fails.
+  await focus();
+  await page.keyboard.press('Control+p');
+  await sleep(1500);
+  const screen = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+  const dialog = decodePng(await page.screenshot({ path: path.join(shots, '3-print-dialog.png') }));
+  const px = dialog.width / screen.width;
+  const pt = (b) => b && { x: (b.x0 + b.x1 + 1) / 2 / px, y: (b.y0 + b.y1 + 1) / 2 / px, w: (b.x1 - b.x0 + 1) / px, h: (b.y1 - b.y0 + 1) / px };
+  // The card is all the pure white left: the backdrop dims the rest of the screen. Print is
+  // taller than half a phone's screen, so a card that is not cut short (say to egui's default
+  // 400-point area) spans more than that.
+  const card = pt(largestPatch(dialog, 0, (r, g, b) => r > 250 && g > 250 && b > 250));
+  check('the Print dialog spans the phone\'s width and more than half its height',
+    card && card.w > screen.width - 24 && card.h > screen.height / 2,
+    card && `card ${card.w.toFixed(0)} x ${card.h.toFixed(0)} pt on a ${screen.width} x ${screen.height} pt screen`);
+  // The dialog scrolls on a phone: wheel to its end, where its buttons are.
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  for (let i = 0; i < 6; i++) { await page.mouse.wheel(600, 600); await sleep(150); }
+  await sleep(500);
+  const scrolled = decodePng(await page.screenshot({ path: path.join(shots, '3b-print-dialog-scrolled.png') }));
+  // PdfCraft's Print button is a pill (28 points tall) filled with the theme's accent (#1B63E0,
+  // or #4B8BF5 when dark) behind white text: the largest patch of that blue in the lower half.
+  const accent = (r, g, b) => [[0x1b, 0x63, 0xe0], [0x4b, 0x8b, 0xf5]]
+    .some(([R, G, B]) => Math.abs(r - R) + Math.abs(g - G) + Math.abs(b - B) <= 24);
+  const pill = (b) => b.y1 - b.y0 + 1 > 18 * px && b.y1 - b.y0 + 1 < 36 * px && b.x1 - b.x0 + 1 > 30 * px && b.x1 - b.x0 + 1 < 160 * px;
+  const button = pt(largestPatch(scrolled, Math.round(scrolled.height / 2), accent, pill));
+  check('PdfCraft\'s Print button shows on the scrolled dialog', button,
+    button && `at ${button.x.toFixed(0)}, ${button.y.toFixed(0)}, ${button.w.toFixed(0)} x ${button.h.toFixed(0)} pt`);
+  if (button) await page.mouse.click(button.x, button.y);
+  await page.waitForFunction(() => window.__print && window.__print.done, null, { timeout: 30000 }).catch(() => {});
+  await page.screenshot({ path: path.join(shots, '3c-after-print.png') });
+  const printed = await page.evaluate(() => window.__print);
+  // All pages at their size: a sheet of US Letter or A4 (the locale's paper) for every page.
+  const pages = (showcase.toString('latin1').match(/\/Type\s*\/Page\b/g) || []).length;
+  const paper = (p) => [[612, 792], [595.28, 841.89]].some(([w, h]) => Math.abs(Math.min(p.w, p.h) - w) < 1 && Math.abs(Math.max(p.w, p.h) - h) < 1);
+  check('PdfCraft\'s own Print reaches Android: a PNG on paper for every page',
+    pages > 0 && printed && printed.done && printed.pages.length === pages && printed.pages.every((p) => p.png && paper(p)),
+    `${printed ? printed.pages.length : 0} sheets for ${pages} pages: ${JSON.stringify(printed && printed.pages.slice(0, 2))}`);
+  if (!printed || !printed.done) {
+    // Diagnostic only: does the shell pass on a print frame shaped like PdfCraft's at all?
+    const relayed = await app.evaluate(async () => {
+      const c = document.createElement('canvas');
+      c.width = 85; c.height = 110;
+      c.getContext('2d').fillRect(10, 10, 20, 20);
+      const png = await new Promise((r) => c.toBlob(r, 'image/png'));
+      const url = URL.createObjectURL(png);
+      const frame = document.createElement('iframe');
+      frame.srcdoc = `<!doctype html><style>@page{size:612pt 792pt;margin:0}div{width:612pt;height:792pt}</style>`
+        + `<body><div><img src="${url}"></div><div class="turned"><img src="${url}"></div></body>`;
+      frame.addEventListener('load', () => setTimeout(() => frame.contentWindow.print(), 50));
+      document.body.appendChild(frame);
+      for (let i = 0; i < 50 && !(window.top.__print && window.top.__print.done); i++) await new Promise((r) => setTimeout(r, 100));
+      return !!(window.top.__print && window.top.__print.done);
+    });
+    console.log(`      (a stand-in print frame ${relayed ? 'does' : 'does not either'} reach Android)`);
+  }
+
+  // 9. A file shared while PdfCraft is open arrives in a new tab.
+  await page.evaluate(() => {
+    window.__pending.push({ id: 'f2', name: 'form.pdf' });
+    window.shell.incoming();
+  });
+  await sleep(2500);
+  check('a file shared later opens too', served.includes('f2'));
+  await page.screenshot({ path: path.join(shots, '4-second-file.png') });
+
+  // 9b. Close all: each tab from Android reports its id with its number.
+  await page.waitForFunction(() => window.__opened.some((o) => o.id === 'f2'), null, { timeout: 10000 }).catch(() => {});
+  await sleep(500);
+  await focus();
+  await page.keyboard.press('Control+k');
+  await sleep(600);
+  await page.keyboard.type('Close all', { delay: 20 });
+  await sleep(600);
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => window.__calls.filter((c) => c[0] === 'closed' && /^f[12]$/.test(c[1])).length === 2, null,
+    { timeout: 5000 }).catch(() => {});
+  const closedAll = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'closed' && /^f[12]$/.test(c[1])));
+  const showcaseDoc = save && save.doc;
+  check('Close all reports each tab Android opened, by its id and number',
+    closedAll.length === 2 && closedAll.some((c) => c[1] === 'f1' && c[2] === showcaseDoc)
+      && closedAll.some((c) => c[1] === 'f2' && /^\d+$/.test(c[2]) && c[2] !== showcaseDoc),
+    JSON.stringify(closedAll));
+
+  // 9c. Files from Android that never become a document of their own report their id alone:
+  // one PdfCraft can't open, and a picture PdfCraft makes a new PDF of (that PDF is not the
+  // picture's file, so its saves must never go there).
+  incoming.set('f3', Buffer.from('not a PDF'));
+  incoming.set('f4', await page.screenshot({ clip: { x: 0, y: 0, width: 24, height: 24 } }));
+  await page.evaluate(() => {
+    window.__pending.push({ id: 'f3', name: 'broken.pdf' }, { id: 'f4', name: 'receipt.png' });
+    window.shell.incoming();
+  });
+  await page.waitForFunction(() => ['f3', 'f4'].every((i) => window.__calls.some((c) => c[0] === 'closed' && c[1] === i)), null,
+    { timeout: 10000 }).catch(() => {});
+  const unopened = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'closed' && /^f[34]$/.test(c[1])));
+  check('files that never become their own document report pdfcraft:closed by id',
+    unopened.length === 2 && unopened.every((c) => c[2] === ''), JSON.stringify(unopened));
+  await page.screenshot({ path: path.join(shots, '4b-picture-made-a-pdf.png') });
+
+
+  const toasts = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'toast'));
+  check('no error toasts', toasts.length === 0, JSON.stringify(toasts));
+  const serious = errors.filter((e) => !/favicon|GPU stall|WebGL|swiftshader/i.test(e));
+  check('no page errors', serious.length === 0, serious.slice(0, 5).join(' | '));
+  const dpr = await app.evaluate(() => ({ dpr: devicePixelRatio, canvas: document.querySelector('canvas').width, css: innerWidth }));
+  check('the canvas is drawn at the device resolution', Math.abs(dpr.canvas - dpr.css * dpr.dpr) < 2, JSON.stringify(dpr));
+
+  // 9d. WebGL 2 missing for a moment at start-up (a WebView that has only just started) is no
+  // error; missing for good is, with the reason Chromium gave on the error screen.
+  for (const misses of [2, 99]) {
+    const ctx = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+    await ctx.addInitScript(mockBridge);
+    await ctx.addInitScript((n) => {
+      if (window.top !== window) return; // Only the shell's check: PdfCraft's own context stays real.
+      const real = HTMLCanvasElement.prototype.getContext;
+      let left = n;
+      HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
+        if (type === 'webgl2' && left > 0) {
+          left--;
+          this.dispatchEvent(Object.assign(new Event('webglcontextcreationerror'), { statusMessage: 'test: no GPU yet' }));
+          return null;
+        }
+        return real.call(this, type, ...rest);
+      };
+    }, misses);
+    const p = await ctx.newPage();
+    const warned = [];
+    p.on('console', (m) => { if (/WebGL 2 is not available yet/.test(m.text())) warned.push(m.text()); });
+    const t0 = performance.now();
+    await p.goto(`${base}/app/shell/index.html`);
+    await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+    const seconds = (performance.now() - t0) / 1000;
+    const shown = await p.evaluate(() => ({
+      error: !document.getElementById('error').hidden,
+      text: document.getElementById('error-text').textContent,
+      info: document.getElementById('error-info').textContent,
+    }));
+    if (misses === 2) {
+      check('WebGL 2 missing for a moment at start-up is no error', !shown.error && warned.length === 2,
+        `${warned.length} warnings; ${shown.error ? shown.text : 'started'}`);
+    } else {
+      check('WebGL 2 missing for good shows the error, with the reason, after a few seconds',
+        shown.error && /WebGL 2/.test(shown.text) && shown.info.includes('test: no GPU yet') && seconds > 5,
+        `${seconds.toFixed(1)} s, ${warned.length} warnings; ${shown.text} / ${shown.info.split('\n').pop()}`);
+    }
+    await ctx.close();
+  }
+
+  // 9e. Touch, in a PdfCraft of its own with the 12-page showcase open: a finger dragged up the
+  // page scrolls it (with the Select tool, not a text selection), and Full screen mode reaches
+  // Android, which takes it back with Back.
+  {
+    const ctx = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+    await ctx.addInitScript(mockBridge);
+    incoming.set('f1', showcase); // /incoming/ hands a file out once.
+    const p = await ctx.newPage();
+    await p.goto(`${base}/app/shell/index.html`);
+    await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+    await p.waitForFunction(() => window.__opened.some((o) => o.id === 'f1'), null, { timeout: 30000 });
+    await sleep(3000);
+    const tbox = await p.frameLocator('#app').locator('canvas').boundingBox();
+    const x = tbox.x + tbox.width * 0.45;
+    // The page view's middle band, in screen pixels.
+    const band = async () => decodePng(await p.screenshot({ clip: { x: x - 60, y: tbox.y + tbox.height * 0.3, width: 120, height: tbox.height * 0.45 } }));
+    const before = await band();
+    const cdp = await ctx.newCDPSession(p);
+    const touch = (type, y) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [{ x, y }] });
+    const y0 = tbox.y + tbox.height * 0.75;
+    const travel = tbox.height * 0.4;
+    await touch('touchStart', y0);
+    for (let k = 1; k <= 20; k++) {
+      await touch('touchMove', y0 - (travel * k) / 20);
+      await sleep(16);
+    }
+    await touch('touchEnd', 0);
+    // Under software rendering each touch event waits for a ~200 ms frame, so this drag is far
+    // too slow to glide; the glide is covered by PdfCraft's own tests (canvas::touch_tests).
+    await sleep(2500);
+    const after = await band();
+    // How far the band moved up: the shift that best lines the two shots up.
+    const rowDiff = (shift) => {
+      let sum = 0;
+      let n = 0;
+      for (let y = 0; y + shift < before.height; y += 2) {
+        for (let xx = 0; xx < before.width; xx += 4) {
+          const a = ((y + shift) * before.width + xx) * 3;
+          const b = (y * after.width + xx) * 3;
+          sum += Math.abs(before.rgb[a] - after.rgb[b]);
+          n++;
+        }
+      }
+      return n ? sum / n : Infinity;
+    };
+    let best = 0;
+    for (let shift = 0; shift < before.height * 0.9; shift += 2) if (rowDiff(shift) < rowDiff(best)) best = shift;
+    const css = best / PHONE.scale;
+    const stillThere = rowDiff(0) < 0.5;
+    check('a finger dragged up the page scrolls it (Select tool)', !stillThere && css >= travel * 0.8,
+      `moved ${css.toFixed(0)} of ${travel.toFixed(0)} px dragged; unmoved diff ${rowDiff(0).toFixed(1)}, best ${rowDiff(best).toFixed(1)}`);
+    await p.screenshot({ path: path.join(shots, '8-touch-scrolled.png') });
+
+    await p.mouse.click(x, tbox.y + tbox.height * 0.6);
+    await p.keyboard.press('Control+k');
+    await sleep(600);
+    await p.keyboard.type('Full screen mode', { delay: 20 });
+    await sleep(600);
+    await p.keyboard.press('Enter');
+    await sleep(1500);
+    const on = await p.evaluate(() => window.__calls.filter((c) => c[0] === 'setFullScreen').map((c) => c[1]));
+    check('Full screen mode reaches Android (setFullScreen)', on.at(-1) === true, JSON.stringify(on));
+    await p.screenshot({ path: path.join(shots, '9-full-screen.png') });
+    await p.evaluate(() => window.shell.leaveFullScreen());
+    await sleep(1500);
+    const off = await p.evaluate(() => window.__calls.filter((c) => c[0] === 'setFullScreen').map((c) => c[1]));
+    check('Android\'s Back leaves Full screen mode', off.at(-1) === false && off.length === on.length + 1, JSON.stringify(off));
+    await ctx.close();
+  }
+
+  } // end of the sections before 9f (ONLY_PHONE skips them)
+  {
+  // 9f. The phone's controls (phone.js), laid out as phone PDF apps lay them out: PdfCraft draws
+  // the page; the page around it draws the controls from pdfcraft:state and drives PdfCraft.
+  {
+    const ctx = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+    await ctx.addInitScript(mockBridge);
+    incoming.set('f1', showcase);
+    const p = await ctx.newPage();
+    await p.goto(`${base}/app/shell/index.html`);
+    await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+    await p.waitForFunction(() => window.__state && window.__state.pages === 12, null, { timeout: 30000 }).catch(() => {});
+    const st = () => p.evaluate(() => window.__state);
+    const settle = (fn, ms = 8000) => p.waitForFunction(fn, null, { timeout: ms }).then(() => true, () => false);
+    const sheetRow = (text) => p.evaluate((t) => {
+      const r = [...document.querySelectorAll('#sheet .row, #sheet .action')].find((x) => x.textContent.trim() === t);
+      if (r) r.click();
+      return !!r;
+    }, text);
+    const app2 = p.frames().find((f) => f.url().includes('/app/pdfcraft/'));
+    check('a phone runs PdfCraft with the controls drawn around it (&chrome=host)', app2 && app2.url().includes('chrome=host'));
+    check('a file opened from Android shows at once (not the home screen)', await settle(() => !document.body.classList.contains('home')));
+    const frameBox = await p.locator('#app').boundingBox();
+    check('the page gets the room between the bars', frameBox.height > 700, `${frameBox.height.toFixed(0)} px tall`);
+    check('the bottom bar: Edit PDF, Comment, Highlight, Draw, Fill & Sign, More tools',
+      await p.evaluate(() => [...document.querySelectorAll('#bottombar .cat span')].map((x) => x.textContent).join('|')) === 'Edit PDF|Comment|Highlight|Draw|Fill & Sign|More tools');
+    await p.screenshot({ path: path.join(shots, 'phone-1-reading.png') });
+
+    const shown = (sel) => p.evaluate((q) => { const e = document.querySelector(q); return !!e && !e.hidden && e.getBoundingClientRect().height > 0; }, sel);
+    const cdp = await ctx.newCDPSession(p);
+    const hold = async (x, y, ms) => {
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+      await sleep(ms);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    };
+
+    // A finger held on a word selects it: handles at its ends, a card of what to do with it.
+    const fb = await p.locator('#app').boundingBox();
+    let selected = false;
+    let onWord = [0.36, 0.37]; // where a held finger found a word
+    for (const [fx, fy] of [[0.36, 0.37], [0.3, 0.33], [0.45, 0.4], [0.25, 0.42]]) {
+      await hold(fb.x + fb.width * fx, fb.y + fb.height * fy, 1500);
+      selected = await settle(() => !!(window.__state.selection && window.__state.selection.text), 4000);
+      if (selected) {
+        onWord = [fx, fy];
+        break;
+      }
+    }
+    const card = selected && await settle(() => !document.getElementById('selcard').hidden, 3000);
+    const handlesShown = await shown('#handle-start') && await shown('#handle-end');
+    check('a finger held on a word selects it, with handles and a card of actions', selected && card && handlesShown,
+      JSON.stringify({ selected, card, handlesShown, sel: (await st()).selection }));
+    check('... with Android\'s long-press buzz, and Android\'s touch-and-hold delay passed to PdfCraft',
+      await p.evaluate(() => window.__calls.some((c) => c[0] === 'haptic'))
+      && p.frames().some((f) => f.url().includes('longpress=450')), p.frames().map((f) => f.url()).join(' '));
+    await p.screenshot({ path: path.join(shots, 'phone-2-selection.png') });
+    await p.tap('#sel-highlight');
+    check('... Highlight on the card highlights the words', await settle(() => !window.__state.selection && window.__state.undo === true)
+      && await p.evaluate(() => document.getElementById('selcard').hidden));
+    await p.tap('#undo');
+    await settle(() => window.__state.undo === false);
+    for (const [fx, fy] of [[0.36, 0.37], [0.3, 0.33], [0.45, 0.4], [0.25, 0.42]]) {
+      await hold(fb.x + fb.width * fx, fb.y + fb.height * fy, 1500);
+      if (await settle(() => !!(window.__state.selection && window.__state.selection.text), 4000)) break;
+    }
+    const words = (await st()).selection && (await st()).selection.text;
+    await settle(() => !document.getElementById('selcard').hidden, 3000);
+    await p.tap('#sel-copy');
+    const copied = await p.evaluate(() => window.__calls.filter((c) => c[0] === 'copyText').map((c) => c[1]));
+    check('... Copy text puts the words on Android\'s clipboard', !!words && copied.at(-1) === words && await settle(() => !window.__state.selection),
+      JSON.stringify({ words, copied }));
+
+    // Taps are not a long press: one, two or three quick taps on that same word select nothing
+    // (a mouse's double and triple click select a word and a line; a finger lands in them by accident).
+    // Both events go out together: a slow machine (CI draws in software) otherwise holds the
+    // finger down for a frame or more between them, and a finger down for half a second IS a
+    // long press. Each tap's real time down is recorded, so a failure says which it was.
+    await p.frames().find((f) => f.url().includes('/app/pdfcraft/')).evaluate(() => {
+      window.top.__downs = [];
+      let t0 = 0;
+      document.addEventListener('pointerdown', () => { t0 = performance.now(); }, true);
+      document.addEventListener('pointerup', () => { window.top.__downs.push(Math.round(performance.now() - t0)); }, true);
+    });
+    if (process.env.TAP_SLOW) await cdp.send('Emulation.setCPUThrottlingRate', { rate: Number(process.env.TAP_SLOW) });
+    const tapAt = (x, y) => Promise.all([
+      cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] }),
+      cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }),
+    ]);
+    const [wx, wy] = [fb.x + fb.width * onWord[0], fb.y + fb.height * onWord[1]];
+    const taps = {};
+    // The shell's double tap zooms (tested below): kept out of this check, which is about what
+    // PdfCraft makes of quick taps, so the word stays under the finger.
+    await p.evaluate(() => { window.shell.touch.doubleTap = 0; });
+    // More than once each: a miss that depends on where a frame falls shows up now and then.
+    for (const [i, n] of [1, 2, 3, 4, 2, 3, 3, 4].entries()) {
+      for (let k = 0; k < n; k++) {
+        await tapAt(wx, wy);
+        await sleep(60);
+      }
+      await sleep(1500); // a selection would show by now (and the bars' tap timer has run)
+      const sel = (await st()).selection;
+      taps[`${n}#${i}`] = sel ? sel.text : null;
+      if (sel) {
+        await p.evaluate(() => window.shell.back()); // clear it for the next try
+        await settle(() => !window.__state.selection, 3000);
+      }
+      await sleep(600);
+    }
+    const downs = await p.evaluate(() => window.__downs);
+    await p.evaluate(() => { window.shell.touch.doubleTap = 300; });
+    if (process.env.TAP_SLOW) await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 });
+    check('quick taps on a word select nothing: only a held finger does', Object.values(taps).every((t) => t === null),
+      JSON.stringify({ taps, msDown: downs }));
+    // The taps may have hidden the bars (a tap on the page does); bring them back for what follows.
+    if (await p.evaluate(() => document.body.classList.contains('immersive'))) {
+      await p.touchscreen.tap(fb.x + fb.width * 0.9, fb.y + fb.height * 0.97);
+      await settle(() => !document.body.classList.contains('immersive'), 4000);
+    }
+
+    // A tap outside the selected text lets it go, as in any PDF viewer; a tap on it does not. The
+    // bars stay as they are (the tap that clears a selection is not the tap that hides them).
+    await sleep(600);
+    const fb2 = await p.locator('#app').boundingBox(); // the bars may have moved the page
+    // A finger takes about a tenth of a second to tap: press and release land in different frames,
+    // which is what the shell sees on a phone. (The quick taps above are the harsh case.) A slow
+    // machine can stretch it, so a tap that took too long to be one is tried again.
+    const humanTap = async (x, y) => {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const before = await p.evaluate(() => window.__downs.length);
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+        await sleep(70);
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+        // The tap is logged when the page has handled its release, which a slow machine (CI draws
+        // in software) can leave for a good while. Wait for it: a second tap made too early would
+        // land on a page that has already let go of its selection and hide the bars.
+        for (let waited = 0; waited < 4000 && (await p.evaluate(() => window.__downs.length)) <= before; waited += 100) await sleep(100);
+        const downs2 = await p.evaluate(() => window.__downs);
+        if (downs2.length > before && downs2.at(-1) <= 300) return downs2.at(-1);
+        if (downs2.length <= before) return -1; // never logged: do not tap again blindly
+        await sleep(800);
+      }
+      return -1;
+    };
+    // A long press that a slow machine missed is made again (a few times) before it counts as failed.
+    const holdWord = async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if ((await st()).selection) return true;
+        await hold(fb2.x + fb2.width * onWord[0], fb2.y + fb2.height * onWord[1], 1500);
+        if (await settle(() => !!(window.__state.selection && window.__state.selection.text), 3500)) return true;
+      }
+      return false;
+    };
+    const results = {};
+    for (const [label, fx, fy] of [['the left margin', 0.03, 0.62], ['the top corner', 0.97, 0.1]]) {
+      const held = await holdWord();
+      const tapMs = held ? await humanTap(fb2.x + fb2.width * fx, fb2.y + fb2.height * fy) : null;
+      const gone = held && await settle(() => !window.__state.selection, 4000);
+      await sleep(700);
+      results[label] = { held, gone, tapMs, page: (await st()).page, barsKept: await p.evaluate(() => !document.body.classList.contains('immersive')) };
+    }
+    check('a tap outside the selected text lets it go, and keeps the bars',
+      Object.values(results).every((r) => r.held && r.gone && r.barsKept && r.page === 1), JSON.stringify(results));
+    // A tap on the selected words leaves it (a long press is how another word is chosen).
+    let keptOnTap = false;
+    let onMs = null;
+    if (await holdWord()) {
+      const b = (await st()).selection;
+      onMs = await humanTap(fb2.x + b.x + b.w / 2, fb2.y + b.y + b.h / 2);
+      await sleep(1200);
+      keptOnTap = !!(await st()).selection;
+    }
+    check('a tap on the selected text leaves it', keptOnTap, JSON.stringify({ keptOnTap, onMs }));
+    if ((await st()).selection) {
+      await p.evaluate(() => window.shell.back()); // so the next checks start clean
+      await settle(() => !window.__state.selection, 3000);
+    }
+
+    // Highlight: ✓ at the top, the tools along the bottom, a hint, and the colour.
+    await p.tap('#bottombar [data-item="highlight"]');
+    const picked = await settle(() => window.__state.tool === 'comment.highlight');
+    const modeShown = await shown('#modebar') && await shown('#toolbar') && !(await shown('#bottombar'));
+    const marked = await p.evaluate(() => !!document.querySelector('#mode-tools [data-cmd="comment.highlight"].on'));
+    const hintText = await p.evaluate(() => document.getElementById('hint').textContent);
+    check('Highlight: ✓ on top, its tools along the bottom, and a hint', picked && modeShown && marked && hintText === 'Drag over text to highlight'
+      && !(await st()).panel, JSON.stringify({ tool: (await st()).tool, modeShown, marked, hintText }));
+    await p.tap('#color');
+    await settle(() => document.getElementById('sheet').dataset.kind === 'style');
+    await sleep(600); // the sheet slides up
+    await p.screenshot({ path: path.join(shots, 'phone-3-highlight-colour.png') });
+    await p.tap('#sheet .swatch[aria-label="Colour #43a047"]');
+    check('... the colour sheet sets the highlighter\'s colour', await settle(() => window.__state.style && window.__state.style.color === '#43a047'),
+      JSON.stringify((await st()).style));
+    await p.evaluate(() => window.shell.back());
+    await p.tap('#mode-tools [data-cmd="comment.underline"]');
+    check('... Underline switches to it', await settle(() => window.__state.tool === 'comment.underline'));
+    await p.tap('#done');
+    check('✓ goes back to the Select tool and the bottom bar', await settle(() => window.__state.tool === 'select')
+      && await shown('#bottombar') && !(await shown('#modebar')));
+
+    // Draw: the pen with its thickness and colour.
+    await p.tap('#bottombar [data-item="draw"]');
+    const pen = await settle(() => window.__state.tool === 'comment.ink');
+    check('Draw picks the pen, with thickness and colour, and says two fingers scroll', pen && await shown('#width') && await shown('#color')
+      && await p.evaluate(() => document.getElementById('hint').textContent.includes('two fingers')));
+    await p.screenshot({ path: path.join(shots, 'phone-4-draw.png') });
+    await p.tap('#done');
+    await settle(() => window.__state.tool === 'select');
+
+    // Comment: a tap pins a note, the box at the bottom writes it.
+    await p.tap('#bottombar [data-item="comment"]');
+    await settle(() => window.__state.tool === 'comment.note');
+    await p.touchscreen.tap(fb.x + fb.width * 0.5, fb.y + fb.height * 0.6);
+    const composing = await settle(() => window.__state.composer && window.__state.composer.kind === 'note') && await shown('#composer');
+    await p.fill('#composer-text', 'Looks good');
+    await p.dispatchEvent('#composer-text', 'input');
+    await p.screenshot({ path: path.join(shots, 'phone-5-comment.png') });
+    await p.tap('#composer-send');
+    check('Comment: a tap pins a note and the box at the bottom posts it', composing
+      && await settle(() => !window.__state.composer && window.__state.undo === true) && !(await shown('#composer')),
+    JSON.stringify({ composing, state: (await st()).composer }));
+    await p.tap('#done');
+    await settle(() => window.__state.tool === 'select');
+    await p.tap('#undo');
+    await settle(() => window.__state.undo === false);
+
+    // Edit PDF: named, with Organize pages, Add text and Add image.
+    await p.tap('#bottombar [data-item="edit"]');
+    const editing = await settle(() => window.__state.tool === 'edit.edit_text');
+    const editTools = await p.evaluate(() => [...document.querySelectorAll('#mode-tools .tool-btn span')].map((x) => x.textContent).join('|'));
+    const title = await p.evaluate(() => document.querySelector('#modebar .mode-title').textContent);
+    // The text blocks are found on the next frames; under software rendering they take a while.
+    await sleep(6000);
+    await p.screenshot({ path: path.join(shots, 'phone-6-edit.png') });
+    check('Edit PDF edits text, with Organize pages, Add text and Add image', editing && title === 'Edit PDF'
+      && editTools === 'Organize pages|Add text|Add image', JSON.stringify({ tool: (await st()).tool, title, editTools }));
+    await p.tap('#done');
+    await settle(() => window.__state.tool === 'select');
+
+    // Search: the top bar turns into the search box.
+    await p.tap('#find');
+    await settle(() => !document.getElementById('searchbar').hidden);
+    await p.fill('#find-input', 'Showcase');
+    await p.dispatchEvent('#find-input', 'input');
+    const found = await settle(() => window.__state.find && window.__state.find.matches > 0, 15000);
+    const count = found && await settle(() => /^1\/\d+$/.test(document.getElementById('find-count').textContent), 3000);
+    await p.screenshot({ path: path.join(shots, 'phone-7-search.png') });
+    check('Search finds the words and counts the matches', found && count,
+      JSON.stringify({ find: (await st()).find, count: await p.evaluate(() => document.getElementById('find-count').textContent) }));
+    await p.tap('#find-close');
+    check('... ← closes the search', await settle(() => !window.__state.find) && await shown('#topbar'));
+
+    // Night mode, from ⋮ ▸ View settings.
+    await p.tap('#more');
+    await settle(() => !document.getElementById('sheet').hidden);
+    await sheetRow('View settings');
+    await settle(() => document.getElementById('sheet').dataset.kind === 'view');
+    await sheetRow('Night mode');
+    const night = await settle(() => window.__state.night === true);
+    const switchOn = await settle(() => !!document.querySelector('#sheet .switch.on'), 3000);
+    await p.evaluate(() => window.shell.back());
+    await sleep(1000);
+    await p.screenshot({ path: path.join(shots, 'phone-8-night.png') });
+    await p.tap('#more');
+    await settle(() => !document.getElementById('sheet').hidden);
+    await sheetRow('View settings');
+    await sheetRow('Night mode');
+    check('View settings ▸ Night mode turns the pages white on black, and back', night && switchOn && await settle(() => window.__state.night === false));
+    await p.evaluate(() => window.shell.back());
+
+    // Share hands the file to Android's share sheet.
+    await p.tap('#share');
+    const shared = await settle(() => window.__saves.some((s) => s.kind === 'share' && s.done), 15000);
+    const sharedPdf = shared && await p.evaluate(() => atob(window.__saves.find((s) => s.kind === 'share').data.slice(0, 12)).startsWith('%PDF-'));
+    check('Share hands the PDF to Android', shared && sharedPdf);
+
+    // ⋮: the file's menu; Go to page… 7.
+    await p.tap('#more');
+    await settle(() => !document.getElementById('sheet').hidden);
+    const rows = await p.evaluate(() => [...document.querySelectorAll('#sheet .row .label')].map((r) => r.textContent));
+    const head = await p.evaluate(() => document.querySelector('#sheet .sheet-title').textContent);
+    check('⋮ shows the file\'s name and its menu', head === 'showcase.pdf'
+      && ['View settings', 'Pages', 'Bookmarks', 'Comment list', 'Go to page', 'Share', 'Print', 'Close file'].every((r) => rows.includes(r)),
+    `${head}: ${rows.join(' | ')}`);
+    await p.screenshot({ path: path.join(shots, 'phone-9-file-menu.png') });
+    await sheetRow('Go to page');
+    await settle(() => !!document.querySelector('.goto input'));
+    await p.fill('.goto input', '7');
+    await p.keyboard.press('Enter');
+    const turned = await settle(() => window.__state.page === 7);
+    check('Go to page 7 turns to page 7, and the page number shows it', turned
+      && await settle(() => document.getElementById('pagepill').textContent === '7 / 12', 3000), `page ${(await st()).page}`);
+
+    // A tap on the page hides the bars; another brings them back.
+    const tapPage = async () => {
+      const b = await p.locator('#app').boundingBox();
+      await p.touchscreen.tap(b.x + b.width * 0.4, b.y + b.height * 0.5);
+    };
+    await tapPage();
+    const hid = await settle(() => document.body.classList.contains('immersive'), 4000);
+    await p.screenshot({ path: path.join(shots, 'phone-10-bars-hidden.png') });
+    await sleep(600);
+    await tapPage();
+    const back = await settle(() => !document.body.classList.contains('immersive'), 4000);
+    check('a tap on the page hides the bars, another brings them back', hid && back, JSON.stringify({ hid, back }));
+
+    // Acrobat's smart zoom: a double tap zooms in on the text under it, another zooms back out;
+    // neither hides the bars.
+    const touchTap = (x, y) => Promise.all([
+      cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] }),
+      cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }),
+    ]);
+    const doubleTap = async (x, y) => {
+      await touchTap(x, y);
+      await sleep(90);
+      await touchTap(x, y);
+    };
+    await sleep(600);
+    const fitted = (await st()).zoom;
+    {
+      const b = await p.locator('#app').boundingBox();
+      await doubleTap(b.x + b.width * 0.4, b.y + b.height * 0.4);
+    }
+    let zoomedIn = false;
+    for (let k = 0; k < 30 && !zoomedIn; k++) {
+      zoomedIn = (await st()).zoom > fitted * 1.2;
+      if (!zoomedIn) await sleep(100);
+    }
+    await sleep(500);
+    const keptBars = await p.evaluate(() => !document.body.classList.contains('immersive'));
+    await p.screenshot({ path: path.join(shots, 'phone-10b-smart-zoom.png') });
+    {
+      const b = await p.locator('#app').boundingBox();
+      await doubleTap(b.x + b.width * 0.5, b.y + b.height * 0.4);
+    }
+    let zoomedOut = false;
+    for (let k = 0; k < 30 && !zoomedOut; k++) {
+      zoomedOut = Math.abs((await st()).zoom - fitted) <= 1;
+      if (!zoomedOut) await sleep(100);
+    }
+    await sleep(500);
+    check('a double tap zooms in on the text, another zooms back out, and the bars stay', zoomedIn && zoomedOut && keptBars
+      && await p.evaluate(() => !document.body.classList.contains('immersive')), JSON.stringify({ fitted, zoomedIn, zoomedOut, keptBars, now: (await st()).zoom }));
+
+    // The scrubber at the right edge: shown as the pages go by; dragged to the foot of its track,
+    // it goes to the last pages; tapped, it asks for a page.
+    await p.evaluate(() => document.getElementById('app').contentWindow.postMessage({ type: 'pdfcraft:gotoPage', page: 2 }, location.origin));
+    const scrubShown = await settle(() => window.__state.page === 2, 4000) && await shown('#scrubber .thumb');
+    let scrubbed = false;
+    if (scrubShown) {
+      const t = await p.locator('#scrubber .thumb').boundingBox();
+      const track = await p.locator('#scrubber').boundingBox();
+      const [x, y0] = [t.x + t.width / 2, t.y + t.height / 2];
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y: y0 }] });
+      for (let k = 1; k <= 8; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y0 + (track.y + track.height - y0) * k / 8 }] });
+        await sleep(40);
+      }
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      scrubbed = await settle(() => window.__state.page >= 11, 4000);
+      await p.screenshot({ path: path.join(shots, 'phone-10c-scrubber.png') });
+    }
+    check('the scrubber shows as the pages go by and drags to the end of the document', scrubShown && scrubbed,
+      JSON.stringify({ scrubShown, scrubbed, page: (await st()).page }));
+    await p.evaluate(() => document.getElementById('app').contentWindow.postMessage({ type: 'pdfcraft:gotoPage', page: 3 }, location.origin));
+    await settle(() => window.__state.page === 3, 4000);
+    if (await shown('#scrubber .thumb')) {
+      const t = await p.locator('#scrubber .thumb').boundingBox();
+      await touchTap(t.x + t.width / 2, t.y + t.height / 2);
+    }
+    check('... and a tap on it asks for a page', await settle(() => !document.getElementById('sheet').hidden && !!document.querySelector('#sheet .goto input'), 3000)
+      && await (async () => { await sleep(600); return p.evaluate(() => !document.getElementById('sheet').hidden); })());
+    await p.evaluate(() => window.shell.back());
+    await settle(() => document.getElementById('sheet').hidden);
+
+    // Single-page view, as in Acrobat: a sideways swipe turns the page, and so does a tap at the
+    // screen's edge.
+    const tellApp = (msg) => p.evaluate((m) => document.getElementById('app').contentWindow.postMessage(m, location.origin), msg);
+    await tellApp({ type: 'pdfcraft:command', id: 'view.continuous' });
+    await tellApp({ type: 'pdfcraft:command', id: 'view.layout.single' });
+    const single = await settle(() => window.__state.continuous === false, 4000);
+    await sleep(800);
+    const before = (await st()).page;
+    {
+      const b = await p.locator('#app').boundingBox();
+      const y = b.y + b.height * 0.5;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: b.x + b.width * 0.8, y }] });
+      for (let k = 1; k <= 6; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: b.x + b.width * (0.8 - 0.1 * k), y }] });
+        await sleep(25);
+      }
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    }
+    const swiped = await settle(() => window.__state.page === 4, 4000);
+    await sleep(600);
+    {
+      const b = await p.locator('#app').boundingBox();
+      await touchTap(b.x + b.width * 0.06, b.y + b.height * 0.5);
+    }
+    const edged = await settle(() => window.__state.page === 3, 4000);
+    await sleep(500);
+    check('single-page view: a swipe turns to the next page, a tap at the left edge back', single && swiped && edged
+      && await p.evaluate(() => !document.body.classList.contains('immersive')), JSON.stringify({ single, before, swiped, edged, page: (await st()).page }));
+    await tellApp({ type: 'pdfcraft:command', id: 'view.continuous' });
+    await settle(() => window.__state.continuous === true, 4000);
+
+    // ⋮ ▸ Pages opens the thumbnails over the page; its bar closes them.
+    await p.tap('#more');
+    await settle(() => !document.getElementById('sheet').hidden);
+    await sheetRow('Pages');
+    const opened2 = await settle(() => window.__state.panel === 'Pages');
+    const bar = await p.evaluate(() => !document.getElementById('panelbar').hidden);
+    await p.screenshot({ path: path.join(shots, 'phone-11-pages.png') });
+    await p.tap('#panelbar button');
+    check('⋮ ▸ Pages opens the thumbnails over the page, and its bar closes them',
+      opened2 && bar && await settle(() => !window.__state.panel), JSON.stringify({ opened2, bar }));
+
+    // More tools: a grid; Rotate pages, then Undo.
+    await p.tap('#bottombar [data-item="tools"]');
+    await settle(() => !document.getElementById('sheet').hidden);
+    const tiles = await p.evaluate(() => [...document.querySelectorAll('#sheet .grid .action')].map((t) => t.textContent));
+    check('More tools shows the tools as a grid', ['Organize pages', 'Export PDF', 'Compress PDF', 'Set password', 'Rotate pages'].every((t) => tiles.includes(t)),
+      tiles.join(' | '));
+    await p.screenshot({ path: path.join(shots, 'phone-12-more-tools.png') });
+    await sheetRow('Rotate pages');
+    const canUndo = await settle(() => window.__state.undo === true);
+    const undoOn = await p.evaluate(() => !document.getElementById('undo').disabled);
+    await p.tap('#undo');
+    check('More tools ▸ Rotate pages makes Undo available, and Undo undoes it', canUndo && undoOn && await settle(() => window.__state.undo === false),
+      JSON.stringify({ canUndo, undoOn }));
+
+    // Android's Back: the menu first, then the file goes to the home screen, then Android.
+    await p.tap('#more');
+    await settle(() => !document.getElementById('sheet').hidden);
+    const b1 = await p.evaluate(() => window.shell.back());
+    const b2 = await p.evaluate(() => window.shell.back());
+    const atHome = await p.evaluate(() => document.body.classList.contains('home'));
+    const b3 = await p.evaluate(() => window.shell.back());
+    check('Back closes the menu, then shows the home screen, then leaves the rest to Android',
+      b1 === true && b2 === true && atHome && b3 === false, JSON.stringify({ b1, b2, atHome, b3 }));
+    const files = await p.evaluate(() => [...document.querySelectorAll('#home .file-name')].map((r) => r.textContent));
+    check('the home screen lists the open file', files.length === 1 && files[0] === 'showcase.pdf', JSON.stringify(files));
+    await p.waitForTimeout(500); // the tiles' icons load when home first shows
+    await p.screenshot({ path: path.join(shots, 'phone-13-home.png') });
+    await p.tap('#home .file-open');
+    check('... and a tap on it shows it again', await settle(() => !document.body.classList.contains('home')));
+
+    await ctx.close();
+  }
+
+  // 9g. Edit PDF outlines each paragraph PdfCraft can edit, dashed: a finger can't hover one.
+  {
+    const ctx = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+    await ctx.addInitScript(mockBridge);
+    incoming.set('f1', plainPdf(['A paragraph to edit', 'on two lines', '', 'And another one']));
+    const p = await ctx.newPage();
+    await p.goto(`${base}/app/shell/index.html`);
+    await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+    await p.waitForFunction(() => window.__state && window.__state.pages === 1, null, { timeout: 30000 }).catch(() => {});
+    await sleep(2000);
+    const area = await p.locator('#app').boundingBox();
+    const clip = { x: area.x, y: area.y, width: area.width, height: area.height * 0.4 };
+    const blues = (img) => {
+      let n = 0;
+      for (let i = 0; i < img.rgb.length; i += 3) if (img.rgb[i + 2] > 150 && img.rgb[i + 2] - img.rgb[i] > 60) n++;
+      return n;
+    };
+    const plain = blues(decodePng(await p.screenshot({ clip })));
+    await p.tap('#bottombar [data-item="edit"]');
+    const editing = await p.waitForFunction(() => window.__state.tool === 'edit.edit_text', null, { timeout: 8000 }).then(() => true, () => false);
+    await sleep(3000);
+    const outlined = blues(decodePng(await p.screenshot({ clip })));
+    await p.screenshot({ path: path.join(shots, 'phone-14-edit-outlines.png') });
+    const editable = await p.evaluate(() => window.__state.editable);
+    const toolNow = await p.evaluate(() => window.__state.tool);
+    check('Edit PDF outlines the paragraphs it can edit', editing && editable === 2 && outlined > plain + 200,
+      JSON.stringify({ editing, editable, toolNow, plain, outlined }));
+    await ctx.close();
+  }
+
+  // 9g2. A pen (an S Pen), as Samsung Notes and Xodo take one: it selects and highlights text as
+  // it moves, with no hold first; once a pen is used a finger only scrolls (next time too); and a
+  // hand resting on the screen while the pen hovers is ignored.
+  {
+    const ctx = await browser.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+    await ctx.addInitScript(mockBridge);
+    incoming.set('f1', showcase);
+    const p = await ctx.newPage();
+    await p.goto(`${base}/app/shell/index.html`);
+    await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+    await p.waitForFunction(() => window.__state && window.__state.pages === 12, null, { timeout: 30000 }).catch(() => {});
+    await sleep(1500);
+    const cdp = await ctx.newCDPSession(p);
+    const st = () => p.evaluate(() => window.__state);
+    const settle = (fn, ms = 8000) => p.waitForFunction(fn, null, { timeout: ms }).then(() => true, () => false);
+    const fb = await p.locator('#app').boundingBox();
+    const penEvent = (type, x, y, down) => cdp.send('Input.dispatchMouseEvent', {
+      type, x, y, pointerType: 'pen', button: down || type !== 'mouseMoved' ? 'left' : 'none', buttons: down ? 1 : 0, clickCount: 1,
+    });
+    const penStroke = async (fy) => {
+      const [x0, x1, y] = [fb.x + fb.width * 0.15, fb.x + fb.width * 0.7, fb.y + fb.height * fy];
+      await penEvent('mouseMoved', x0, y, false);
+      await penEvent('mousePressed', x0, y, true);
+      for (let k = 1; k <= 6; k++) {
+        await penEvent('mouseMoved', x0 + (x1 - x0) * k / 6, y, true);
+        await sleep(30);
+      }
+      await penEvent('mouseReleased', x1, y, false);
+    };
+    let row = 0.37;
+    let selected = false;
+    for (const fy of [0.37, 0.33, 0.4, 0.42, 0.3]) {
+      await penStroke(fy);
+      selected = await settle(() => !!(window.__state.selection && window.__state.selection.text), 3000);
+      if (selected) {
+        row = fy;
+        break;
+      }
+    }
+    check('a pen run over text selects it at once, with no hold', selected, JSON.stringify((await st()).selection));
+    check('... and the shell remembers that a pen is used here', (await st()).pen === true
+      && await p.evaluate(() => localStorage.getItem('shell.pen') === '1'));
+    await p.evaluate(() => window.shell.back());
+    await settle(() => !window.__state.selection, 3000);
+
+    await p.tap('#bottombar [data-item="highlight"]');
+    await settle(() => window.__state.tool === 'comment.highlight');
+    const hint = await p.evaluate(() => document.getElementById('hint').textContent);
+    await sleep(2500); // the hint has gone, and the pen's first sight of the page with it
+    await penStroke(row);
+    const highlighted = await settle(() => window.__state.undo === true, 4000);
+    check('with the highlighter, the pen highlights what it runs over, and the hint says so', highlighted && hint.includes('pen'),
+      JSON.stringify({ highlighted, hint }));
+    const fingerDrag = async () => {
+      const x = fb.x + fb.width * 0.5;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y: fb.y + fb.height * 0.85 }] });
+      for (let k = 1; k <= 8; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: fb.y + fb.height * (0.85 - 0.09 * k) }] });
+        await sleep(30);
+      }
+      await sleep(150);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    };
+    await sleep(500);
+    const pageBefore = (await st()).page;
+    for (let k = 0; k < 4; k++) await fingerDrag();
+    const scrolled = await settle(() => window.__state.page > 1, 4000);
+    check('... and one finger scrolls the page instead of marking it', scrolled && (await st()).tool === 'comment.highlight',
+      JSON.stringify({ pageBefore, page: (await st()).page }));
+
+    // A hand on the glass while the pen hovers over it is the hand holding the pen.
+    await sleep(1500);
+    const pageThen = (await st()).page;
+    for (let k = 0; k < 3; k++) {
+      await penEvent('mouseMoved', fb.x + fb.width * 0.3, fb.y + fb.height * 0.3, false);
+      const x = fb.x + fb.width * 0.6;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y: fb.y + fb.height * 0.85 }] });
+      for (let j = 1; j <= 8; j++) {
+        await penEvent('mouseMoved', fb.x + fb.width * 0.3, fb.y + fb.height * 0.3 + j, false);
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: fb.y + fb.height * (0.85 - 0.09 * j) }] });
+        await sleep(30);
+      }
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    }
+    await sleep(1500);
+    check('a hand on the screen while the pen hovers is ignored', (await st()).page === pageThen,
+      JSON.stringify({ pageThen, page: (await st()).page }));
+
+    // Started again, PdfCraft knows from the first touch that the pen marks and a finger scrolls.
+    const p2 = await ctx.newPage();
+    await p2.goto(`${base}/app/shell/index.html`);
+    await p2.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 }).catch(() => {});
+    check('... and the next start remembers the pen', p2.frames().some((f) => f.url().includes('pen=1')),
+      p2.frames().map((f) => f.url()).join(' '));
+    await p.screenshot({ path: path.join(shots, 'phone-15-pen.png') });
+    await ctx.close();
+  }
+
+  } // ONLY_TABLET
+
+  // 9h. A tablet (600 dp and wider) has the same controls with the room used: centred bars, the
+  // file's name on top, sheets as cards, and a panel docked beside the page with the bars kept.
+  for (const [name, W, H] of process.env.ONLY_PHONE ? [] : [['landscape', 1280, 800], ['portrait', 800, 1280]]) {
+    // Pixel ratio 1: `screen` is the display in CSS px, as on a tablet (a higher ratio shrinks it).
+    const tab = await launch(W, H, 1);
+    try {
+      const ctx = await tab.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+      await ctx.addInitScript(mockBridge);
+      incoming.set('f1', showcase);
+      const p = await ctx.newPage();
+      await p.goto(`${base}/app/shell/index.html`);
+      await p.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+      await p.waitForFunction(() => window.__state && window.__state.pages === 12, null, { timeout: 30000 }).catch(() => {});
+      const st = () => p.evaluate(() => window.__state);
+      const settle = (fn, ms = 8000) => p.waitForFunction(fn, null, { timeout: ms }).then(() => true, () => false);
+      const box = (sel) => p.evaluate((q) => { const e = document.querySelector(q); if (!e) return null; const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height, hidden: e.hidden || r.height === 0 }; }, sel);
+      const sheetRow = (text) => p.evaluate((t) => {
+        const r = [...document.querySelectorAll('#sheet .row, #sheet .action')].find((x) => x.textContent.trim() === t);
+        if (r) r.click();
+        return !!r;
+      }, text);
+      const inner = await p.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+      const tag = `tablet ${name}`;
+      await settle(() => !document.body.classList.contains('home'));
+      const app3 = p.frames().find((f) => f.url().includes('/app/pdfcraft/'));
+      check(`${tag}: runs PdfCraft with the controls drawn around it and panels docked beside the page`,
+        app3 && app3.url().includes('chrome=host') && app3.url().includes('panel=side')
+        && await p.evaluate(() => document.body.classList.contains('tablet')), app3 && app3.url());
+
+      // The file's name on the top bar; the bottom bar's buttons together in the middle.
+      const title = await p.evaluate(() => document.getElementById('doc-title').textContent);
+      const titleBox = await box('#doc-title');
+      const cats = await p.evaluate(() => [...document.querySelectorAll('#bottombar .cat')].map((c) => { const r = c.getBoundingClientRect(); return [r.left, r.right]; }));
+      const groupW = cats.at(-1)[1] - cats[0][0];
+      const groupMid = (cats.at(-1)[1] + cats[0][0]) / 2;
+      const bar = await box('#bottombar');
+      check(`${tag}: the file's name is on the top bar`, title === 'showcase.pdf' && !titleBox.hidden, JSON.stringify({ title, titleBox }));
+      check(`${tag}: the bottom bar's buttons sit together in the middle, not stretched across`,
+        cats.length === 6 && groupW < Math.min(inner.w - 80, 760) && Math.abs(groupMid - inner.w / 2) < 6 && bar.w >= inner.w - 1,
+        JSON.stringify({ groupW, groupMid, inner, barW: bar.w }));
+      const page = await box('#app');
+      check(`${tag}: the page gets the room between the bars`, page.h > inner.h - 64 - 76 - 4, JSON.stringify(page));
+      await p.screenshot({ path: path.join(shots, `tablet-1-reading-${name}.png`) });
+
+      // ⋮ is a card in the middle, not a strip across the whole width; More tools is a wider grid.
+      await p.tap('#more');
+      await settle(() => !document.getElementById('sheet').hidden);
+      await sleep(600);
+      const card = await box('#sheet');
+      check(`${tag}: the ⋮ menu is a centred card`, card.w <= 561 && card.w >= 400 && Math.abs(card.x + card.w / 2 - inner.w / 2) < 2 && card.y + card.h <= inner.h - 8,
+        JSON.stringify({ card, inner }));
+      await p.screenshot({ path: path.join(shots, `tablet-2-menu-${name}.png`) });
+      await p.evaluate(() => window.shell.back());
+      await p.tap('#bottombar [data-item="tools"]');
+      await settle(() => document.getElementById('sheet').dataset.kind === 'tools');
+      await sleep(600);
+      const cols = await p.evaluate(() => getComputedStyle(document.querySelector('#sheet .grid')).gridTemplateColumns.split(' ').length);
+      const grid = await box('#sheet');
+      check(`${tag}: More tools is a six-column grid on a card`, cols === 6 && grid.w <= 781 && Math.abs(grid.x + grid.w / 2 - inner.w / 2) < 2, JSON.stringify({ cols, grid }));
+      await p.screenshot({ path: path.join(shots, `tablet-3-more-tools-${name}.png`) });
+      await p.evaluate(() => window.shell.back());
+
+      // A panel docks beside the page, and the bars stay.
+      await p.tap('#more');
+      await settle(() => !document.getElementById('sheet').hidden);
+      await sheetRow('Pages');
+      const docked = await settle(() => window.__state.panel === 'Pages' && window.__state.panelRect, 8000);
+      await sleep(800);
+      const pr = (await st()).panelRect;
+      check(`${tag}: Pages docks beside the page, and the bars stay`, docked && pr && pr.w >= 299 && pr.w <= 441 && pr.x + pr.w >= inner.w - 2 && pr.h > (inner.h - 64 - 76) * 0.9
+        && !(await box('#bottombar')).hidden && (await box('#panelbar')).hidden, JSON.stringify({ pr, inner }));
+      await p.screenshot({ path: path.join(shots, `tablet-4-pages-panel-${name}.png`) });
+      await p.evaluate(() => window.shell.back());
+      check(`${tag}: Back closes the panel`, await settle(() => !window.__state.panel && !window.__state.panelRect));
+
+      // Highlight: its tools in the middle of the bottom, ✓ at the top.
+      await p.tap('#bottombar [data-item="highlight"]');
+      await settle(() => window.__state.tool === 'comment.highlight');
+      const tools = await p.evaluate(() => [...document.querySelectorAll('#mode-tools .tool-btn')].map((c) => { const r = c.getBoundingClientRect(); return [r.left, r.right]; }));
+      const mid = (tools.at(-1)[1] + tools[0][0]) / 2;
+      check(`${tag}: a mode's tools sit in the middle of the bottom bar`, tools.length === 3 && Math.abs(mid - inner.w / 2) < 120 && (await box('#modebar')) && !(await box('#toolbar')).hidden,
+        JSON.stringify({ tools, mid, w: inner.w }));
+      await p.screenshot({ path: path.join(shots, `tablet-5-highlight-${name}.png`) });
+      await p.tap('#done');
+      await settle(() => window.__state.tool === 'select');
+
+      // Home: a column, the quick actions in a row that wraps.
+      await p.tap('#back');
+      await settle(() => document.body.classList.contains('home'));
+      await sleep(600);
+      const acts = await p.evaluate(() => [...document.querySelectorAll('#home .actions .action')].map((a) => a.getBoundingClientRect().top));
+      const fileRow = await box('#home .file');
+      check(`${tag}: home is a column with the quick actions together`, acts.length === 4 && fileRow.w <= 761 && fileRow.x >= 20, JSON.stringify({ acts, fileRow }));
+      await p.screenshot({ path: path.join(shots, `tablet-6-home-${name}.png`) });
+      await p.tap('#home .file-open');
+      await settle(() => !document.body.classList.contains('home'));
+
+      if (name === 'landscape') {
+        // A mouse's double click still selects a word on a tablet, and a finger's double tap does
+        // not. A small plain PDF with big words in a known place (the cover's are widely spaced).
+        incoming.set('f1', plainPdf(['A paragraph to edit', 'on two lines']));
+        const ctx2 = await tab.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+        await ctx2.addInitScript(mockBridge);
+        const q = await ctx2.newPage();
+        await q.goto(`${base}/app/shell/index.html`);
+        await q.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+        await q.waitForFunction(() => window.__state && window.__state.pages === 1, null, { timeout: 30000 }).catch(() => {});
+        await sleep(2500);
+        const sel = (page) => page.evaluate(() => window.__state.selection && window.__state.selection.text);
+        let found = null;
+        for (const y of [236, 252, 268, 284]) {
+          for (const x of [300, 340, 380, 420]) {
+            await q.mouse.dblclick(x, y);
+            await sleep(500);
+            if (await sel(q)) {
+              found = [x, y];
+              break;
+            }
+          }
+          if (found) break;
+        }
+        check(`${tag}: a mouse's double click still selects a word`, !!found, JSON.stringify({ found, sel: await sel(q) }));
+        if (found) {
+          await q.evaluate(() => window.shell.back());
+          await sleep(500);
+          const cdp2 = await ctx2.newCDPSession(q);
+          for (let k = 0; k < 2; k++) {
+            await Promise.all([
+              cdp2.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: found[0], y: found[1] }] }),
+              cdp2.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }),
+            ]);
+            await sleep(60);
+          }
+          await sleep(1500);
+          check(`${tag}: a finger's double tap selects nothing`, !(await sel(q)), JSON.stringify(await sel(q)));
+        }
+        await ctx2.close();
+      }
+      await ctx.close();
+    } finally {
+      await tab.close();
+    }
+  }
+} finally {
+  await browser.close();
+}
+
+// 10. Landscape, in a landscape window of its own.
+const wide = await launch(PHONE.height, PHONE.width);
+try {
+  const context = await wide.newContext({ viewport: null, hasTouch: true, userAgent: devices['Pixel 7'].userAgent });
+  await context.addInitScript(mockBridge);
+  incoming.set('f1', fs.readFileSync(path.join(root, 'build/src/pdfcraft/crates/ui-egui/tests/data/form.pdf')));
+  const page = await context.newPage();
+  await page.goto(`${base}/app/shell/index.html`);
+  await page.waitForFunction(() => document.getElementById('splash').hidden, null, { timeout: 240000 });
+  await sleep(3000);
+  await page.screenshot({ path: path.join(shots, '5-landscape.png') });
+  const box = await page.frameLocator('#app').locator('canvas').boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height * 0.6);
+  await page.keyboard.press('Control+p');
+  await sleep(2000);
+  await page.screenshot({ path: path.join(shots, '6-landscape-print-dialog.png') });
+} finally {
+  await wide.close();
+  server.close();
+}
+
+const failed = results.filter((r) => !r.ok);
+console.log(`\n${results.length - failed.length}/${results.length} checks passed; screenshots in ${shots}`);
+process.exit(failed.length ? 1 : 0);

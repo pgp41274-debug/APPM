@@ -1,0 +1,264 @@
+/* PdfCraft on a phone: the controls drawn here, around the page PdfCraft draws (`&chrome=host`),
+   laid out as phone PDF apps lay them out. */
+
+:root {
+  --bar-bg: #ffffff;
+  --bar-fg: #1b1b1f;
+  --bar-muted: #6b6b75;
+  --bar-line: rgba(0, 0, 0, 0.1);
+  --press: rgba(0, 0, 0, 0.06);
+  --chip-on: #d7f2ec;
+  --sheet-bg: #ffffff;
+  --home-bg: #f6f6f8;
+  --scrim: rgba(0, 0, 0, 0.4);
+  --tile-l: 92%;
+  --tile-fg-l: 34%;
+  --top: 56px;
+  --bottom: 68px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bar-bg: #1f1f22;
+    --bar-fg: #ececf1;
+    --bar-muted: #a0a0ab;
+    --bar-line: rgba(255, 255, 255, 0.1);
+    --press: rgba(255, 255, 255, 0.08);
+    --chip-on: #16463c;
+    --sheet-bg: #232326;
+    --home-bg: #121214;
+    --scrim: rgba(0, 0, 0, 0.6);
+    --tile-l: 18%;
+    --tile-fg-l: 72%;
+  }
+}
+
+/* An iframe's own height is 150px: give it the room between the bars. */
+body.phone #app { top: var(--top); height: calc(100% - var(--top) - var(--bottom)); }
+body.phone.immersive #app, body.phone.full-screen #app { top: 0; height: 100%; }
+
+.ic {
+  display: inline-block; width: 24px; height: 24px; flex: none; background: currentColor;
+  -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat;
+}
+.spacer { flex: 1; }
+
+.pbar, #home, #sheet, #pagepill, #hint { -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+.pbar button, #home button, #sheet button, #pagepill {
+  font: inherit; color: inherit; background: none; border: 0; padding: 0; margin: 0; border-radius: 12px;
+}
+.pbar button:disabled, #sheet button:disabled { opacity: 0.35; }
+.pbar button:active:not(:disabled), #home button:active, #sheet button:active:not(:disabled) { background: var(--press); }
+.icon-btn { position: relative; width: 48px; height: 48px; display: grid; place-items: center; flex: none; }
+
+/* ---- bars ---- */
+
+.pbar {
+  position: fixed; left: 0; right: 0; z-index: 5; display: flex; align-items: center;
+  background: var(--bar-bg); color: var(--bar-fg); box-sizing: border-box; transition: transform 160ms ease;
+}
+.pbar[hidden] { display: none; }
+.topbar { top: 0; height: var(--top); padding: 0 4px; gap: 2px; border-bottom: 1px solid var(--bar-line); }
+#bottombar, #toolbar, #panelbar { bottom: 0; height: var(--bottom); border-top: 1px solid var(--bar-line); }
+body.immersive .topbar, body.full-screen .topbar { transform: translateY(-100%); }
+body.immersive #bottombar, body.immersive #toolbar, body.immersive #panelbar,
+body.full-screen #bottombar, body.full-screen #toolbar, body.full-screen #panelbar { transform: translateY(100%); }
+body.home .pbar { display: none; }
+body.busy .pbar { pointer-events: none; opacity: 0.5; }
+
+/* A mode: ✓ (done) in the accent colour, and the mode's name when it has one. */
+#done { color: var(--accent); }
+#done .ic { width: 28px; height: 28px; }
+.mode-title { font-size: 18px; font-weight: 600; margin-left: 6px; white-space: nowrap; }
+
+/* Search: the box takes the room between the arrows. */
+#find-input { flex: 1; min-width: 0; height: 40px; padding: 0 4px; font: inherit; font-size: 17px; color: inherit;
+  background: none; border: 0; border-bottom: 2px solid var(--accent); border-radius: 0; outline: none; }
+#find-input::-webkit-search-cancel-button { display: none; }
+#find-count { flex: none; font-size: 13px; color: var(--bar-muted); padding: 0 4px; font-variant-numeric: tabular-nums; }
+
+/* Edit PDF · Comment · Highlight · Draw · Fill & Sign · More tools: icon over label (`.pbar` outranks the button reset). */
+#bottombar { padding: 0 2px; }
+.pbar .cat { position: relative; flex: 1; min-width: 0; height: 60px; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 4px; font-size: 11px; }
+.cat span { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* A mode's tools along the bottom, centred; the colour and thickness after a divider. */
+#toolbar { justify-content: center; padding: 0 6px; }
+#mode-tools { display: flex; align-items: center; gap: 2px; overflow-x: auto; scrollbar-width: none; min-width: 0; }
+#mode-tools::-webkit-scrollbar { display: none; }
+.pbar .tool-btn { flex: none; position: relative; min-width: 48px; height: 52px; padding: 0 6px; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 3px; font-size: 11px; }
+.pbar .tool-btn.gap { margin-left: 14px; }
+.pbar .tool-btn.gap::before { content: ""; position: absolute; left: -8px; top: 12px; bottom: 12px; width: 1px; background: var(--bar-line); }
+#mode-tools.named .tool-btn { min-width: 92px; font-size: 12px; }
+.pbar .tool-btn.on { color: var(--accent); background: var(--chip-on); }
+#style-tools { display: flex; align-items: center; gap: 2px; flex: none; }
+#style-tools[hidden], .tool-btn[hidden] { display: none; }
+.divider { width: 1px; height: 32px; background: var(--bar-line); margin: 0 8px; }
+.dot { width: 26px; height: 26px; border-radius: 50%; box-shadow: 0 0 0 2px var(--bar-bg), 0 0 0 3px var(--bar-line); }
+.width-lines { display: flex; flex-direction: column; gap: 4px; width: 24px; }
+.width-lines i { display: block; height: 2px; background: currentColor; border-radius: 1px; }
+.width-lines i:nth-child(2) { height: calc(var(--w, 2px) * 0.75 + 1px); }
+.width-lines i:nth-child(3) { height: var(--w, 3px); }
+
+#panelbar { padding: 0 8px 0 20px; justify-content: space-between; font-weight: 600; }
+
+/* A tool's hint, in the middle of the page for a moment. */
+#hint { position: fixed; z-index: 6; left: 50%; top: 45%; transform: translate(-50%, -50%); max-width: calc(100% - 48px);
+  padding: 12px 20px; border-radius: 10px; background: rgba(40, 40, 44, 0.9); color: #fff; font-size: 16px; text-align: center;
+  pointer-events: none; transition: opacity 300ms ease; }
+#hint[hidden] { display: none; }
+#hint.out { opacity: 0; }
+
+/* The comment being written: a box along the bottom, over the keyboard. */
+#composer { position: fixed; z-index: 7; left: 0; right: 0; bottom: 0; display: flex; align-items: flex-end; gap: 4px;
+  padding: 10px 6px 12px; background: var(--sheet-bg); color: var(--bar-fg); border-radius: 18px 18px 0 0;
+  box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.18); }
+#composer[hidden] { display: none; }
+#composer button { font: inherit; color: inherit; background: none; border: 0; border-radius: 12px; }
+#composer button:disabled { opacity: 0.35; }
+#composer-send:not(:disabled) { color: var(--accent); }
+#composer-text { flex: 1; min-width: 0; min-height: 24px; max-height: 140px; padding: 12px; font: inherit; font-size: 16px;
+  color: inherit; background: var(--home-bg); border: 1px solid var(--bar-line); border-radius: 12px; resize: none; outline: none; }
+
+/* A text selection: a handle hangs from each end; the card offers what to do with it. */
+.handle { position: fixed; z-index: 8; left: 0; top: 0; width: 22px; height: 22px; background: var(--accent);
+  border-radius: 50% 0 50% 50%; touch-action: none; }
+.handle.end { border-radius: 0 50% 50% 50%; }
+.handle::after { content: ""; position: absolute; inset: -12px; }
+.handle[hidden] { display: none; }
+#selcard { position: fixed; z-index: 8; left: 0; top: 0; background: #1f1f22; color: #f2f2f5; border-radius: 12px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35); overflow: hidden; -webkit-user-select: none; user-select: none; }
+#selcard[hidden] { display: none; }
+#selcard button { font: inherit; color: inherit; background: none; border: 0; }
+#selcard button:active { background: rgba(255, 255, 255, 0.1); }
+.sel-icons { display: flex; justify-content: space-around; padding: 4px; border-bottom: 1px solid rgba(255, 255, 255, 0.15); }
+.sel-row { display: flex; align-items: center; gap: 16px; width: 100%; min-height: 50px; padding: 0 18px; font-size: 16px; text-align: left; }
+
+/* The page number, a while after the page changes; a tap goes to a page. */
+#pagepill { position: fixed; z-index: 4; top: calc(var(--top) + 10px); left: 12px; padding: 6px 12px !important;
+  border-radius: 16px !important; background: rgba(32, 32, 36, 0.78) !important; color: #fff !important;
+  font-size: 13px; font-variant-numeric: tabular-nums; }
+#pagepill[hidden] { display: none; }
+body.immersive #pagepill, body.full-screen #pagepill { top: 10px; }
+
+/* The scrubber: a tab at the right edge that drags through the pages. Its track (top, height)
+   is set by phone.js between the bars; the track itself lets touches through to the page. */
+#scrubber { position: fixed; z-index: 4; right: 0; width: 44px; pointer-events: none; }
+#scrubber[hidden] { display: none; }
+#scrubber .thumb { pointer-events: auto; width: 32px; height: 48px; margin-left: 12px; border-radius: 16px 0 0 16px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0;
+  background: rgba(32, 32, 36, 0.78); color: #fff; touch-action: none; -webkit-tap-highlight-color: transparent; }
+#scrubber .thumb .ic { width: 16px; height: 16px; margin: -2px 0; }
+#scrubber .thumb.held { background: var(--accent); }
+
+/* ---- home ---- */
+
+#home { position: fixed; inset: 0; z-index: 4; overflow-y: auto; background: var(--home-bg); color: var(--bar-fg);
+  padding: 0 0 24px; box-sizing: border-box; }
+body:not(.home) #home { display: none; }
+.home-head { display: flex; align-items: center; gap: 10px; height: 64px; padding: 0 8px 0 20px; }
+.home-head img { width: 32px; height: 32px; }
+.brand { font-size: 20px; font-weight: 700; }
+#home h2 { margin: 18px 20px 12px; font-size: 16px; font-weight: 600; }
+.actions { display: flex; gap: 8px; padding: 0 12px; overflow-x: auto; scrollbar-width: none; }
+#home .action, #sheet .action { flex: none; width: 88px; display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 6px 0; font-size: 12.5px; text-align: center; line-height: 1.25; }
+.tile { width: 64px; height: 64px; border-radius: 14px; display: grid; place-items: center;
+  background: hsl(var(--hue) 45% var(--tile-l)); color: hsl(var(--hue) 70% var(--tile-fg-l)); }
+.tile .ic { width: 30px; height: 30px; }
+.file { display: flex; align-items: center; padding: 0 8px 0 4px; border-bottom: 1px solid var(--bar-line); }
+.file-open { flex: 1; min-width: 0; display: flex; align-items: center; gap: 14px; padding: 12px 8px 12px 16px !important; text-align: left; border-radius: 0 !important; }
+.file-icon { width: 40px; height: 52px; border-radius: 4px; display: grid; place-items: center; background: var(--bar-bg);
+  border: 1px solid var(--bar-line); color: var(--accent); flex: none; }
+.file-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.file-name { font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-sub { font-size: 13px; color: var(--bar-muted); }
+#home .empty { margin: 4px 20px; color: var(--bar-muted); }
+
+/* ---- sheets (⋮, More tools, Go to page): rise from the bottom over a dimmed page ---- */
+
+#scrim { position: fixed; inset: 0; z-index: 20; background: var(--scrim); opacity: 0; transition: opacity 160ms ease; }
+#scrim.open { opacity: 1; }
+#scrim[hidden] { display: none; }
+#sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 21; max-height: 82%; display: flex; flex-direction: column;
+  background: var(--sheet-bg); color: var(--bar-fg); border-radius: 20px 20px 0 0; box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.2);
+  transform: translateY(100%); transition: transform 180ms ease;
+}
+#sheet.open { transform: none; }
+#sheet[hidden] { display: none; }
+.grabber { flex: none; width: 36px; height: 4px; margin: 10px auto 6px; border-radius: 2px; background: var(--bar-muted); opacity: 0.5; }
+.sheet-head { flex: none; display: flex; align-items: center; gap: 4px; padding: 8px 20px 10px; flex-wrap: wrap; }
+.sheet-head .back { margin-left: -12px; }
+.sheet-title { flex: 1; min-width: 0; font-size: 17px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sheet-title.big { font-size: 20px; }
+.sheet-sub { flex-basis: 100%; font-size: 13px; color: var(--bar-muted); }
+.sep { flex: none; height: 1px; margin: 0 20px; background: var(--bar-line); }
+#sheet .list { overflow-y: auto; padding: 4px 0 12px; }
+#sheet .row { display: flex; align-items: center; gap: 18px; width: 100%; min-height: 54px; padding: 0 20px !important; box-sizing: border-box;
+  font-size: 16px; text-align: left; border-radius: 0 !important; }
+.row .label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .tick { color: var(--accent); }
+.row .next { color: var(--bar-muted); }
+#sheet .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px 4px; padding: 6px 8px 20px; overflow-y: auto; }
+#sheet .grid .action { width: auto; }
+.goto { display: flex; gap: 12px; padding: 4px 20px 22px; }
+.goto input { flex: 1; min-width: 0; font: inherit; font-size: 18px; padding: 10px 12px; border-radius: 10px;
+  border: 1px solid var(--bar-line); background: var(--home-bg); color: inherit; }
+.goto button { padding: 10px 22px !important; background: var(--accent) !important; color: #fff !important; border-radius: 10px !important; }
+
+/* The colour sheet: swatches, then sliders. */
+.swatches { display: flex; flex-wrap: wrap; gap: 14px; padding: 6px 20px 14px; }
+#sheet .swatch { width: 38px; height: 38px; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.15); }
+#sheet .swatch.on { box-shadow: 0 0 0 3px var(--sheet-bg), 0 0 0 5px var(--accent); }
+.slider { display: flex; align-items: center; gap: 12px; padding: 8px 20px 18px; font-size: 15px; }
+.slider .label { width: 84px; }
+.slider input { flex: 1; min-width: 0; accent-color: var(--accent); }
+.slider .value { width: 52px; text-align: right; color: var(--bar-muted); font-variant-numeric: tabular-nums; }
+
+/* An on/off row (Night mode). */
+.switch { position: relative; width: 44px; height: 26px; border-radius: 13px; background: var(--bar-line); flex: none; transition: background 150ms; }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); transition: transform 150ms; }
+.switch.on { background: var(--accent); }
+.switch.on::after { transform: translateX(18px); }
+#sheet .list .sep { margin: 6px 20px; }
+
+/* ---- tablets (600 dp and wider): the same controls, with the room used ----
+   Bars keep the screen's full width but their buttons stay together in the middle; sheets are
+   cards, not strips across the whole width; the home screen is a column; and a panel docks
+   beside the page (PdfCraft draws it, `&panel=side`), so the bars stay. */
+
+#doc-title { display: none; }
+body.tablet { --top: 64px; --bottom: 76px; }
+body.tablet .topbar { padding: 0 12px; gap: 6px; }
+body.tablet #doc-title { display: block; flex: 0 1 auto; min-width: 0; max-width: 45%; margin: 0 8px; font-size: 18px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body.tablet .icon-btn { width: 52px; height: 52px; }
+body.tablet #bottombar, body.tablet #toolbar { justify-content: center; gap: 10px; }
+body.tablet .pbar .cat { flex: 0 1 108px; height: 66px; font-size: 12.5px; }
+body.tablet .pbar .tool-btn { min-width: 60px; height: 56px; font-size: 12px; }
+body.tablet #mode-tools.named .tool-btn { min-width: 124px; font-size: 13px; }
+body.tablet #mode-tools { gap: 6px; }
+body.tablet #find-input { max-width: 520px; font-size: 18px; }
+body.tablet #searchbar { padding-left: 12px; }
+
+/* Sheets and the comment box: centred cards. */
+body.tablet #sheet { left: 0; right: 0; bottom: 16px; margin: 0 auto; width: min(560px, calc(100% - 32px));
+  max-height: calc(100% - 96px); border-radius: 20px; transform: translateY(calc(100% + 16px)); }
+body.tablet #sheet.open { transform: none; }
+body.tablet #sheet[data-kind="tools"] { width: min(780px, calc(100% - 32px)); }
+body.tablet #sheet[data-kind="tools"] .grid { grid-template-columns: repeat(6, 1fr); }
+body.tablet #composer { left: 0; right: 0; margin: 0 auto; width: min(720px, 100%); bottom: 0; }
+
+/* Home: a column, the quick actions wrapping rather than scrolling. */
+body.tablet #home { padding-left: max(0px, calc(50% - 380px)); padding-right: max(0px, calc(50% - 380px)); }
+body.tablet .home-head { height: 76px; }
+body.tablet .brand { font-size: 24px; }
+body.tablet .actions { flex-wrap: wrap; overflow: visible; gap: 12px 8px; }
+body.tablet #home .action { width: 112px; font-size: 13.5px; }
+body.tablet .tile { width: 72px; height: 72px; border-radius: 16px; }
+body.tablet .tile .ic { width: 34px; height: 34px; }
+body.tablet .file-open { padding: 14px 8px 14px 20px !important; }
+body.tablet .file-name { font-size: 17px; }

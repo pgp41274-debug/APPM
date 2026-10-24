@@ -1,0 +1,399 @@
+diff --git a/apps/pdfcraft-web/src/main.rs b/apps/pdfcraft-web/src/main.rs
+index 942057f..4344828 100644
+--- a/apps/pdfcraft-web/src/main.rs
++++ b/apps/pdfcraft-web/src/main.rs
+@@ -66,10 +66,11 @@ fn main() {
+                         {
+                             app.comment_prefs.author = author.chars().take(200).collect();
+                         }
+-                        bridge.listen(app.host_inbox.clone(), cc.egui_ctx.clone());
++                        bridge.listen(app.host_inbox.clone(), app.host_leave_full_screen.clone(), cc.egui_ctx.clone());
+                         app.host_save = Some(bridge.save_fn());
+                         app.host_dirty = Some(bridge.dirty_fn());
+                         app.host_closed = Some(bridge.closed_fn());
++                        app.host_full_screen = Some(bridge.full_screen_fn());
+                         bridge.post_ready();
+                     } else if query_param("host").as_deref() == Some("parent") {
+                         eframe::web_sys::console::warn_1(
+@@ -142,6 +143,9 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+ ///   prompt went away unanswered, or it was an image or text file that became a new PDF) sends
+ ///   only its `id`. The parent can then let go of where the document's saves went.
+ /// - `pdfcraft:dirty` (to the parent): `{ dirty }` whenever unsaved work appears or goes away.
++/// - `pdfcraft:fullScreen` (to the parent): `{ on }` whenever Full screen mode (the page alone)
++///   starts or ends; the browser build can't take the screen itself, the parent can.
++/// - `pdfcraft:leaveFullScreen` (from the parent): leave Full screen mode, as Esc does.
+ /// - `pdfcraft:failed` (to the parent): `{ error }` when the app couldn't start.
+ ///
+ /// Only the parent window on the app's own origin is heard or answered. With a parent on
+@@ -196,8 +200,14 @@ mod host {
+             }
+         }
+ 
+-        /// Hear `pdfcraft:open` from the parent and queue the file like a `?file=` download.
+-        pub fn listen(&self, inbox: pdfcraft_ui_egui::HostInbox, ctx: egui::Context) {
++        /// Hear `pdfcraft:open` from the parent and queue the file like a `?file=` download, and
++        /// `pdfcraft:leaveFullScreen`.
++        pub fn listen(
++            &self,
++            inbox: pdfcraft_ui_egui::HostInbox,
++            leave_full_screen: std::sync::Arc<std::sync::atomic::AtomicBool>,
++            ctx: egui::Context,
++        ) {
+             let parent = self.parent.clone();
+             let origin = self.origin.clone();
+             let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+@@ -205,8 +215,14 @@ mod host {
+                     return;
+                 }
+                 let data = event.data();
+-                if string(&data, "type").as_deref() != Some("pdfcraft:open") {
+-                    return;
++                match string(&data, "type").as_deref() {
++                    Some("pdfcraft:open") => {}
++                    Some("pdfcraft:leaveFullScreen") => {
++                        leave_full_screen.store(true, std::sync::atomic::Ordering::Relaxed);
++                        ctx.request_repaint();
++                        return;
++                    }
++                    _ => return,
+                 }
+                 let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "document.pdf".to_string());
+                 let id = string(&data, "id").filter(|i| !i.is_empty());
+@@ -260,6 +276,19 @@ mod host {
+             })
+         }
+ 
++        pub fn full_screen_fn(&self) -> pdfcraft_ui_egui::HostFullScreenFn {
++            let bridge = self.clone();
++            let mut last = false;
++            Box::new(move |on: bool| {
++                if on != last {
++                    last = on;
++                    if let Some(m) = message(&[("type", "pdfcraft:fullScreen".into()), ("on", on.into())]) {
++                        let _ = bridge.post(&m, None);
++                    }
++                }
++            })
++        }
++
+         pub fn dirty_fn(&self) -> pdfcraft_ui_egui::HostDirtyFn {
+             let bridge = self.clone();
+             let mut last = false;
+diff --git a/crates/ui-egui/src/canvas.rs b/crates/ui-egui/src/canvas.rs
+index f8df86f..9a8733b 100644
+--- a/crates/ui-egui/src/canvas.rs
++++ b/crates/ui-egui/src/canvas.rs
+@@ -509,6 +509,16 @@ pub struct DocView {
+     wheel_boost_y: crate::wheel_boost::WheelBoost,
+     /// Touchpad momentum after the fingers lift (#531).
+     fling: crate::fling::Fling,
++    /// A one-finger drag with the Select tool is scrolling the page (see `touch_pan`).
++    touch_panning: bool,
++    /// The page's glide after a touch scroll is let go, in points per second.
++    touch_fling: Vec2,
++    /// The finger's speed while it scrolls (points per second), and when it last moved. Kept
++    /// here rather than read from egui when the finger lifts: by a slow frame egui's has decayed.
++    touch_velocity: Vec2,
++    touch_moved_at: f64,
++    /// Seconds between the finger's last two moves: how fast frames come on this device.
++    touch_step: f32,
+     pub(crate) auto_scroll: crate::autoscroll::AutoScroll,
+     /// Pages selected in the organize grid or the Pages panel (0-based). Empty means "the current page".
+     pub selected: BTreeSet<usize>,
+@@ -797,6 +807,11 @@ impl DocView {
+             wheel_boost_x: Default::default(),
+             wheel_boost_y: Default::default(),
+             fling: Default::default(),
++            touch_panning: false,
++            touch_fling: Vec2::ZERO,
++            touch_velocity: Vec2::ZERO,
++            touch_moved_at: 0.0,
++            touch_step: 0.0,
+             auto_scroll: Default::default(),
+             selected: BTreeSet::new(),
+             select_anchor: None,
+@@ -3005,6 +3020,11 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+     view.current_scale_tag = tag;
+     let hand = app.quick_tool == QuickTool::Hand;
+     let tool = app.quick_tool;
++    // A finger dragged across the page with the Select tool scrolls it, as on any phone or
++    // tablet. The page widget below senses every drag (text selection), so the ScrollArea's
++    // own drag-to-scroll never gets one. A press on a comment or a form field still goes to
++    // it, a double tap still selects a word, and two fingers pinch-zoom instead.
++    let touch_pan = tool == QuickTool::Select && !preparing && ui.input(|i| i.any_touches() && i.multi_touch().is_none());
+     // Text selection runs for the Select tool and for the markup tools (highlight…).
+     let selects_text = match tool {
+         QuickTool::Comment(t) => t.markup().is_some() || t == comments::CommentTool::ReplaceText,
+@@ -3138,6 +3158,32 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+             }
+         }
++        // A touch scroll let go glides on and slows down, with the friction egui's own
++        // ScrollArea uses; any new press stops it.
++        if ui.input(|i| i.pointer.any_pressed()) {
++            view.touch_fling = Vec2::ZERO;
++        }
++        let now = ui.input(|i| i.time);
++        if view.touch_panning && !resp.dragged() {
++            view.touch_panning = false;
++            // A finger that stopped before it lifted leaves the page where it is. Lifting comes a
++            // frame after the last move at best, and frames are slow on a slow phone.
++            let fresh = ((now - view.touch_moved_at) as f32) < 0.1f32.max(view.touch_step * 2.5);
++            view.touch_fling = if fresh && view.touch_velocity.is_finite() { view.touch_velocity } else { Vec2::ZERO };
++        }
++        if view.touch_fling != Vec2::ZERO {
++            let dt = ui.input(|i| i.stable_dt).min(0.1);
++            let speed = view.touch_fling.length();
++            let slower = speed - 1000.0 * dt;
++            if slower < 20.0 || !speed.is_finite() {
++                view.touch_fling = Vec2::ZERO;
++            } else {
++                ui.scroll_with_delta_animation(view.touch_fling * dt, egui::style::ScrollAnimation::none());
++                view.touch_fling *= slower / speed;
++                ui.ctx().request_repaint();
++            }
++        }
++        let mut comment_grabbed = false;
+         let origin = resp_rect.min - vec2(0.0, y_shift);
+         let painter = ui.painter();
+         let visible = viewport.translate(resp_rect.min.to_vec2());
+@@ -3535,6 +3581,8 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                 view.links.context = Some((i, l.index));
+             }
+             let consumed = on_objects || on_edit_text || on_link || on_content || boxing || on_field || comments::page_input(ui, &resp, &pcx, view);
++            // The Select tool moves and resizes comments by dragging them; a finger does too.
++            comment_grabbed |= touch_pan && comments::select_grabs(ui, &pcx, view);
+ 
+             let preview_target =
+                 (matches!(tool, QuickTool::Select | QuickTool::Fill(_)) && !comments_hidden).then_some(view.comments.selected).flatten();
+@@ -3628,7 +3676,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                             }
+                         }
+                     }
+-                    if resp.drag_started() && press_here && !over_link {
++                    if resp.drag_started() && press_here && !over_link && !touch_pan {
+                         // A drag replaces the selection without passing through none, so a
+                         // re-drag over text whose bar Copy closed would keep the bar hidden.
+                         view.actions_dismissed = None;
+@@ -3645,6 +3693,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                     }
+                     let clicks = if view.clicks > 2 && tool != QuickTool::Select { 1 } else { view.clicks };
+                     if resp.dragged()
++                        && !touch_pan
+                         && let Some(sel) = view.selection.as_mut().filter(|s| s.page == i)
+                     {
+                         match &mut sel.span {
+@@ -3911,6 +3960,28 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                 ui.ctx().request_repaint();
+             }
+         }
++        // Scrolled by a finger: the drag pans, unless it is moving or resizing a comment.
++        if touch_pan && resp.dragged() && !comment_grabbed {
++            // egui reports no motion on the frame a drag starts: take it from the press.
++            let delta = match ui.input(|i| (i.pointer.press_origin(), i.pointer.interact_pos())) {
++                (Some(from), Some(to)) if resp.drag_started() => to - from,
++                _ => resp.drag_delta(),
++            };
++            ui.scroll_with_delta_animation(delta, egui::style::ScrollAnimation::none());
++            if delta != Vec2::ZERO {
++                let dt = (now - view.touch_moved_at) as f32;
++                view.touch_step = if view.touch_panning { dt } else { 0.0 };
++                view.touch_velocity = if view.touch_panning && dt > 0.001 && dt < 0.5 {
++                    // Smoothed over the last few moves, and never faster than a hard flick.
++                    let v = if view.touch_velocity == Vec2::ZERO { delta / dt } else { view.touch_velocity * 0.5 + (delta / dt) * 0.5 };
++                    if v.length() > 8000.0 { v * (8000.0 / v.length()) } else { v }
++                } else {
++                    Vec2::ZERO
++                };
++                view.touch_moved_at = now;
++            }
++            view.touch_panning = true;
++        }
+         // The page navigated to stays current while no page shows more of itself, so the next
+         // page step starts from it rather than from a page further down the screen (#188).
+         // It also stays current while it is wholly on screen: a short page (a cheque) gone to
+@@ -5371,8 +5442,14 @@ fn organize_grid(view: &mut DocView, info: &DocInfo, editable: bool, dirty: bool
+                 if let Some((_, above)) = anchor.filter(|(page, _)| *page == i) {
+                     ui.scroll_to_rect_animation(c.translate(vec2(0.0, -above)), Some(egui::Align::Min), egui::style::ScrollAnimation::none());
+                 }
++                // A finger scrolls the grid, as on any phone, unless it starts on a selected page
++                // (tap to select): only then does it move pages.
++                let scrolls = ui.input(|i| i.any_touches()) && !view.selected.contains(&i);
++                if scrolls && resp.dragged() {
++                    ui.scroll_with_delta_animation(resp.drag_delta(), egui::style::ScrollAnimation::none());
++                }
+                 // Drag pages to move them (the selection, or the page grabbed).
+-                if resp.drag_started() {
++                if resp.drag_started() && !scrolls {
+                     if !view.selected.contains(&i) {
+                         view.selected = [i].into();
+                         view.select_anchor = Some(i);
+@@ -7028,3 +7105,97 @@ trailer << /Root 1 0 R >>
+         h.state_mut().views[0].tiles.clear();
+     }
+ }
++
++#[cfg(test)]
++mod touch_tests {
++    use crate::PdfCraftApp;
++    use egui::{Event, PointerButton, TouchDeviceId, TouchId, TouchPhase, pos2};
++    use egui_kittest::Harness;
++
++    /// A PDF of `pages` Letter pages, each with a line of text.
++    fn long_pdf(pages: usize) -> Vec<u8> {
++        let mut objs = vec![
++            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
++            format!("<< /Type /Pages /Kids [{}] /Count {pages} >>", (0..pages).map(|n| format!("{} 0 R", 4 + 2 * n)).collect::<Vec<_>>().join(" ")),
++            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
++        ];
++        for n in 0..pages {
++            let stream = format!("BT /F1 36 Tf 72 680 Td (Page {}) Tj ET", n + 1);
++            objs.push(format!(
++                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {} 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
++                5 + 2 * n
++            ));
++            objs.push(format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()));
++        }
++        let mut pdf = String::from("%PDF-1.4\n");
++        let mut offsets = Vec::new();
++        for (i, o) in objs.iter().enumerate() {
++            offsets.push(pdf.len());
++            pdf += &format!("{} 0 obj\n{o}\nendobj\n", i + 1);
++        }
++        let xref = pdf.len();
++        pdf += &format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1);
++        for o in offsets {
++            pdf += &format!("{o:010} 00000 n \n");
++        }
++        pdf += &format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1);
++        pdf.into_bytes()
++    }
++
++    /// The top of the first page on screen.
++    fn first_page_top(h: &Harness<'static, PdfCraftApp>) -> f32 {
++        h.state().views[0].screen_rects.iter().find(|(i, _)| *i == 0).map_or(f32::NEG_INFINITY, |(_, r)| r.top())
++    }
++
++    /// A finger drags from y 600 to y 300 in `moves` frames of `step` seconds, rests for `rest`
++    /// frames, then lifts; returns how far the first page moved up once it settles.
++    fn swipe(step: f32, moves: usize, rest: usize) -> f32 {
++        let mut h = Harness::builder().with_size(egui::vec2(900.0, 900.0)).with_step_dt(step).build_eframe(|_| {
++            let mut app = PdfCraftApp::new();
++            app.set_option("language", "en").unwrap();
++            app.open_bytes("long.pdf", None, long_pdf(8)).unwrap();
++            app
++        });
++        h.run_steps(8);
++        let start = first_page_top(&h);
++        let touch = |phase, y: f32| Event::Touch { device_id: TouchDeviceId(1), id: TouchId(1), phase, pos: pos2(550.0, y), force: None };
++        let at = |y: f32| pos2(550.0, y);
++        h.event(touch(TouchPhase::Start, 600.0));
++        h.event(Event::PointerMoved(at(600.0)));
++        h.event(Event::PointerButton { pos: at(600.0), button: PointerButton::Primary, pressed: true, modifiers: Default::default() });
++        h.step();
++        for k in 1..=moves {
++            let y = 600.0 - 300.0 * k as f32 / moves as f32;
++            h.event(touch(TouchPhase::Move, y));
++            h.event(Event::PointerMoved(at(y)));
++            h.step();
++        }
++        for _ in 0..rest {
++            h.step();
++        }
++        h.event(Event::PointerButton { pos: at(300.0), button: PointerButton::Primary, pressed: false, modifiers: Default::default() });
++        h.event(Event::PointerGone);
++        h.event(touch(TouchPhase::End, 300.0));
++        h.run_steps(60);
++        start - first_page_top(&h)
++    }
++
++    #[test]
++    fn a_finger_flick_scrolls_the_page_and_it_glides_on() {
++        // 300 points in a quarter of a second.
++        let moved = swipe(1.0 / 60.0, 15, 0);
++        assert!(moved > 400.0, "a 300 pt flick moved the page {moved} pt");
++    }
++
++    #[test]
++    fn it_glides_on_a_phone_with_slow_frames_too() {
++        let moved = swipe(0.1, 3, 0);
++        assert!(moved > 400.0, "a 300 pt flick at 10 frames a second moved the page {moved} pt");
++    }
++
++    #[test]
++    fn a_finger_that_stops_before_it_lifts_leaves_the_page_there() {
++        let moved = swipe(1.0 / 60.0, 15, 30);
++        assert!((290.0..=310.0).contains(&moved), "a 300 pt drag held still moved the page {moved} pt");
++    }
++}
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 16e3d2f..b4b1fc2 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -438,6 +438,11 @@ pub type HostDirtyFn = Box<dyn FnMut(bool)>;
+ /// new PDF. With it the page can let go of where the document's saves went.
+ pub type HostClosedFn = Box<dyn Fn(Option<&str>, Option<u64>)>;
+ 
++/// Told every frame whether PdfCraft shows the page alone (Full screen mode), so a host page
++/// can take the whole screen for it: the web build can't (eframe ignores
++/// `ViewportCommand::Fullscreen` on the web).
++pub type HostFullScreenFn = Box<dyn FnMut(bool)>;
++
+ pub struct PasswordPrompt {
+     pub name: String,
+     pub path: Option<String>,
+@@ -658,6 +663,10 @@ pub struct PdfCraftApp {
+     pub host_dirty: Option<HostDirtyFn>,
+     /// Reports closed documents to the embedding page (web, see [`HostClosedFn`]).
+     pub host_closed: Option<HostClosedFn>,
++    /// Reports Full screen mode to the embedding page (web, see [`HostFullScreenFn`]).
++    pub host_full_screen: Option<HostFullScreenFn>,
++    /// Set by the embedding page to leave Full screen mode (its Back button, on Android).
++    pub host_leave_full_screen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+     /// Files the embedding page sent (web, see [`HostInbox`]).
+     pub host_inbox: HostInbox,
+     /// The embedding page's id for each document opened from a file it sent ([`HostInbox`]).
+@@ -1041,6 +1050,8 @@ impl PdfCraftApp {
+             host_save: None,
+             host_dirty: None,
+             host_closed: None,
++            host_full_screen: None,
++            host_leave_full_screen: Default::default(),
+             host_inbox: Default::default(),
+             host_ids: Default::default(),
+             close_request: None,
+@@ -3384,6 +3395,14 @@ impl eframe::App for PdfCraftApp {
+                 report(dirty);
+             }
+         }
++        if self.host_leave_full_screen.swap(false, std::sync::atomic::Ordering::Relaxed) && self.full_screen {
++            self.set_full_screen(ctx, false);
++        }
++        // What the window shows: Full screen mode with no document is the usual layout.
++        let page_alone = self.full_screen && self.active.is_some();
++        if let Some(report) = self.host_full_screen.as_mut() {
++            report(page_alone);
++        }
+         self.poll_updates();
+         self.poll_print();
+         // Shortcuts deferred last frame: the text field has taken that frame's typing since.
+diff --git a/crates/ui-egui/src/panels.rs b/crates/ui-egui/src/panels.rs
+index edfe63e..75cca0d 100644
+--- a/crates/ui-egui/src/panels.rs
++++ b/crates/ui-egui/src/panels.rs
+@@ -1303,8 +1303,14 @@ fn pages(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &mut crate::DocVie
+             if rect.intersects(ui.clip_rect().expand(200.0)) {
+                 view.need_thumbnail(i, rect.intersects(ui.clip_rect()));
+             }
++            // A finger scrolls the list, as on any phone, unless it starts on a picked page (a long
++            // press picks one): only then does it move pages.
++            let scrolls = ui.input(|i| i.any_touches()) && !view.selected.contains(&i);
++            if scrolls && resp.dragged() {
++                ui.scroll_with_delta_animation(resp.drag_delta(), egui::style::ScrollAnimation::none());
++            }
+             // Only the primary button drags pages (the middle button scrolls, the secondary one opens the menu).
+-            if resp.drag_started_by(egui::PointerButton::Primary) {
++            if resp.drag_started_by(egui::PointerButton::Primary) && !scrolls {
+                 if !view.target_pages().contains(&i) {
+                     view.click_page(i, egui::Modifiers::NONE, true);
+                 }
