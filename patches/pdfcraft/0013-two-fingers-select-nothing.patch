@@ -1,0 +1,104 @@
+diff --git a/crates/ui-egui/src/canvas.rs b/crates/ui-egui/src/canvas.rs
+index a1bdf7a..df6f081 100644
+--- a/crates/ui-egui/src/canvas.rs
++++ b/crates/ui-egui/src/canvas.rs
+@@ -495,6 +495,9 @@ pub struct DocView {
+     long_pressed: bool,
+     /// The latest press on a page was a finger's (a mouse on the same screen keeps its double click).
+     press_touch: bool,
++    /// A second finger joined the fingers on the page: they scroll or pinch, and select nothing,
++    /// until every finger lifts.
++    two_fingers: bool,
+     viewport_h: f32,
+     page_count: usize,
+     /// Page heights in points (view space), for mapping text positions to scroll offsets.
+@@ -811,6 +814,7 @@ impl DocView {
+             host_compose: None,
+             long_pressed: false,
+             press_touch: false,
++            two_fingers: false,
+             viewport_h: 600.0,
+             page_count: info.pages.len(),
+             page_heights: info.pages.iter().map(|p| p.height).collect(),
+@@ -3305,6 +3309,18 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+         if !resp.dragged_by(egui::PointerButton::Primary) {
+             view.selection_drag = false;
+         }
++        // The browser's pointer is the first finger, so two fingers scrolling or pinching would
++        // drag out a selection with it: a second finger drops the selection that drag began (as a
++        // stroke is dropped, comments.rs) and keeps the rest of it from selecting.
++        if ui.input(|i| i.multi_touch().is_some()) {
++            if !view.two_fingers && view.selection_drag {
++                view.selection = None;
++                view.selection_drag = false;
++            }
++            view.two_fingers = true;
++        } else if !ui.input(|i| i.any_touches()) {
++            view.two_fingers = false;
++        }
+         // The Hand tool pans by this widget's drag, before the pages are laid out (above).
+         if hand {
+             if resp.dragged() {
+@@ -3878,7 +3894,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                             ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((long_press - h).max(0.01)));
+                         }
+                     }
+-                    if resp.drag_started() && press_here && !over_link && !touch_pan {
++                    if resp.drag_started() && press_here && !over_link && !touch_pan && !view.two_fingers {
+                         // A drag replaces the selection without passing through none, so a
+                         // re-drag over text whose bar Copy closed would keep the bar hidden.
+                         view.actions_dismissed = None;
+@@ -3896,6 +3912,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                     let clicks = if view.clicks > 2 && tool != QuickTool::Select { 1 } else { view.clicks };
+                     if resp.dragged()
+                         && !touch_pan
++                        && !view.two_fingers
+                         && let Some(sel) = view.selection.as_mut().filter(|s| s.page == i)
+                     {
+                         match &mut sel.span {
+diff --git a/crates/ui-egui/src/host_chrome.rs b/crates/ui-egui/src/host_chrome.rs
+index beb3bc7..8de82b5 100644
+--- a/crates/ui-egui/src/host_chrome.rs
++++ b/crates/ui-egui/src/host_chrome.rs
+@@ -680,6 +680,41 @@ mod tests {
+         h.run_steps(4);
+     }
+ 
++    #[test]
++    fn two_fingers_landing_together_select_nothing_nor_does_a_tap_after() {
++        let mut h = phone(2);
++        let (word, _) = first_and_last_glyph(&mut h);
++        pen(&mut h, false, false);
++        // Two fingers scroll, the first of them over the text; the browser's pointer is the first.
++        let (a, b) = (word + egui::vec2(0.0, 40.0), word + egui::vec2(120.0, 40.0));
++        finger(&mut h, 1, TouchPhase::Start, a);
++        h.event(Event::PointerMoved(a));
++        h.event(Event::PointerButton { pos: a, button: PointerButton::Primary, pressed: true, modifiers: Default::default() });
++        // Both fingers land in the same frame, as they often do.
++        finger(&mut h, 2, TouchPhase::Start, b);
++        h.step();
++        for k in 1..=4 {
++            let d = egui::vec2(0.0, -10.0 * k as f32);
++            finger(&mut h, 1, TouchPhase::Move, a + d);
++            finger(&mut h, 2, TouchPhase::Move, b + d);
++            h.event(Event::PointerMoved(a + d));
++            h.step();
++        }
++        let end = a + egui::vec2(0.0, -40.0);
++        h.event(Event::PointerButton { pos: end, button: PointerButton::Primary, pressed: false, modifiers: Default::default() });
++        h.event(Event::PointerGone);
++        finger(&mut h, 1, TouchPhase::End, end);
++        finger(&mut h, 2, TouchPhase::End, b + egui::vec2(0.0, -40.0));
++        h.step();
++        assert!(state(&h)["selection"].is_null(), "two fingers scrolling selected nothing: {}", state(&h));
++        // A finger's tap on the word right after: no double tap, no selection.
++        press(&mut h, word);
++        h.step();
++        lift(&mut h, word);
++        h.run_steps(6);
++        assert!(state(&h)["selection"].is_null(), "the tap after the scroll selected nothing: {}", state(&h));
++    }
++
+     /// A pen's drag as the browser sends it: pointer events only, no touch events (the shell keeps
+     /// a pen's contact out of them).
+     fn pen_drag(h: &mut Harness<'static, PdfCraftApp>, from: egui::Pos2, to: egui::Pos2, steps: usize) {

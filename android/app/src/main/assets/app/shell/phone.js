@@ -929,6 +929,11 @@
     let down = null;
     let pending = 0;
     let lastTap = null; // the tap a second one, soon and close by, makes a double tap
+    // Two fingers on the page (a pinch or a two-finger scroll), and when the last of them lifted:
+    // as in Acrobat, a touch in the next 500 ms is the end of that gesture, not a tap or a swipe.
+    let several = false;
+    let severalEnd = -Infinity;
+    const touch = () => shell.touch || { longPress: 400, doubleTap: 300, slop: 8, doubleTapSlop: 100 };
     // A pen near the screen (touching or hovering, and a moment after): a finger's touch then is
     // the hand holding it, and PdfCraft drops it too.
     let penAt = -Infinity;
@@ -942,6 +947,12 @@
       else if (e.type === 'pointerup' || e.type === 'pointercancel') penDown = false;
     };
     doc.addEventListener('pointermove', notePen, true);
+    // The press's recent path, for its sideways speed as it lifts.
+    doc.addEventListener('pointermove', (e) => {
+      if (!down) return;
+      down.moves.push({ x: e.clientX, t: e.timeStamp });
+      if (down.moves.length > 32) down.moves.splice(1, 1);
+    }, true);
     doc.addEventListener('pointerdown', (e) => {
       const palm = e.pointerType === 'touch' && penNear(e);
       notePen(e);
@@ -949,7 +960,7 @@
         palms.add(e.pointerId);
         return;
       }
-      if (e.pointerType === 'touch') fingersDown++;
+      if (e.pointerType === 'touch' && ++fingersDown > 1) several = true;
       // A second tap (of a double tap) waits for its own release.
       clearTimeout(pending);
       // A finger's tap only. With text selected, a tap lets it go (below); otherwise, while
@@ -959,27 +970,40 @@
       const reading = free && state.tool === 'select' && !state.selection && !state.panel && !state.fullScreen;
       // A pen taps as a finger does; it drags to select text, so it never swipes.
       const pen = e.pointerType === 'pen';
-      down = (pen ? fingersDown === 0 : fingersDown === 1 && e.pointerType === 'touch') && (reading || selecting)
-        ? { x: e.clientX, y: e.clientY, t: e.timeStamp, selecting, pen } : null;
+      const settled = !several && e.timeStamp - severalEnd >= 500;
+      down = settled && (pen ? fingersDown === 0 : fingersDown === 1 && e.pointerType === 'touch') && (reading || selecting)
+        ? { x: e.clientX, y: e.clientY, t: e.timeStamp, selecting, pen, moves: [{ x: e.clientX, t: e.timeStamp }] } : null;
       if (!down) lastTap = null;
     }, true);
     const up = (e) => {
       notePen(e);
       if (palms.delete(e.pointerId)) return;
       if (e.pointerType === 'touch') fingersDown = Math.max(0, fingersDown - 1);
+      if (several && fingersDown === 0) {
+        several = false;
+        severalEnd = e.timeStamp;
+      }
       const d = down;
       down = null;
       if (!d || e.type !== 'pointerup') return;
       const dx = e.clientX - d.x;
       const dy = e.clientY - d.y;
+      const t = touch();
       // Single-page view: a quick sideways swipe turns the page (PdfCraft keeps a page zoomed in
-      // past the screen's width for scrolling).
-      if (!d.selecting && !d.pen && !state.continuous && Math.abs(dx) > 60 && Math.abs(dx) > 1.5 * Math.abs(dy) && e.timeStamp - d.t < 700) {
+      // past the screen's width for scrolling). Quick is Acrobat's fling: 500 screen pixels a
+      // second sideways as the finger lifts; a slow drag only moves the page.
+      // Over the path's last 50 ms or more (moves can arrive bunched in one frame), from the
+      // press itself when the path is shorter.
+      const last = d.moves[d.moves.length - 1];
+      const from = d.moves.findLast((m) => last.t - m.t >= 50) || d.moves[0];
+      const speed = Math.abs(last.x - from.x) / Math.max(1, last.t - from.t) * 1000 * (window.devicePixelRatio || 1);
+      if (!d.selecting && !d.pen && !state.continuous && Math.abs(dx) > t.slop && Math.abs(dx) > 1.5 * Math.abs(dy) && speed > 500) {
         lastTap = null;
         post('pdfcraft:turnPage', { forward: dx < 0, swipe: true });
         return;
       }
-      if (Math.hypot(dx, dy) > 12 || e.timeStamp - d.t > 350) {
+      // Android's tap: lifted within its touch slop, before a long press would begin.
+      if (Math.hypot(dx, dy) > t.slop || e.timeStamp - d.t >= t.longPress) {
         lastTap = null;
         return;
       }
@@ -994,8 +1018,8 @@
         return;
       }
       // A double tap zooms in on the text under it, or back out (Acrobat's smart zoom).
-      const wait = shell.touch ? shell.touch.doubleTap : 300;
-      if (lastTap && d.t - lastTap.t <= wait && Math.hypot(d.x - lastTap.x, d.y - lastTap.y) <= 48) {
+      const wait = t.doubleTap;
+      if (lastTap && d.t - lastTap.t <= wait && Math.hypot(d.x - lastTap.x, d.y - lastTap.y) <= t.doubleTapSlop) {
         lastTap = null;
         post('pdfcraft:smartZoom', { x: e.clientX, y: e.clientY });
         return;

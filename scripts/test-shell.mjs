@@ -110,6 +110,12 @@ const results = [];
 function check(name, ok, detail = '') {
   results.push({ name, ok: !!ok });
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`);
+  // On GitHub Actions a failure is also an annotation, readable on the run's page and from the
+  // checks API without the full log.
+  if (!ok && process.env.GITHUB_ACTIONS) {
+    const esc = (s) => String(s).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+    console.log(`::error title=${esc(name).replace(/:/g, '%3A').replace(/,/g, '%2C')}::${esc(detail || name)}`);
+  }
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -402,16 +408,29 @@ try {
     const b = largestPatch(shot, 0, (r, g, bl) => r > 250 && g > 250 && bl > 250);
     return b && { x: b.x0 / scale, y: b.y0 / scale, w: (b.x1 - b.x0 + 1) / scale, h: (b.y1 - b.y0 + 1) / scale };
   };
+  // A slow machine opens a dialog late: wait for its card (it has margins; the page has none),
+  // or for the card to be what `ok` wants.
+  const cardWhen = async (file, ok = () => true, ms = 10000) => {
+    const width = await page.evaluate(() => innerWidth);
+    const end = Date.now() + ms;
+    let c;
+    do {
+      c = await cardOn(file);
+      if (c && c.w < width - 8 && ok(c)) return c;
+      await sleep(400);
+    } while (Date.now() < end);
+    return c;
+  };
   await command('Document properties');
-  const described = await cardOn('2b-properties-description.png');
+  const described = await cardWhen('2b-properties-description.png');
   await page.keyboard.press('Escape');
   await sleep(800);
   await command('Security properties');
-  const secured = await cardOn('2c-properties-security.png');
+  const secured = await cardWhen('2c-properties-security.png');
   // The tabs run along the top of the card, Description first.
   if (secured) await page.mouse.click(secured.x + 60, secured.y + 75);
   await sleep(1500);
-  const switched = await cardOn('2d-properties-security-then-description.png');
+  const switched = await cardWhen('2d-properties-security-then-description.png', (c) => described && Math.abs(c.h - described.h) < 2, 6000);
   // More frames (the pointer moving over the backdrop) for a card that is still on the move.
   for (let i = 0; i < 20; i++) { await page.mouse.move(4 + (i % 2), 4); await sleep(50); }
   const settled = await cardOn('2e-properties-settled.png');
@@ -908,6 +927,8 @@ try {
     await p.tap('#more');
     await settle(() => !document.getElementById('sheet').hidden);
     await sheetRow('View settings');
+    // The sheet slides in; a row tapped before it has been drawn is missed on a slow machine.
+    await settle(() => document.getElementById('sheet').dataset.kind === 'view' && !!document.querySelector('#sheet .row'));
     await sheetRow('Night mode');
     check('View settings ▸ Night mode turns the pages white on black, and back', night && switchOn && await settle(() => window.__state.night === false));
     await p.evaluate(() => window.shell.back());
@@ -947,6 +968,27 @@ try {
     await tapPage();
     const back = await settle(() => !document.body.classList.contains('immersive'), 4000);
     check('a tap on the page hides the bars, another brings them back', hid && back, JSON.stringify({ hid, back }));
+
+    // As in Acrobat, a touch just after two fingers lift (a pinch or a two-finger scroll) ends that
+    // gesture: it is no tap, so the bars stay.
+    {
+      await sleep(600);
+      const b = await p.locator('#app').boundingBox();
+      const [x, y] = [b.x + b.width * 0.5, b.y + b.height * 0.5];
+      const two = (dy) => [{ x: x - 60, y: y + dy, id: 1 }, { x: x + 60, y: y + dy, id: 2 }];
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: two(0) });
+      for (let k = 1; k <= 4; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: two(-15 * k) });
+        await sleep(30);
+      }
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      await sleep(100);
+      await p.touchscreen.tap(b.x + b.width * 0.4, b.y + b.height * 0.5);
+      await sleep(900);
+      const kept = await p.evaluate(() => !document.body.classList.contains('immersive'));
+      check('a tap just after two fingers lift is part of their gesture: the bars stay', kept);
+      await sleep(600);
+    }
 
     // Acrobat's smart zoom: a double tap zooms in on the text under it, another zooms back out;
     // neither hides the bars.
@@ -1025,6 +1067,30 @@ try {
     const single = await settle(() => window.__state.continuous === false, 4000);
     await sleep(800);
     const before = (await st()).page;
+    // A slow sideways drag only moves the page: a swipe has Acrobat's fling speed.
+    let dragged;
+    {
+      const b = await p.locator('#app').boundingBox();
+      const y = b.y + b.height * 0.5;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: b.x + b.width * 0.7, y }] });
+      for (let k = 1; k <= 12; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: b.x + b.width * (0.7 - 0.02 * k), y }] });
+        await sleep(60);
+      }
+      await sleep(500);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      await sleep(1200);
+      dragged = (await st()).page;
+    }
+    // What the page saw of the swipe, for the check's report.
+    await p.evaluate(() => {
+      const d = document.getElementById('app').contentDocument;
+      window.__swipe = [];
+      for (const k of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel']) {
+        d.addEventListener(k, (e) => window.__swipe.length < 40 && window.__swipe.push(`${k.slice(7)} ${Math.round(e.clientX)} ${Math.round(e.timeStamp)}`), true);
+      }
+    });
+    const stateBeforeSwipe = await st();
     {
       const b = await p.locator('#app').boundingBox();
       const y = b.y + b.height * 0.5;
@@ -1036,6 +1102,7 @@ try {
       await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
     }
     const swiped = await settle(() => window.__state.page === 4, 4000);
+    const swipeSeen = await p.evaluate(() => window.__swipe.join(', '));
     await sleep(600);
     {
       const b = await p.locator('#app').boundingBox();
@@ -1043,8 +1110,9 @@ try {
     }
     const edged = await settle(() => window.__state.page === 3, 4000);
     await sleep(500);
+    check('single-page view: a slow sideways drag turns no page', dragged === before, JSON.stringify({ before, dragged }));
     check('single-page view: a swipe turns to the next page, a tap at the left edge back', single && swiped && edged
-      && await p.evaluate(() => !document.body.classList.contains('immersive')), JSON.stringify({ single, before, swiped, edged, page: (await st()).page }));
+      && await p.evaluate(() => !document.body.classList.contains('immersive')), JSON.stringify({ single, before, swiped, edged, page: (await st()).page, selection: stateBeforeSwipe.selection, tool: stateBeforeSwipe.tool, dpr: await p.evaluate(() => devicePixelRatio), swipeSeen }));
     await tellApp({ type: 'pdfcraft:command', id: 'view.continuous' });
     await settle(() => window.__state.continuous === true, 4000);
 
@@ -1145,34 +1213,49 @@ try {
       const [x0, x1, y] = [fb.x + fb.width * 0.15, fb.x + fb.width * 0.7, fb.y + fb.height * fy];
       await penEvent('mouseMoved', x0, y, false);
       await penEvent('mousePressed', x0, y, true);
-      for (let k = 1; k <= 6; k++) {
-        await penEvent('mouseMoved', x0 + (x1 - x0) * k / 6, y, true);
-        await sleep(30);
+      // A stroke spans several frames, as a hand's does; a press and release within one frame
+      // is a click to PdfCraft, not a drag.
+      for (let k = 1; k <= 12; k++) {
+        await penEvent('mouseMoved', x0 + (x1 - x0) * k / 12, y, true);
+        await sleep(60);
       }
       await penEvent('mouseReleased', x1, y, false);
     };
-    let row = 0.37;
-    let selected = false;
-    for (const fy of [0.37, 0.33, 0.4, 0.42, 0.3]) {
-      await penStroke(fy);
-      selected = await settle(() => !!(window.__state.selection && window.__state.selection.text), 3000);
-      if (selected) {
-        row = fy;
-        break;
+    const row = 0.37;
+    // In the Select tool the pen scrolls the page by a drag (a finger holds a word to select it).
+    const pageBeforePen = (await st()).page;
+    const penScroll = async () => {
+      const [x, y0, y1] = [fb.x + fb.width * 0.5, fb.y + fb.height * 0.8, fb.y + fb.height * 0.3];
+      await penEvent('mouseMoved', x, y0, false);
+      await penEvent('mousePressed', x, y0, true);
+      for (let k = 1; k <= 8; k++) {
+        await penEvent('mouseMoved', x, y0 + (y1 - y0) * k / 8, true);
+        await sleep(30);
       }
-    }
-    check('a pen run over text selects it at once, with no hold', selected, JSON.stringify((await st()).selection));
-    check('... and the shell remembers that a pen is used here', (await st()).pen === true
-      && await p.evaluate(() => localStorage.getItem('shell.pen') === '1'));
-    await p.evaluate(() => window.shell.back());
-    await settle(() => !window.__state.selection, 3000);
+      await penEvent('mouseReleased', x, y1, false);
+    };
+    await penScroll();
+    await penScroll();
+    const penScrolled = await p.waitForFunction((from) => window.__state.page !== from, pageBeforePen, { timeout: 4000 }).then(() => true, () => false);
+    check('a pen drag in the Select tool scrolls the page, and selects nothing', penScrolled && !(await st()).selection && (await st()).pen === true,
+      JSON.stringify({ pageBeforePen, page: (await st()).page, selection: (await st()).selection, pen: (await st()).pen }));
+    check('... and the shell remembers that a pen is used here', await p.evaluate(() => localStorage.getItem('shell.pen') === '1'));
+    // The pen's scroll glides on after it lifts; back to page 1 once it has stopped, or the glide
+    // would carry the page on under the strokes below.
+    await sleep(2000);
+    await p.evaluate(() => document.getElementById('app').contentWindow.postMessage({ type: 'pdfcraft:gotoPage', page: 1 }, location.origin));
+    await settle(() => window.__state.page === 1, 4000);
 
     await p.tap('#bottombar [data-item="highlight"]');
     await settle(() => window.__state.tool === 'comment.highlight');
     const hint = await p.evaluate(() => document.getElementById('hint').textContent);
     await sleep(2500); // the hint has gone, and the pen's first sight of the page with it
-    await penStroke(row);
-    const highlighted = await settle(() => window.__state.undo === true, 4000);
+    let highlighted = false;
+    for (const fy of [row, 0.33, 0.4, 0.42, 0.3]) {
+      await penStroke(fy);
+      highlighted = await settle(() => window.__state.undo === true, 3000);
+      if (highlighted) break;
+    }
     check('with the highlighter, the pen highlights what it runs over, and the hint says so', highlighted && hint.includes('pen'),
       JSON.stringify({ highlighted, hint }));
     const fingerDrag = async () => {

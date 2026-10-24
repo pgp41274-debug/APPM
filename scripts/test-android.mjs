@@ -131,6 +131,12 @@ const results = [];
 function check(name, ok, detail = '') {
   results.push({ name, ok: !!ok });
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`);
+  // On GitHub Actions a failure is also an annotation, readable on the run's page and from the
+  // checks API without the full log.
+  if (!ok && process.env.GITHUB_ACTIONS) {
+    const esc = (s) => String(s).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+    console.log(`::error title=${esc(name).replace(/:/g, '%3A').replace(/,/g, '%2C')}::${esc(detail || name)}`);
+  }
 }
 
 /** A small one-page PDF with `text` on it. */
