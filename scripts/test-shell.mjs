@@ -956,6 +956,27 @@ try {
     const back = await settle(() => !document.body.classList.contains('immersive'), 4000);
     check('a tap on the page hides the bars, another brings them back', hid && back, JSON.stringify({ hid, back }));
 
+    // As in Acrobat, a touch just after two fingers lift (a pinch or a two-finger scroll) ends that
+    // gesture: it is no tap, so the bars stay.
+    {
+      await sleep(600);
+      const b = await p.locator('#app').boundingBox();
+      const [x, y] = [b.x + b.width * 0.5, b.y + b.height * 0.5];
+      const two = (dy) => [{ x: x - 60, y: y + dy, id: 1 }, { x: x + 60, y: y + dy, id: 2 }];
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: two(0) });
+      for (let k = 1; k <= 4; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: two(-15 * k) });
+        await sleep(30);
+      }
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      await sleep(100);
+      await p.touchscreen.tap(b.x + b.width * 0.4, b.y + b.height * 0.5);
+      await sleep(900);
+      const kept = await p.evaluate(() => !document.body.classList.contains('immersive'));
+      check('a tap just after two fingers lift is part of their gesture: the bars stay', kept);
+      await sleep(600);
+    }
+
     // Acrobat's smart zoom: a double tap zooms in on the text under it, another zooms back out;
     // neither hides the bars.
     const touchTap = (x, y) => Promise.all([
@@ -1033,6 +1054,21 @@ try {
     const single = await settle(() => window.__state.continuous === false, 4000);
     await sleep(800);
     const before = (await st()).page;
+    // A slow sideways drag only moves the page: a swipe has Acrobat's fling speed.
+    let dragged;
+    {
+      const b = await p.locator('#app').boundingBox();
+      const y = b.y + b.height * 0.5;
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: b.x + b.width * 0.7, y }] });
+      for (let k = 1; k <= 12; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: b.x + b.width * (0.7 - 0.02 * k), y }] });
+        await sleep(60);
+      }
+      await sleep(500);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      await sleep(1200);
+      dragged = (await st()).page;
+    }
     {
       const b = await p.locator('#app').boundingBox();
       const y = b.y + b.height * 0.5;
@@ -1051,6 +1087,7 @@ try {
     }
     const edged = await settle(() => window.__state.page === 3, 4000);
     await sleep(500);
+    check('single-page view: a slow sideways drag turns no page', dragged === before, JSON.stringify({ before, dragged }));
     check('single-page view: a swipe turns to the next page, a tap at the left edge back', single && swiped && edged
       && await p.evaluate(() => !document.body.classList.contains('immersive')), JSON.stringify({ single, before, swiped, edged, page: (await st()).page }));
     await tellApp({ type: 'pdfcraft:command', id: 'view.continuous' });

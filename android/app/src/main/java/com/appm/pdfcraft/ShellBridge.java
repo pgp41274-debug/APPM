@@ -193,14 +193,19 @@ final class ShellBridge {
     /**
      * Android's touch timings, in milliseconds: how long a finger rests before a press is a long
      * press (Settings ▸ Accessibility ▸ Touch & hold delay), and the most time between the taps
-     * of a double tap.
+     * of a double tap. Also its distances, in dp (the page's CSS pixels): how far a finger moves
+     * before a press is a drag, and how far apart a double tap's taps may land.
      */
     @JavascriptInterface
     public String touchTimings() {
         JSONObject o = new JSONObject();
+        ViewConfiguration config = ViewConfiguration.get(activity);
+        float density = activity.getResources().getDisplayMetrics().density;
         try {
             o.put("longPress", ViewConfiguration.getLongPressTimeout());
             o.put("doubleTap", ViewConfiguration.getDoubleTapTimeout());
+            o.put("slop", config.getScaledTouchSlop() / density);
+            o.put("doubleTapSlop", config.getScaledDoubleTapSlop() / density);
         } catch (JSONException ignored) {
             // put() with String keys never throws here.
         }

@@ -439,9 +439,9 @@
     if (frame.contentWindow) frame.contentWindow.postMessage({ type: 'pdfcraft:leaveFullScreen' }, origin);
   }
 
-  /** Android's touch timings (ms), or its defaults outside the app. */
+  /** Android's touch timings (ms) and distances (CSS px), or its defaults outside the app. */
   function touchTimings() {
-    const timings = { longPress: 400, doubleTap: 300 };
+    const timings = { longPress: 400, doubleTap: 300, slop: 8, doubleTapSlop: 100 };
     try {
       const t = android && android.touchTimings ? JSON.parse(android.touchTimings()) : {};
       for (const k of Object.keys(timings)) if (Number.isFinite(t[k]) && t[k] > 0) timings[k] = t[k];
