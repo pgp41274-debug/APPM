@@ -1,0 +1,204 @@
+diff --git a/apps/pdfcraft-web/src/main.rs b/apps/pdfcraft-web/src/main.rs
+index 4957cf5..0027c4f 100644
+--- a/apps/pdfcraft-web/src/main.rs
++++ b/apps/pdfcraft-web/src/main.rs
+@@ -136,6 +136,8 @@ fn watch_pointer_type(
+     let pen_down = Rc::new(Cell::new(false));
+     // The touches taken for the hand, dropped until they end.
+     let palms: Rc<RefCell<Vec<i32>>> = Rc::default();
++    // The touches a pen made, as touch events report them (`touchType` "stylus").
++    let pens: Rc<RefCell<Vec<i32>>> = Rc::default();
+     let near = {
+         let (pen_at, pen_down) = (pen_at.clone(), pen_down.clone());
+         move |now: f64| pen_down.get() || now - pen_at.get() < PEN_NEAR_MS
+@@ -155,6 +157,7 @@ fn watch_pointer_type(
+                 pen_at.set(now);
+                 // The S Pen's side button reads as the barrel button (2), an eraser end as 32.
+                 let held = (num(e, "buttons") as u32) & (2 | 32) != 0;
++                button.store(held, Relaxed);
+                 match ty.as_str() {
+                     "pointerdown" => {
+                         pen_down.set(true);
+@@ -167,7 +170,6 @@ fn watch_pointer_type(
+                             event.stop_immediate_propagation();
+                         }
+                     }
+-                    "pointermove" if pen_down.get() => button.store(held, Relaxed),
+                     "pointerup" | "pointercancel" => pen_down.set(false),
+                     _ => {}
+                 }
+@@ -187,7 +189,7 @@ fn watch_pointer_type(
+         })
+     };
+     let on_touch = {
+-        let palms = palms.clone();
++        let (palms, pens) = (palms.clone(), pens.clone());
+         Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+             let e: &JsValue = event.as_ref();
+             let changed = get(e, "changedTouches");
+@@ -196,15 +198,26 @@ fn watch_pointer_type(
+                 .map(|k| js_sys::Reflect::get_u32(&changed, k).unwrap_or(JsValue::UNDEFINED))
+                 .map(|t| (num(&t, "identifier") as i32, text(&t, "touchType") == "stylus"))
+                 .collect();
++            let kind = event.type_();
++            let now = event.time_stamp();
+             let mut palms = palms.borrow_mut();
+-            if event.type_() == "touchstart" && near(event.time_stamp()) {
+-                palms.extend(touches.iter().filter(|(_, stylus)| !stylus).map(|(id, _)| *id));
++            let mut pens = pens.borrow_mut();
++            if kind == "touchstart" {
++                if near(now) {
++                    palms.extend(touches.iter().filter(|(_, stylus)| !stylus).map(|(id, _)| *id));
++                }
++                pens.extend(touches.iter().filter(|(_, stylus)| *stylus).map(|(id, _)| *id));
+             }
++            // A pen's contact is the pointer events' business alone: as a touch it would look like
++            // a second finger (two fingers scroll and pinch, and end a stroke), and egui would hold
++            // it as a long press. Its pointer events still come through.
++            let all_pen = !touches.is_empty() && touches.iter().all(|(id, stylus)| *stylus || pens.contains(id));
+             let all_palms = !touches.is_empty() && touches.iter().all(|(id, _)| palms.contains(id));
+-            if matches!(event.type_().as_str(), "touchend" | "touchcancel") {
++            if matches!(kind.as_str(), "touchend" | "touchcancel") {
+                 palms.retain(|id| !touches.iter().any(|(t, _)| t == id));
++                pens.retain(|id| !touches.iter().any(|(t, _)| t == id));
+             }
+-            if all_palms {
++            if all_pen || all_palms {
+                 stop(&event);
+             }
+         })
+diff --git a/crates/ui-egui/src/canvas.rs b/crates/ui-egui/src/canvas.rs
+index e02f6a1..a1bdf7a 100644
+--- a/crates/ui-egui/src/canvas.rs
++++ b/crates/ui-egui/src/canvas.rs
+@@ -3170,9 +3170,14 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+     // it, a double tap still selects a word (not for a finger when a host draws the controls: there
+     // only a finger held on a word selects), and two fingers pinch-zoom instead.
+     // Once a pen has been used, a finger scrolls with the comment tools and marks nothing (as in
+-    // Xodo and Samsung Notes): the pen draws and highlights. A pen never scrolls; it selects text.
++    // Xodo and Samsung Notes): the pen draws and highlights. In the Select tool the pen scrolls the
++    // page by a drag, as a finger does; it selects text only in the markup tools, and a finger
++    // holds a word to select it.
+     let finger_scrolls = tool == QuickTool::Select || (pen_seen && matches!(tool, QuickTool::Comment(_)));
+-    let touch_pan = finger_scrolls && !pointer_pen && !preparing && ui.input(|i| i.any_touches() && i.multi_touch().is_none());
++    let pen_scrolls = pointer_pen && tool == QuickTool::Select && !preparing;
++    let touch_pan = finger_scrolls
++        && !preparing
++        && (pen_scrolls || (!pointer_pen && ui.input(|i| i.any_touches() && i.multi_touch().is_none())));
+     // Such a finger leaves the tool alone: the page only scrolls under it.
+     let finger_only_scrolls = touch_pan && tool != QuickTool::Select;
+     // Text selection runs for the Select tool and for the markup tools (highlight…).
+@@ -3860,7 +3865,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                     // egui lets go of a finger held past its 0.8 s for a click (it becomes a long
+                     // touch), so a longer host delay asks whether that finger is still down.
+                     let down = resp.is_pointer_button_down_on() || (view.press_touch && ui.input(|inp| inp.pointer.primary_down()));
+-                    if touch_pan && !finger_only_scrolls && over_text && !over_link && !view.long_pressed && !view.touch_panning && down {
++                    if touch_pan && !pointer_pen && !finger_only_scrolls && over_text && !over_link && !view.long_pressed && !view.touch_panning && down {
+                         let (start, origin) = ui.input(|inp| (inp.pointer.press_start_time(), inp.pointer.press_origin()));
+                         let held = start.map(|t0| ui.input(|inp| inp.time) - t0);
+                         let still = origin.is_some_and(|o| r.contains(o) && o.distance(p) <= 10.0);
+diff --git a/crates/ui-egui/src/host_chrome.rs b/crates/ui-egui/src/host_chrome.rs
+index c96156c..beb3bc7 100644
+--- a/crates/ui-egui/src/host_chrome.rs
++++ b/crates/ui-egui/src/host_chrome.rs
+@@ -666,7 +666,7 @@ mod tests {
+         h.state().host_pointer_touch.store(!pen, Relaxed);
+     }
+ 
+-    /// A press at `from` dragged to `to` in `steps` frames, then lifted.
++    /// A press at `from` dragged to `to` in `steps` frames, then lifted, as a finger sends it.
+     fn drag(h: &mut Harness<'static, PdfCraftApp>, from: egui::Pos2, to: egui::Pos2, steps: usize) {
+         press(h, from);
+         h.step();
+@@ -680,6 +680,22 @@ mod tests {
+         h.run_steps(4);
+     }
+ 
++    /// A pen's drag as the browser sends it: pointer events only, no touch events (the shell keeps
++    /// a pen's contact out of them).
++    fn pen_drag(h: &mut Harness<'static, PdfCraftApp>, from: egui::Pos2, to: egui::Pos2, steps: usize) {
++        h.event(Event::PointerMoved(from));
++        h.event(Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers: Default::default() });
++        h.step();
++        for k in 1..=steps {
++            let at = from + (to - from) * (k as f32 / steps as f32);
++            h.event(Event::PointerMoved(at));
++            h.step();
++        }
++        h.event(Event::PointerButton { pos: to, button: PointerButton::Primary, pressed: false, modifiers: Default::default() });
++        h.event(Event::PointerGone);
++        h.run_steps(4);
++    }
++
+     fn inks(h: &Harness<'static, PdfCraftApp>) -> usize {
+         let app = h.state();
+         app.session.get(app.views[0].id).map_or(0, |d| d.info.annotations.iter().filter(|a| a.subtype == "Ink").count())
+@@ -690,24 +706,43 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn a_pen_selects_text_as_it_moves_with_no_hold_first() {
++    fn a_pen_drag_in_the_select_tool_scrolls_the_page_and_selects_nothing() {
++        let mut h = phone(8);
++        pen(&mut h, true, false);
++        let before = page_top(&h);
++        pen_drag(&mut h, pos2(200.0, 600.0), pos2(200.0, 300.0), 10);
++        h.run_steps(8);
++        assert!(before - page_top(&h) > 150.0, "the pen scrolled the page ({})", before - page_top(&h));
++        assert!(state(&h)["selection"].is_null(), "and selected nothing: {}", state(&h));
++        assert_eq!(state(&h)["pen"], true, "the host hears a pen is in use");
++    }
++
++    #[test]
++    fn a_pen_run_over_text_with_the_highlighter_highlights_it_with_no_hold_first() {
+         let mut h = phone(2);
+         let (first, last) = first_and_last_glyph(&mut h);
+-        let before = page_top(&h);
+         pen(&mut h, true, false);
+-        // Quicker than any long press: a finger would scroll here.
+-        drag(&mut h, first, last, 2);
+-        let s = state(&h);
+-        assert!(s["selection"]["text"].as_str().is_some_and(|t| t.starts_with("Page")), "the pen selected the text it crossed: {s}");
+-        assert_eq!(s["pen"], true, "and the host hears a pen is in use");
+-        assert!((page_top(&h) - before).abs() < 1.0, "the page did not scroll");
+-        // With the highlighter, the same quick stroke highlights what it crossed.
+-        ask(&mut h, HostRequest::Select);
+         ask(&mut h, HostRequest::Command("comment.highlight".into()));
+-        drag(&mut h, first, last, 2);
++        pen_drag(&mut h, first, last, 3);
+         let app = h.state();
+         let marks = app.session.get(app.views[0].id).map_or(0, |d| d.info.annotations.iter().filter(|a| a.subtype == "Highlight").count());
+-        assert_eq!(marks, 1, "the pen highlighted the text: {}", state(&h));
++        assert_eq!(marks, 1, "the pen highlighted the text it ran over: {}", state(&h));
++        assert_eq!(state(&h)["undo"], true);
++    }
++
++    #[test]
++    fn a_pen_held_still_on_text_in_the_select_tool_does_not_select_it() {
++        let mut h = phone(2);
++        let (word, _) = first_and_last_glyph(&mut h);
++        h.state_mut().host_long_press = 0.5;
++        pen(&mut h, true, false);
++        h.event(Event::PointerMoved(word));
++        h.event(Event::PointerButton { pos: word, button: PointerButton::Primary, pressed: true, modifiers: Default::default() });
++        h.run_steps(12);
++        h.event(Event::PointerButton { pos: word, button: PointerButton::Primary, pressed: false, modifiers: Default::default() });
++        h.event(Event::PointerGone);
++        h.run_steps(4);
++        assert!(state(&h)["selection"].is_null(), "a pen held still selected nothing: {}", state(&h));
+     }
+ 
+     #[test]
+@@ -722,10 +757,10 @@ mod tests {
+         assert_eq!(inks(&h), 0);
+         // The pen draws; held, its side button turns it into the eraser for that stroke.
+         pen(&mut h, true, false);
+-        drag(&mut h, pos2(120.0, 300.0), pos2(260.0, 340.0), 6);
++        pen_drag(&mut h, pos2(120.0, 300.0), pos2(260.0, 340.0), 6);
+         assert_eq!(inks(&h), 1, "the pen drew");
+         pen(&mut h, true, true);
+-        drag(&mut h, pos2(110.0, 298.0), pos2(270.0, 342.0), 12);
++        pen_drag(&mut h, pos2(110.0, 298.0), pos2(270.0, 342.0), 12);
+         assert_eq!(inks(&h), 0, "the side button rubbed the drawing out");
+         // From then on a finger only scrolls.
+         pen(&mut h, false, false);

@@ -1151,28 +1151,38 @@ try {
       }
       await penEvent('mouseReleased', x1, y, false);
     };
-    let row = 0.37;
-    let selected = false;
-    for (const fy of [0.37, 0.33, 0.4, 0.42, 0.3]) {
-      await penStroke(fy);
-      selected = await settle(() => !!(window.__state.selection && window.__state.selection.text), 3000);
-      if (selected) {
-        row = fy;
-        break;
+    const row = 0.37;
+    // In the Select tool the pen scrolls the page by a drag (a finger holds a word to select it).
+    const pageBeforePen = (await st()).page;
+    const penScroll = async () => {
+      const [x, y0, y1] = [fb.x + fb.width * 0.5, fb.y + fb.height * 0.8, fb.y + fb.height * 0.3];
+      await penEvent('mouseMoved', x, y0, false);
+      await penEvent('mousePressed', x, y0, true);
+      for (let k = 1; k <= 8; k++) {
+        await penEvent('mouseMoved', x, y0 + (y1 - y0) * k / 8, true);
+        await sleep(30);
       }
-    }
-    check('a pen run over text selects it at once, with no hold', selected, JSON.stringify((await st()).selection));
-    check('... and the shell remembers that a pen is used here', (await st()).pen === true
-      && await p.evaluate(() => localStorage.getItem('shell.pen') === '1'));
-    await p.evaluate(() => window.shell.back());
-    await settle(() => !window.__state.selection, 3000);
+      await penEvent('mouseReleased', x, y1, false);
+    };
+    await penScroll();
+    await penScroll();
+    const penScrolled = await p.waitForFunction((from) => window.__state.page !== from, pageBeforePen, { timeout: 4000 }).then(() => true, () => false);
+    check('a pen drag in the Select tool scrolls the page, and selects nothing', penScrolled && !(await st()).selection && (await st()).pen === true,
+      JSON.stringify({ pageBeforePen, page: (await st()).page, selection: (await st()).selection, pen: (await st()).pen }));
+    check('... and the shell remembers that a pen is used here', await p.evaluate(() => localStorage.getItem('shell.pen') === '1'));
+    await p.evaluate(() => document.getElementById('app').contentWindow.postMessage({ type: 'pdfcraft:gotoPage', page: 1 }, location.origin));
+    await settle(() => window.__state.page === 1, 4000);
 
     await p.tap('#bottombar [data-item="highlight"]');
     await settle(() => window.__state.tool === 'comment.highlight');
     const hint = await p.evaluate(() => document.getElementById('hint').textContent);
     await sleep(2500); // the hint has gone, and the pen's first sight of the page with it
-    await penStroke(row);
-    const highlighted = await settle(() => window.__state.undo === true, 4000);
+    let highlighted = false;
+    for (const fy of [row, 0.33, 0.4, 0.42, 0.3]) {
+      await penStroke(fy);
+      highlighted = await settle(() => window.__state.undo === true, 3000);
+      if (highlighted) break;
+    }
     check('with the highlighter, the pen highlights what it runs over, and the hint says so', highlighted && hint.includes('pen'),
       JSON.stringify({ highlighted, hint }));
     const fingerDrag = async () => {
