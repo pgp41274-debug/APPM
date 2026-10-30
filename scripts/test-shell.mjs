@@ -435,10 +435,15 @@ try {
   for (let i = 0; i < 20; i++) { await page.mouse.move(4 + (i % 2), 4); await sleep(50); }
   const settled = await cardOn('2e-properties-settled.png');
   const size = (c) => c && `${c.w.toFixed(0)} x ${c.h.toFixed(0)}`;
-  check('a dialog\'s card grows to fit what it shows (Properties: Security, then Description)',
-    described && secured && switched && settled && secured.h < described.h - 40 && Math.abs(switched.h - described.h) < 2
-      && ['x', 'y', 'w', 'h'].every((k) => Math.abs(settled[k] - switched[k]) < 1),
+  const grew = described && secured && switched && settled && secured.h < described.h - 40 && Math.abs(switched.h - described.h) < 2
+    && ['x', 'y', 'w', 'h'].every((k) => Math.abs(settled[k] - switched[k]) < 1);
+  check('a dialog\'s card grows to fit what it shows (Properties: Security, then Description)', grew,
     `Description ${size(described)} pt, Security ${size(secured)}, then Description ${size(switched)} and ${size(settled)} later`);
+  // CI's screenshots are an artifact a reader may not reach; the screen goes in the log as well.
+  if (!grew && process.env.GITHUB_ACTIONS) {
+    const jpeg = await page.screenshot({ scale: 'css', type: 'jpeg', quality: 40 });
+    console.log(`SCREEN 2e-properties-settled.jpg ${jpeg.toString('base64')}`);
+  }
   await page.keyboard.press('Escape');
   await sleep(800);
 

@@ -371,7 +371,7 @@ index 067e524..e6d2ae6 100644
                  let opposite = corner.map(|k| corners[3 - k]);
                  if let Some(s) = view.image_selection.as_mut() {
 diff --git a/crates/ui-egui/src/host_chrome.rs b/crates/ui-egui/src/host_chrome.rs
-index c563fd1..2ff248b 100644
+index c563fd1..1b263eb 100644
 --- a/crates/ui-egui/src/host_chrome.rs
 +++ b/crates/ui-egui/src/host_chrome.rs
 @@ -24,6 +24,28 @@ fn panel_named(name: &str) -> Option<RightPanel> {
@@ -383,14 +383,14 @@ index c563fd1..2ff248b 100644
 +const TOUCH_ROW: f32 = 36.0;
 +
 +/// Size the stock controls for a finger, once for each theme egui keeps a style for (a theme
-+/// change sets them afresh, so this runs every frame and returns at once when it is done).
++/// change sets them afresh, so this runs every frame and returns at once when it is done). Only
++/// heights grow: wider buttons would push a dialog's row of tabs past a phone's width.
 +fn touch_sized(ctx: &egui::Context) {
 +    if ctx.global_style().spacing.interact_size.y >= TOUCH_ROW {
 +        return;
 +    }
 +    ctx.all_styles_mut(|s| {
 +        s.spacing.interact_size.y = TOUCH_ROW;
-+        s.spacing.button_padding = egui::vec2(12.0, 8.0);
 +        s.spacing.item_spacing.y = s.spacing.item_spacing.y.max(8.0);
 +        s.spacing.icon_width = 20.0;
 +        s.spacing.icon_width_inner = 12.0;
