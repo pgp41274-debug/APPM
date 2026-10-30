@@ -1209,7 +1209,13 @@ try {
       }
     });
     const stateBeforeSwipe = await st();
-    {
+    // A slow machine (CI draws in software) can hand the page a quick swipe's moves a third of a
+    // second apart, which is a slow drag to the shell as it would be on a phone. A swipe the page
+    // saw that slowly is made again (a few times) before it counts as failed.
+    let swiped = false;
+    let swipeSeen = '';
+    for (let attempt = 0; attempt < 3 && !swiped; attempt++) {
+      await p.evaluate(() => { window.__swipe.length = 0; });
       const b = await p.locator('#app').boundingBox();
       const y = b.y + b.height * 0.5;
       await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: b.x + b.width * 0.8, y }] });
@@ -1218,9 +1224,13 @@ try {
         await sleep(25);
       }
       await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      swiped = await settle(() => window.__state.page === 4, 4000);
+      swipeSeen += `${attempt ? ' | ' : ''}${await p.evaluate(() => window.__swipe.join(', '))}`;
+      const times = await p.evaluate(() => window.__swipe.filter((m) => !m.startsWith('down')).map((m) => +m.split(' ').at(-1)));
+      const slowest = Math.max(0, ...times.slice(1).map((t, i) => t - times[i]));
+      if (swiped || slowest <= 120) break;
+      await sleep(800);
     }
-    const swiped = await settle(() => window.__state.page === 4, 4000);
-    const swipeSeen = await p.evaluate(() => window.__swipe.join(', '));
     await sleep(600);
     {
       const b = await p.locator('#app').boundingBox();
