@@ -1,0 +1,616 @@
+diff --git a/apps/pdfcraft-web/src/main.rs b/apps/pdfcraft-web/src/main.rs
+index 9d2e2c6..109eaa2 100644
+--- a/apps/pdfcraft-web/src/main.rs
++++ b/apps/pdfcraft-web/src/main.rs
+@@ -302,7 +302,8 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+ ///   opacity }` for the current comment tool. `pdfcraft:selection`: `{ action }` on the text
+ ///   selection (`note`, `highlight`, `underline`, `strikeout`, `replace`, `clear`), and
+ ///   `pdfcraft:selectionHandle`: `{ end, x, y }` moves one of its ends (`{ done: true }` when
+-///   the finger lifts). `pdfcraft:composerText`:
++///   the finger lifts). `pdfcraft:comment`: `{ action, color }` on the selected comment
++///   (`edit`, `color` with `"#rrggbb"`, `delete`, `clear`). `pdfcraft:composerText`:
+ ///   `{ text }` and `pdfcraft:composerDone`: `{ post }` write the comment being added.
+ ///   `pdfcraft:find`: `{ query }`, `pdfcraft:findStep`: `{ forward }`, `pdfcraft:findClose`.
+ ///   `pdfcraft:night`: `{ on }`. `pdfcraft:share` asks for `pdfcraft:share` (to the parent):
+@@ -405,6 +406,10 @@ mod host {
+                                 (_, _, true) => Some(HostRequest::SelectionHandle { end: boolean(&data, "end"), x: f32::NAN, y: f32::NAN, done: true }),
+                                 _ => None,
+                             },
++                            "pdfcraft:comment" => string(&data, "action").map(|action| HostRequest::Comment {
++                                action,
++                                color: string(&data, "color").and_then(|c| hex_color(&c)),
++                            }),
+                             "pdfcraft:composerText" => string(&data, "text").map(HostRequest::ComposerText),
+                             "pdfcraft:composerDone" => Some(HostRequest::ComposerDone(boolean(&data, "post"))),
+                             "pdfcraft:find" => string(&data, "query").map(HostRequest::Find),
+diff --git a/crates/ui-egui/src/canvas.rs b/crates/ui-egui/src/canvas.rs
+index 56ec141..1a5f36c 100644
+--- a/crates/ui-egui/src/canvas.rs
++++ b/crates/ui-egui/src/canvas.rs
+@@ -1386,6 +1386,54 @@ impl DocView {
+         (!words.is_empty()).then(|| (bounds, *first, *last, words))
+     }
+ 
++    /// The selected comment on screen (points), while its page is drawn and no drag is moving or
++    /// resizing it: its box, and the comment. A phone shows what to do with it there.
++    pub(crate) fn comment_on_screen<'a>(&self, info: &'a DocInfo) -> Option<(Rect, &'a pdfcraft_render::Annotation)> {
++        let (page, index) = self.comments.selected?;
++        if self.comments.gesture.is_some() || self.comments.composer.is_some() {
++            return None;
++        }
++        let a = info.annotations.iter().find(|a| a.page == page && a.index == index && a.in_reply_to.is_none())?;
++        let xf = self.page_xform(page)?;
++        let rect = xf.user_rect(info, page, a.rect);
++        rect.intersects(self.viewport_screen).then_some((rect, a))
++    }
++
++    /// Act on the selected comment, from a phone's card: `edit` its text, `color` it, `delete`
++    /// it, or `clear` the selection. `false` for an action PdfCraft doesn't know.
++    pub(crate) fn host_comment_action(&mut self, name: &str, color: Option<[f64; 3]>, info: &DocInfo, allowed: bool) -> bool {
++        let Some((page, index)) = self.comments.selected else { return name == "clear" };
++        let Some(a) = info.annotations.iter().find(|a| a.page == page && a.index == index && a.in_reply_to.is_none()) else {
++            self.comments.selected = None;
++            return true;
++        };
++        match name {
++            "clear" => self.comments.selected = None,
++            "edit" if allowed => {
++                self.comments.composer = Some(comments::Composer {
++                    page,
++                    at: [a.rect[2] as f64, a.rect[3] as f64],
++                    kind: comments::ComposerKind::Edit(index),
++                    text: a.contents.clone().unwrap_or_default(),
++                    focus: true,
++                });
++            }
++            "color" if allowed => {
++                if let Some(c) = color.filter(|c| c.iter().all(|x| x.is_finite())) {
++                    let color = Some(c.map(|x| x.clamp(0.0, 1.0)));
++                    self.pending_edit = Some(Edit::StyleAnnotation { page, index, color, opacity: None, width: None, endings: None });
++                }
++            }
++            "delete" if allowed && !a.locked => {
++                self.comments.selected = None;
++                self.pending_edit = Some(Edit::DeleteAnnotation { page, index });
++            }
++            "edit" | "color" | "delete" => {}
++            _ => return false,
++        }
++        true
++    }
++
+     /// A double tap at `pos` (screen points), as in Acrobat's phone app: zoom in on the column of
+     /// text under the finger until its lines fill the screen's width (twice the page's width
+     /// where there is no text), or, on a page already zoomed in, back to the page's width. The
+@@ -2950,6 +2998,15 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+         app.host_pen_seen = true;
+     }
+     let pen_seen = app.host_chrome && app.host_pen_seen;
++    // What pressed the page last, for how far from a handle a press still takes it.
++    let press_kind = if pointer_pen {
++        comments::PressKind::Pen
++    } else if (app.host_chrome && pointer_touch) || ui.input(|i| i.any_touches()) {
++        comments::PressKind::Finger
++    } else {
++        comments::PressKind::Mouse
++    };
++    comments::note_press_kind(ui.ctx(), press_kind);
+     let long_press = app.host_long_press;
+     // Edit a PDF: added text and images can be selected, moved and edited.
+     let editing_content =
+diff --git a/crates/ui-egui/src/combine_grid.rs b/crates/ui-egui/src/combine_grid.rs
+index ee3b03f..1813629 100644
+--- a/crates/ui-egui/src/combine_grid.rs
++++ b/crates/ui-egui/src/combine_grid.rs
+@@ -984,8 +984,8 @@ impl Card {
+             painter.text(pos2(c.center().x, name_y + 17.0), Align2::CENTER_CENTER, text, theme::regular(11.5), colour);
+         }
+ 
+-        // On hover, the card's own actions along the top of the page (not while a card is
+-        // dragged): remove this file only, and show it large when there is a page to show. Drawn
++        // On hover (or, for a finger, on the selected card), the card's own actions along the top
++        // of the page (not while a card is dragged): remove this file only, and show it large when there is a page to show. Drawn
+         // over the card, so a click on one doesn't select or move it.
+         let previewable = why.is_none();
+         // A file that adds more pages than one can be spread out into them.
+@@ -1013,7 +1013,9 @@ impl Card {
+         // Nothing of the card shows over a dialog (the preview, the password box).
+         let covered = ui.ctx().memory(|m| m.top_modal_layer().is_some());
+         let mut over_bar = false;
+-        if !covered && ui.rect_contains_pointer(c.shrink(4.0)) && !egui::DragAndDrop::has_any_payload(ui.ctx()) {
++        // A finger has no hover: the card it tapped (selected) shows them.
++        let touched = self.selected && crate::comments::press_kind(ui) == crate::comments::PressKind::Finger;
++        if !covered && (ui.rect_contains_pointer(c.shrink(4.0)) || touched) && !egui::DragAndDrop::has_any_payload(ui.ctx()) {
+             let count = buttons.len() as f32;
+             // Mostly above the page (a quarter over its top edge), so it hides little of it, and
+             // never the name below.
+diff --git a/crates/ui-egui/src/comments.rs b/crates/ui-egui/src/comments.rs
+index 94f75d5..3ff2eab 100644
+--- a/crates/ui-egui/src/comments.rs
++++ b/crates/ui-egui/src/comments.rs
+@@ -736,8 +736,63 @@ fn grabs_points(tool: QuickTool) -> bool {
+ }
+ 
+ /// The point of `a` (an end or a corner) whose handle is at `p` on screen.
+-fn point_handle(cx: &PageCx<'_>, a: &Annotation, p: Pos2) -> Option<usize> {
+-    a.points.iter().position(|q| cx.to_screen([f64::from(q[0]), f64::from(q[1])]).distance(p) <= 7.0)
++fn point_handle(ui: &egui::Ui, cx: &PageCx<'_>, a: &Annotation, p: Pos2) -> Option<usize> {
++    let points = a.points.iter().map(|q| cx.to_screen([f64::from(q[0]), f64::from(q[1])]));
++    nearest_handle(points, Rect::NOTHING, p, grab(ui, 7.0), 7.0)
++}
++
++/// How a finger takes a handle: within about half of Android's 48 dp touch target of it.
++const FINGER_GRAB: f32 = 22.0;
++/// A pen is as precise as a mouse but sits on glass that moves under it.
++const PEN_GRAB: f32 = 12.0;
++
++fn press_kind_id() -> egui::Id {
++    egui::Id::new("pdfcraft-press-kind")
++}
++
++/// What made the latest press on the page: a mouse (or trackpad), a pen or a finger. The canvas
++/// notes it every frame, from the browser's `pointerType` when the host draws the controls and
++/// from egui's touches otherwise.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) enum PressKind {
++    #[default]
++    Mouse,
++    Pen,
++    Finger,
++}
++
++pub(crate) fn note_press_kind(ctx: &egui::Context, kind: PressKind) {
++    ctx.data_mut(|d| d.insert_temp(press_kind_id(), kind));
++}
++
++pub(crate) fn press_kind(ui: &egui::Ui) -> PressKind {
++    let noted = ui.ctx().data(|d| d.get_temp::<PressKind>(press_kind_id())).unwrap_or_default();
++    if noted == PressKind::Mouse && ui.input(|i| i.any_touches()) { PressKind::Finger } else { noted }
++}
++
++/// How far from a handle a press still takes it (points): `mouse` for a mouse, more for a pen
++/// and a finger.
++pub(crate) fn grab(ui: &egui::Ui, mouse: f32) -> f32 {
++    match press_kind(ui) {
++        PressKind::Mouse => mouse,
++        PressKind::Pen => mouse.max(PEN_GRAB),
++        PressKind::Finger => mouse.max(FINGER_GRAB),
++    }
++}
++
++/// Handles drawn for a finger are drawn larger, as a phone's are.
++pub(crate) fn handle_radius(ui: &egui::Ui, mouse: f32) -> f32 {
++    if press_kind(ui) == PressKind::Finger { mouse.max(7.0) } else { mouse }
++}
++
++/// The handle of `handles` (on screen) a press at `p` takes: the nearest within `reach`. A
++/// finger's reach is wide, and on a small box it would leave no middle to move the box by, so
++/// inside `body` a handle reaches no further than a quarter of the box's smaller side (or
++/// `mouse`, if that is more). `Rect::NOTHING` for handles with no box around them.
++pub(crate) fn nearest_handle(handles: impl IntoIterator<Item = Pos2>, body: Rect, p: Pos2, reach: f32, mouse: f32) -> Option<usize> {
++    let (i, d) = handles.into_iter().enumerate().map(|(i, h)| (i, h.distance(p))).min_by(|a, b| a.1.total_cmp(&b.1))?;
++    let reach = if body.contains(p) { reach.min((body.width().min(body.height()) / 4.0).max(mouse)) } else { reach };
++    (d <= reach).then_some(i)
+ }
+ 
+ /// `points` with point `i` moved to `to`; with Shift, held to the nearest 45° from the point
+@@ -1112,7 +1167,7 @@ pub(crate) fn draw_grabs(ui: &egui::Ui, cx: &PageCx<'_>, view: &DocView) -> bool
+     if cv.gesture.is_some() {
+         return false;
+     }
+-    press_point(ui, cx).is_some_and(|p| on_handle(cx, view, p, |_| true))
++    press_point(ui, cx).is_some_and(|p| on_handle(ui, cx, view, p, |_| true))
+ }
+ 
+ /// Whether the press (or, with no button down, the pointer) is on a `pick` comment or on the
+@@ -1126,7 +1181,11 @@ fn grabs(ui: &egui::Ui, cx: &PageCx<'_>, view: &DocView, pick: impl Fn(&Annotati
+         return true;
+     }
+     let Some(p) = press_point(ui, cx) else { return false };
+-    on_handle(cx, view, p, &pick) || cx.hit(p).is_some_and(pick)
++    // A finger moves only the comment it tapped first, as in Acrobat's phone app: a drag that
++    // starts on another one scrolls the page.
++    let finger = press_kind(ui) == PressKind::Finger && cx.tool == QuickTool::Select;
++    let selected = view.comments.selected.filter(|(page, _)| *page == cx.page).map(|(_, i)| i);
++    on_handle(ui, cx, view, p, &pick) || cx.hit(p).is_some_and(|a| pick(a) && (!finger || selected == Some(a.index)))
+ }
+ 
+ /// Where a gesture on this page is decided: the press while the button is down, otherwise the
+@@ -1137,10 +1196,11 @@ fn press_point(ui: &egui::Ui, cx: &PageCx<'_>) -> Option<Pos2> {
+ }
+ 
+ /// Whether `p` is on a resize handle of the selected comment, when it is a resizable `pick`.
+-fn on_handle(cx: &PageCx<'_>, view: &DocView, p: Pos2, pick: impl Fn(&Annotation) -> bool) -> bool {
++fn on_handle(ui: &egui::Ui, cx: &PageCx<'_>, view: &DocView, p: Pos2, pick: impl Fn(&Annotation) -> bool) -> bool {
+     view.comments.selected.filter(|(page, _)| *page == cx.page).and_then(|(_, i)| cx.get(i)).filter(|a| pick(a) && cx.allowed).is_some_and(|a| {
+-        (resizable(a) && HANDLES.into_iter().any(|h| handle_pos(cx.screen_rect(a), h).distance(p) <= 7.0))
+-            || (grabs_points(cx.tool) && reshapable(a) && point_handle(cx, a, p).is_some())
++        let r = cx.screen_rect(a);
++        (resizable(a) && nearest_handle(HANDLES.map(|h| handle_pos(r, h)), r, p, grab(ui, 7.0), 7.0).is_some())
++            || (grabs_points(cx.tool) && reshapable(a) && point_handle(ui, cx, a, p).is_some())
+     })
+ }
+ 
+@@ -1164,11 +1224,12 @@ fn select_input(
+     let handle_at = |p: Pos2| -> Option<(i8, i8)> {
+         let a = selected.filter(|a| cx.allowed && resizable(a))?;
+         let r = cx.screen_rect(a);
+-        HANDLES.into_iter().find(|h| handle_pos(r, *h).distance(p) <= 7.0)
++        nearest_handle(HANDLES.map(|h| handle_pos(r, h)), r, p, grab(ui, 7.0), 7.0).map(|k| HANDLES[k])
+     };
+     // Ends and corners of a selected line, connected lines, polygon or cloud.
+-    let point_at =
+-        |p: Pos2| -> Option<usize> { selected.filter(|a| cx.allowed && grabs_points(cx.tool) && reshapable(a)).and_then(|a| point_handle(cx, a, p)) };
++    let point_at = |p: Pos2| -> Option<usize> {
++        selected.filter(|a| cx.allowed && grabs_points(cx.tool) && reshapable(a)).and_then(|a| point_handle(ui, cx, a, p))
++    };
+     let mut consumed = false;
+     if let Some(p) = pointer {
+         if point_at(p).is_some() {
+@@ -1206,6 +1267,7 @@ fn select_input(
+             consumed = true;
+         } else if let Some(a) = cx.hit(o)
+             && !is_markup(&a.subtype)
++            && (press_kind(ui) != PressKind::Finger || cx.tool != QuickTool::Select || selected.is_some_and(|s| s.index == a.index))
+         {
+             cv.selected = Some((cx.page, a.index));
+             cv.reveal = true;
+@@ -1276,11 +1338,14 @@ fn select_input(
+             None => cv.selected = None,
+         }
+     }
++    // A finger's double tap on a phone zooms (the host's smart zoom); the comment's card edits it.
+     if resp.double_clicked()
+         && on_page
+         && cx.allowed
++        && !(view.host && press_kind(ui) == PressKind::Finger)
+         && let Some(a) = pointer.and_then(|p| cx.hit(p))
+     {
++        let cv = &mut view.comments;
+         cv.selected = Some((cx.page, a.index));
+         cv.composer = Some(Composer {
+             page: cx.page,
+@@ -1366,9 +1431,10 @@ pub(crate) fn paint_page(ui: &egui::Ui, painter: &egui::Painter, cx: &PageCx<'_>
+         let r = cx.adjusted_rect(a, cv.gesture.as_ref(), pointer, shift, view.pending_edit.as_ref()).expand(2.0);
+         painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, SELECT_BLUE), egui::StrokeKind::Middle);
+         if cx.allowed && resizable(a) {
++            let radius = handle_radius(ui, 4.5);
+             for h in HANDLES {
+                 let c = handle_pos(r, h);
+-                painter.circle(c, 4.5, Color32::WHITE, Stroke::new(1.0, SELECT_BLUE));
++                painter.circle(c, radius, Color32::WHITE, Stroke::new(1.0, SELECT_BLUE));
+             }
+         }
+     }
+diff --git a/crates/ui-egui/src/content_ui.rs b/crates/ui-egui/src/content_ui.rs
+index 6742105..900ee35 100644
+--- a/crates/ui-egui/src/content_ui.rs
++++ b/crates/ui-egui/src/content_ui.rs
+@@ -274,6 +274,12 @@ fn handles(r: Rect) -> [(Pos2, bool, bool); 4] {
+     [(r.left_top(), true, true), (r.right_top(), false, true), (r.left_bottom(), true, false), (r.right_bottom(), false, false)]
+ }
+ 
++/// The corner of `r` a press at `p` takes (a finger reaches further than a mouse).
++fn corner_at(ui: &egui::Ui, r: Rect, p: Pos2) -> Option<(Pos2, bool, bool)> {
++    let corners = handles(r);
++    crate::comments::nearest_handle(corners.map(|(c, ..)| c), r, p, crate::comments::grab(ui, 6.0), 6.0).map(|k| corners[k])
++}
++
+ /// The rect while moving or resizing (images keep their proportions).
+ fn dragged(r: Rect, grab: Grab, d: egui::Vec2, keep_aspect: bool) -> Rect {
+     match grab {
+@@ -312,8 +318,7 @@ pub(crate) fn select_grabs(ui: &egui::Ui, xf: &PageXform, page: usize, info: &Do
+     };
+     on_page(added, page).into_iter().any(|(index, item)| {
+         let rect = screen_rect(xf, info, page, item.content.rect());
+-        rect.expand(2.0).contains(p)
+-            || cv.selected == Some((page, index)) && handles(rect).into_iter().any(|(corner, _, _)| corner.distance(p) <= 6.0)
++        rect.expand(2.0).contains(p) || cv.selected == Some((page, index)) && corner_at(ui, rect, p).is_some()
+     })
+ }
+ 
+@@ -370,7 +375,7 @@ pub(crate) fn page_input(
+         .filter(|s| s.0 == page)
+         .and_then(|(_, si)| items.iter().find(|(i, _)| *i == si))
+         .map(|(_, a)| screen_rect(xf, info, page, a.content.rect()));
+-    let corner = selected_rect.and_then(|r| handles(r).into_iter().find(|(c, ..)| c.distance(p) <= 6.0));
++    let corner = selected_rect.and_then(|r| corner_at(ui, r, p));
+     // Cursors only where the page shows: the mode bar and side panels over a page scrolled under
+     // them keep their own (#2755).
+     let shows = resp.contains_pointer();
+@@ -409,7 +414,7 @@ pub(crate) fn page_input(
+     }
+     if resp.drag_started() {
+         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(p);
+-        if let Some((_, left, top)) = selected_rect.and_then(|r| handles(r).into_iter().find(|(c, ..)| c.distance(origin) <= 6.0)) {
++        if let Some((_, left, top)) = selected_rect.and_then(|r| corner_at(ui, r, origin)) {
+             cv.grab = Some((page, Grab::Corner(left, top), origin));
+             consumed = true;
+         } else if let Some((i, _)) = items.iter().rev().find(|(_, a)| screen_rect(xf, info, page, a.content.rect()).expand(2.0).contains(origin)) {
+@@ -468,8 +473,9 @@ pub(crate) fn paint_page(ui: &egui::Ui, painter: &egui::Painter, xf: &PageXform,
+         }
+         if selected {
+             painter.rect_stroke(r.expand(1.0), CornerRadius::ZERO, Stroke::new(1.5, SELECT_BLUE), egui::StrokeKind::Outside);
++            let radius = crate::comments::handle_radius(ui, 3.5);
+             for (c, ..) in handles(r.expand(1.0)) {
+-                painter.circle(c, 3.5, Color32::WHITE, Stroke::new(1.5, SELECT_BLUE));
++                painter.circle(c, radius, Color32::WHITE, Stroke::new(1.5, SELECT_BLUE));
+             }
+         } else if pointer.is_some_and(|p| r.expand(2.0).contains(p)) {
+             painter.rect_stroke(r.expand(1.0), CornerRadius::ZERO, Stroke::new(1.0, SELECT_BLUE.gamma_multiply(0.7)), egui::StrokeKind::Outside);
+diff --git a/crates/ui-egui/src/edit_text_ui.rs b/crates/ui-egui/src/edit_text_ui.rs
+index 067e524..e6d2ae6 100644
+--- a/crates/ui-egui/src/edit_text_ui.rs
++++ b/crates/ui-egui/src/edit_text_ui.rs
+@@ -526,7 +526,7 @@ fn crop_input(
+         && let Some(o) = ui.input(|inp| inp.pointer.press_origin())
+     {
+         let k = keep_screen(mode.keep);
+-        let grip = crop_handles(k).iter().position(|h| h.distance(o) < 8.0).or_else(|| k.contains(o).then_some(8));
++        let grip = crate::comments::nearest_handle(crop_handles(k), k, o, crate::comments::grab(ui, 8.0), 8.0).or_else(|| k.contains(o).then_some(8));
+         if let Some(g) = grip {
+             mode.drag = Some((g, o, mode.keep));
+         }
+@@ -920,7 +920,8 @@ pub(crate) fn image_input(
+         if allow_interaction
+             && resp.drag_started()
+             && let Some(o) = origin
+-            && o.distance(knob) < 8.0
++            && o.distance(knob) < crate::comments::grab(ui, 8.0)
++            && !b.contains(o)
+         {
+             if let Some(s) = view.image_selection.as_mut() {
+                 s.drag = Some((o, None));
+@@ -930,7 +931,7 @@ pub(crate) fn image_input(
+             && resp.drag_started()
+             && let Some(o) = origin
+         {
+-            let corner = corners.iter().position(|c| c.distance(o) < 8.0);
++            let corner = crate::comments::nearest_handle(corners, b, o, crate::comments::grab(ui, 8.0), 8.0);
+             if corner.is_some() || image_contains(i, o) {
+                 let opposite = corner.map(|k| corners[3 - k]);
+                 if let Some(s) = view.image_selection.as_mut() {
+diff --git a/crates/ui-egui/src/host_chrome.rs b/crates/ui-egui/src/host_chrome.rs
+index c563fd1..1b263eb 100644
+--- a/crates/ui-egui/src/host_chrome.rs
++++ b/crates/ui-egui/src/host_chrome.rs
+@@ -24,6 +24,28 @@ fn panel_named(name: &str) -> Option<RightPanel> {
+     PANELS.into_iter().find(|p| format!("{p:?}") == name)
+ }
+ 
++/// Rows and buttons of PdfCraft's own dialogs, menus and panels as tall as a finger needs (egui's
++/// are a mouse's 18 points); Android asks for 48 dp, phone apps' dense lists go to about 36.
++const TOUCH_ROW: f32 = 36.0;
++
++/// Size the stock controls for a finger, once for each theme egui keeps a style for (a theme
++/// change sets them afresh, so this runs every frame and returns at once when it is done). Only
++/// heights grow: wider buttons would push a dialog's row of tabs past a phone's width.
++fn touch_sized(ctx: &egui::Context) {
++    if ctx.global_style().spacing.interact_size.y >= TOUCH_ROW {
++        return;
++    }
++    ctx.all_styles_mut(|s| {
++        s.spacing.interact_size.y = TOUCH_ROW;
++        s.spacing.item_spacing.y = s.spacing.item_spacing.y.max(8.0);
++        s.spacing.icon_width = 20.0;
++        s.spacing.icon_width_inner = 12.0;
++        s.spacing.icon_spacing = 8.0;
++        s.spacing.combo_height = s.spacing.combo_height.max(320.0);
++        s.spacing.slider_rail_height = 6.0;
++    });
++}
++
+ /// The active tool as the command that picks it (`comment.highlight`, `sign.fill.text`, ...), so
+ /// a host marks the button that ran it; `select` and `hand` for the two that have none.
+ pub(crate) fn tool_id(tool: QuickTool) -> String {
+@@ -103,6 +125,14 @@ impl PdfCraftApp {
+                         self.views[i].host_selection_action(&name, &doc.info, &self.comment_prefs, can_comment);
+                     }
+                 }
++                HostRequest::Comment { action, color } => {
++                    if let Some(i) = self.active
++                        && let Some(doc) = self.session.get(self.views[i].id)
++                    {
++                        let allowed = doc.allows_annotation() && !doc.comments_hidden();
++                        self.views[i].host_comment_action(&action, color, &doc.info, allowed);
++                    }
++                }
+                 HostRequest::SelectionHandle { end, x, y, done } => {
+                     let scale = self.ctx.as_ref().map_or(1.0, |c| c.zoom_factor()).max(0.01);
+                     let now = self.ctx.as_ref().map_or(0.0, |c| c.input(|i| i.time));
+@@ -215,6 +245,18 @@ impl PdfCraftApp {
+                 "text": text,
+             })
+         });
++        // The selected comment: its box, its kind (`Highlight`, `Square`, `FreeText`, ...), its
++        // colour, whether it has text, and whether it can be changed and deleted.
++        let comment = active.zip(active.and_then(|v| self.session.get(v.id))).filter(|(_, d)| !d.comments_hidden()).and_then(|(v, d)| {
++            let (r, a) = v.comment_on_screen(&d.info)?;
++            let color = a.color.map(|c| format!("#{:02x}{:02x}{:02x}", channel(c[0].into()), channel(c[1].into()), channel(c[2].into())));
++            let allowed = d.allows_annotation();
++            Some(json!({
++                "x": px(r.left()), "y": px(r.top()), "w": px(r.width()), "h": px(r.height()),
++                "kind": a.subtype, "color": color, "text": a.contents.as_deref().is_some_and(|t| !t.trim().is_empty()),
++                "edit": allowed, "delete": allowed && !a.locked,
++            }))
++        });
+         let style = match self.quick_tool {
+             QuickTool::Comment(tool) => {
+                 let s = self.comment_prefs.style(tool);
+@@ -257,6 +299,7 @@ impl PdfCraftApp {
+             "save": enabled("file.save"),
+             "fullScreen": self.full_screen,
+             "selection": selection,
++            "comment": comment,
+             "style": style,
+             "composer": composer,
+             "find": find,
+@@ -273,6 +316,20 @@ impl PdfCraftApp {
+     /// for a tablet, beside the page), the page, and what PdfCraft draws over the page.
+     pub(crate) fn host_chrome_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+         let t = theme::Tokens::get(ctx);
++        // What pressed the screen last, as the browser said (`pointerType`): handles and a card's
++        // buttons are sized and shown for it, here as on the page.
++        {
++            use std::sync::atomic::Ordering::Relaxed;
++            let kind = if self.host_pointer_pen.load(Relaxed) {
++                crate::comments::PressKind::Pen
++            } else if self.host_pointer_touch.load(Relaxed) || ctx.input(|i| i.any_touches()) {
++                crate::comments::PressKind::Finger
++            } else {
++                crate::comments::PressKind::Mouse
++            };
++            crate::comments::note_press_kind(ctx, kind);
++        }
++        touch_sized(ctx);
+         // No floating quick-action bar to keep the pages clear of: a phone's width is the page's.
+         for view in &mut self.views {
+             view.side = HOST_SIDE;
+@@ -965,4 +1022,130 @@ mod tests {
+         lift(&mut h, word);
+         h.run_steps(2);
+     }
++
++    /// A rectangle comment on the first page, selected as a new comment is; its box on screen.
++    fn rectangle(h: &mut Harness<'static, PdfCraftApp>) -> egui::Rect {
++        use pdfcraft_engine::{Edit, NewAnnotation, Shape, Style};
++        let shape = Shape::Rectangle { rect: [150.0, 300.0, 400.0, 500.0] };
++        let style = Style::default_for(&shape);
++        h.state_mut().views[0].pending_edit =
++            Some(Edit::AddAnnotation(NewAnnotation { page: 0, shape, style, contents: String::new(), author: "Me".into() }));
++        h.run_steps(6);
++        comment_box(h).expect("the new rectangle is selected")
++    }
++
++    /// The selected comment's box as the host is told it (CSS pixels are points here).
++    fn comment_box(h: &Harness<'static, PdfCraftApp>) -> Option<egui::Rect> {
++        let c = state(h)["comment"].clone();
++        let n = |k: &str| c[k].as_f64().map(|v| v as f32);
++        Some(egui::Rect::from_min_size(pos2(n("x")?, n("y")?), egui::vec2(n("w")?, n("h")?)))
++    }
++
++    fn rectangles(h: &Harness<'static, PdfCraftApp>) -> Vec<[f32; 4]> {
++        let app = h.state();
++        app.session.get(app.views[0].id).map_or(vec![], |d| d.info.annotations.iter().filter(|a| a.subtype == "Square").map(|a| a.rect).collect())
++    }
++
++    #[test]
++    fn a_tapped_comment_gets_the_hosts_card_which_colours_and_deletes_it() {
++        let mut h = phone(2);
++        let r = rectangle(&mut h);
++        let s = state(&h);
++        assert_eq!(s["comment"]["kind"], "Square", "{s}");
++        assert_eq!(s["comment"]["edit"], true);
++        assert_eq!(s["comment"]["delete"], true);
++        // Let go (Back), then a finger's tap on it picks it again.
++        ask(&mut h, HostRequest::Comment { action: "clear".into(), color: None });
++        assert!(state(&h)["comment"].is_null());
++        pen(&mut h, false, false);
++        press(&mut h, r.center());
++        h.step();
++        lift(&mut h, r.center());
++        h.run_steps(4);
++        assert_eq!(state(&h)["comment"]["kind"], "Square", "{}", state(&h));
++        // The card's Colour.
++        ask(&mut h, HostRequest::Comment { action: "color".into(), color: Some([1.0, 0.0, 0.0]) });
++        h.run_steps(4);
++        assert_eq!(state(&h)["comment"]["color"], "#ff0000", "{}", state(&h));
++        // Its Comment opens the box for the comment's text.
++        ask(&mut h, HostRequest::Comment { action: "edit".into(), color: None });
++        assert_eq!(state(&h)["composer"]["kind"], "edit", "{}", state(&h));
++        assert!(state(&h)["comment"].is_null(), "no card over the box being written");
++        ask(&mut h, HostRequest::ComposerDone(false));
++        // Its Delete.
++        ask(&mut h, HostRequest::Comment { action: "delete".into(), color: None });
++        h.run_steps(4);
++        assert!(state(&h)["comment"].is_null());
++        assert!(rectangles(&h).is_empty(), "deleted");
++    }
++
++    #[test]
++    fn a_finger_takes_a_handle_from_a_fingers_width_away() {
++        let mut h = phone(2);
++        let r = rectangle(&mut h);
++        let before = rectangles(&h);
++        pen(&mut h, false, false);
++        // 14 points out from the bottom-right corner (a mouse's handle takes 7), dragged on.
++        let from = r.right_bottom() + egui::vec2(10.0, 10.0);
++        drag(&mut h, from, from + egui::vec2(60.0, 40.0), 6);
++        h.run_steps(6);
++        let after = rectangles(&h);
++        assert_eq!(after.len(), 1);
++        assert!(after[0][2] > before[0][2] + 20.0, "wider: {before:?} -> {after:?}");
++        assert_eq!(after[0][0], before[0][0], "the left edge stays");
++    }
++
++    #[test]
++    fn a_finger_scrolls_over_a_comment_it_has_not_tapped_and_moves_one_it_has() {
++        let mut h = phone(3);
++        let r = rectangle(&mut h);
++        ask(&mut h, HostRequest::Comment { action: "clear".into(), color: None });
++        let before = rectangles(&h);
++        let top = |h: &Harness<'static, PdfCraftApp>| h.state().views[0].page_xform(0).map(|xf| xf.rect.top());
++        let start = top(&h);
++        pen(&mut h, false, false);
++        drag(&mut h, r.center(), r.center() - egui::vec2(0.0, 150.0), 8);
++        h.run_steps(20);
++        assert_eq!(rectangles(&h), before, "the comment stays where it was");
++        assert!(top(&h) < start, "the page scrolled: {start:?} -> {:?}", top(&h));
++        // Tapped first, the comment moves with the finger.
++        let r = {
++            let app = h.state();
++            let xf = app.views[0].page_xform(0).expect("the first page on screen");
++            let d = app.session.get(app.views[0].id).expect("the document");
++            xf.user_rect(&d.info, 0, before[0])
++        };
++        press(&mut h, r.center());
++        h.step();
++        lift(&mut h, r.center());
++        h.run_steps(4);
++        assert_eq!(state(&h)["comment"]["kind"], "Square", "{}", state(&h));
++        drag(&mut h, r.center(), r.center() + egui::vec2(40.0, 0.0), 6);
++        h.run_steps(6);
++        let moved = rectangles(&h);
++        assert!(moved[0][0] > before[0][0] + 10.0, "moved right: {before:?} -> {moved:?}");
++    }
++
++    #[test]
++    fn a_fingers_double_tap_on_a_comment_opens_no_editor() {
++        let mut h = phone(2);
++        let r = rectangle(&mut h);
++        pen(&mut h, false, false);
++        for _ in 0..2 {
++            press(&mut h, r.center());
++            h.step();
++            lift(&mut h, r.center());
++            h.step();
++        }
++        h.run_steps(4);
++        assert!(state(&h)["composer"].is_null(), "{}", state(&h));
++    }
++
++    #[test]
++    fn dialogs_and_panels_get_rows_a_finger_can_take() {
++        let h = phone(1);
++        let style = h.ctx.global_style();
++        assert!(style.spacing.interact_size.y >= 36.0, "{:?}", style.spacing.interact_size);
++        assert!(style.spacing.icon_width >= 20.0, "check boxes to match");
++    }
+ }
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 166abdf..0305dbf 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -491,6 +491,12 @@ pub enum HostRequest {
+     Night(bool),
+     /// Hand the active document's bytes, as Save would write them, to [`HostShareFn`].
+     Share,
++    /// Act on the selected comment: `edit` its text, `color` it (RGB, 0–1), `delete` it, or
++    /// `clear` the selection (a tap elsewhere, Back).
++    Comment {
++        action: String,
++        color: Option<[f64; 3]>,
++    },
+     /// A double tap at this point of the page, in CSS pixels from the canvas's top-left: zoom
+     /// in on the text there, or back out ([`canvas::DocView::smart_zoom`]).
+     SmartZoom {

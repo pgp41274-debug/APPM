@@ -392,14 +392,21 @@ try {
   // 8. Dialogs. On a phone a dialog's card fits what it shows, also when that grows while the
   // dialog is open: Properties opened on its short Security tab and switched to Description gets
   // the card Description opens with, and then keeps still.
+  // The screen at each step, kept (on CI) for the log if the check below fails.
+  const trail = [];
+  const mark = async (label) => {
+    if (process.env.GITHUB_ACTIONS) trail.push([label, (await page.screenshot({ scale: 'css', type: 'jpeg', quality: 40 })).toString('base64')]);
+  };
   const command = async (name) => {
     await focus();
     await page.keyboard.press('Control+k');
     await sleep(600);
     await page.keyboard.type(name, { delay: 20 });
     await sleep(600);
+    await mark(`${name}: typed`);
     await page.keyboard.press('Enter');
     await sleep(1500);
+    await mark(`${name}: entered`);
   };
   // The card, in points: all the pure white left, as the backdrop dims the rest of the screen.
   const cardOn = async (file) => {
@@ -425,6 +432,7 @@ try {
   const described = await cardWhen('2b-properties-description.png');
   await page.keyboard.press('Escape');
   await sleep(800);
+  await mark('Escape');
   await command('Security properties');
   const secured = await cardWhen('2c-properties-security.png');
   // The tabs run along the top of the card, Description first.
@@ -435,10 +443,15 @@ try {
   for (let i = 0; i < 20; i++) { await page.mouse.move(4 + (i % 2), 4); await sleep(50); }
   const settled = await cardOn('2e-properties-settled.png');
   const size = (c) => c && `${c.w.toFixed(0)} x ${c.h.toFixed(0)}`;
-  check('a dialog\'s card grows to fit what it shows (Properties: Security, then Description)',
-    described && secured && switched && settled && secured.h < described.h - 40 && Math.abs(switched.h - described.h) < 2
-      && ['x', 'y', 'w', 'h'].every((k) => Math.abs(settled[k] - switched[k]) < 1),
+  const grew = described && secured && switched && settled && secured.h < described.h - 40 && Math.abs(switched.h - described.h) < 2
+    && ['x', 'y', 'w', 'h'].every((k) => Math.abs(settled[k] - switched[k]) < 1);
+  check('a dialog\'s card grows to fit what it shows (Properties: Security, then Description)', grew,
     `Description ${size(described)} pt, Security ${size(secured)}, then Description ${size(switched)} and ${size(settled)} later`);
+  // CI's screenshots are an artifact a reader may not reach; the screen goes in the log as well.
+  if (!grew) {
+    await mark('settled');
+    for (const [label, jpeg] of trail) console.log(`SCREEN ${label.replace(/\W+/g, '-')}.jpg ${jpeg}`);
+  }
   await page.keyboard.press('Escape');
   await sleep(800);
 
@@ -733,6 +746,59 @@ try {
     const copied = await p.evaluate(() => window.__calls.filter((c) => c[0] === 'copyText').map((c) => c[1]));
     check('... Copy text puts the words on Android\'s clipboard', !!words && copied.at(-1) === words && await settle(() => !window.__state.selection),
       JSON.stringify({ words, copied }));
+
+    // A comment on the page, tapped: a card comments on it, colours it or deletes it, which a
+    // desktop does with a right click or the Delete key. The tap keeps the bars.
+    {
+      for (const [fx, fy] of [onWord, [0.36, 0.37], [0.3, 0.33], [0.45, 0.4]]) {
+        await hold(fb.x + fb.width * fx, fb.y + fb.height * fy, 1500);
+        if (await settle(() => !!(window.__state.selection && window.__state.selection.text), 4000)) break;
+      }
+      if (await settle(() => !document.getElementById('selcard').hidden, 3000)) await p.tap('#sel-highlight');
+      await settle(() => !window.__state.selection && window.__state.undo === true);
+      // A new highlight opens its note in Acrobat; leave it empty.
+      if (await settle(() => !!window.__state.composer, 1500)) {
+        await p.evaluate(() => window.shell.back());
+        await settle(() => !window.__state.composer);
+      }
+      // Let it go with a tap beside it, then tap it again.
+      const hl = await settle(() => !!window.__state.comment, 3000) ? (await st()).comment : null;
+      if (hl) {
+        await p.touchscreen.tap(fb.x + fb.width * 0.5, fb.y + fb.height * 0.85);
+        await settle(() => !window.__state.comment, 3000);
+        await sleep(600);
+        await p.touchscreen.tap(fb.x + hl.x + hl.w / 2, fb.y + hl.y + hl.h / 2);
+      }
+      const picked = hl && await settle(() => !!window.__state.comment && window.__state.comment.kind === 'Highlight', 4000);
+      const cardOn = picked && await settle(() => !document.getElementById('commentcard').hidden, 3000);
+      await sleep(600);
+      const barsKept = await p.evaluate(() => !document.body.classList.contains('immersive'));
+      await p.screenshot({ path: path.join(shots, 'phone-9c-comment-card.png') });
+      check('a tap on a comment picks it, with a card of Comment, Colour and Delete, and the bars stay', picked && cardOn && barsKept,
+        JSON.stringify({ hl, picked, cardOn, barsKept, comment: (await st()).comment }));
+      let green = false;
+      let deleted = false;
+      if (cardOn) {
+        await p.tap('#comment-color');
+        if (await settle(() => !document.getElementById('comment-colors').hidden, 2000)) {
+          await p.tap('#comment-colors [data-color="#43a047"]');
+          green = await settle(() => window.__state.comment && window.__state.comment.color === '#43a047', 4000);
+        }
+        await p.tap('#comment-delete');
+        deleted = await settle(() => !window.__state.comment, 4000) && await p.evaluate(() => document.getElementById('commentcard').hidden);
+      }
+      check('... its Colour turns it green', green, JSON.stringify((await st()).comment));
+      check('... its Delete deletes it, and the card goes', deleted, JSON.stringify((await st()).comment));
+      // Undo the delete, the colour and the highlight.
+      for (let k = 0; k < 3 && (await st()).undo; k++) {
+        await p.tap('#undo');
+        await sleep(400);
+      }
+      // (Back with nothing open would go to the home screen.)
+      if ((await st()).comment) await p.evaluate(() => window.shell.back());
+      await settle(() => !window.__state.comment, 2000);
+      await settle(() => window.__state.undo === false, 3000);
+    }
 
     // Held, then dragged on without lifting: the selection widens a word at a time (Android's
     // touch, hold and drag), the page doesn't scroll, and the card waits for the finger to lift.
@@ -1150,7 +1216,13 @@ try {
       }
     });
     const stateBeforeSwipe = await st();
-    {
+    // A slow machine (CI draws in software) can hand the page a quick swipe's moves a third of a
+    // second apart, which is a slow drag to the shell as it would be on a phone. A swipe the page
+    // saw that slowly is made again (a few times) before it counts as failed.
+    let swiped = false;
+    let swipeSeen = '';
+    for (let attempt = 0; attempt < 3 && !swiped; attempt++) {
+      await p.evaluate(() => { window.__swipe.length = 0; });
       const b = await p.locator('#app').boundingBox();
       const y = b.y + b.height * 0.5;
       await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: b.x + b.width * 0.8, y }] });
@@ -1159,9 +1231,13 @@ try {
         await sleep(25);
       }
       await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      swiped = await settle(() => window.__state.page === 4, 4000);
+      swipeSeen += `${attempt ? ' | ' : ''}${await p.evaluate(() => window.__swipe.join(', '))}`;
+      const times = await p.evaluate(() => window.__swipe.filter((m) => !m.startsWith('down')).map((m) => +m.split(' ').at(-1)));
+      const slowest = Math.max(0, ...times.slice(1).map((t, i) => t - times[i]));
+      if (swiped || slowest <= 120) break;
+      await sleep(800);
     }
-    const swiped = await settle(() => window.__state.page === 4, 4000);
-    const swipeSeen = await p.evaluate(() => window.__swipe.join(', '));
     await sleep(600);
     {
       const b = await p.locator('#app').boundingBox();

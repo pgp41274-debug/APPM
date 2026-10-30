@@ -134,6 +134,18 @@ body.busy .pbar { pointer-events: none; opacity: 0.5; }
 #selcard button { font: inherit; color: inherit; background: none; border: 0; }
 #selcard button:active { background: rgba(255, 255, 255, 0.1); }
 .sel-icons { display: flex; justify-content: space-around; padding: 4px; border-bottom: 1px solid rgba(255, 255, 255, 0.15); }
+/* A comment tapped on the page: Comment, Colour and Delete, and the colours under them. */
+#commentcard { position: fixed; z-index: 8; left: 0; top: 0; background: #1f1f22; color: #f2f2f5; border-radius: 12px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35); overflow: hidden; -webkit-user-select: none; user-select: none; }
+#commentcard[hidden], #comment-colors[hidden] { display: none; }
+#commentcard button { font: inherit; color: inherit; background: none; border: 0; }
+#commentcard button:active { background: rgba(255, 255, 255, 0.1); }
+#commentcard button:disabled { opacity: 0.35; }
+#commentcard .sel-icons { border-bottom: 0; }
+#commentcard .dot { display: block; width: 22px; height: 22px; border-radius: 50%; border: 2px solid #f2f2f5; }
+#comment-colors { gap: 10px; padding: 10px 12px 12px; border-top: 1px solid rgba(255, 255, 255, 0.15); }
+#comment-colors .swatch { width: 40px; height: 40px; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25); }
+#comment-colors .swatch.on { box-shadow: 0 0 0 3px #1f1f22, 0 0 0 5px var(--accent); }
 .sel-row { display: flex; align-items: center; gap: 16px; width: 100%; min-height: 50px; padding: 0 18px; font-size: 16px; text-align: left; }
 
 /* The page number, a while after the page changes; a tap goes to a page. */
