@@ -392,14 +392,21 @@ try {
   // 8. Dialogs. On a phone a dialog's card fits what it shows, also when that grows while the
   // dialog is open: Properties opened on its short Security tab and switched to Description gets
   // the card Description opens with, and then keeps still.
+  // The screen at each step, kept (on CI) for the log if the check below fails.
+  const trail = [];
+  const mark = async (label) => {
+    if (process.env.GITHUB_ACTIONS) trail.push([label, (await page.screenshot({ scale: 'css', type: 'jpeg', quality: 40 })).toString('base64')]);
+  };
   const command = async (name) => {
     await focus();
     await page.keyboard.press('Control+k');
     await sleep(600);
     await page.keyboard.type(name, { delay: 20 });
     await sleep(600);
+    await mark(`${name}: typed`);
     await page.keyboard.press('Enter');
     await sleep(1500);
+    await mark(`${name}: entered`);
   };
   // The card, in points: all the pure white left, as the backdrop dims the rest of the screen.
   const cardOn = async (file) => {
@@ -425,6 +432,7 @@ try {
   const described = await cardWhen('2b-properties-description.png');
   await page.keyboard.press('Escape');
   await sleep(800);
+  await mark('Escape');
   await command('Security properties');
   const secured = await cardWhen('2c-properties-security.png');
   // The tabs run along the top of the card, Description first.
@@ -440,9 +448,9 @@ try {
   check('a dialog\'s card grows to fit what it shows (Properties: Security, then Description)', grew,
     `Description ${size(described)} pt, Security ${size(secured)}, then Description ${size(switched)} and ${size(settled)} later`);
   // CI's screenshots are an artifact a reader may not reach; the screen goes in the log as well.
-  if (!grew && process.env.GITHUB_ACTIONS) {
-    const jpeg = await page.screenshot({ scale: 'css', type: 'jpeg', quality: 40 });
-    console.log(`SCREEN 2e-properties-settled.jpg ${jpeg.toString('base64')}`);
+  if (!grew) {
+    await mark('settled');
+    for (const [label, jpeg] of trail) console.log(`SCREEN ${label.replace(/\W+/g, '-')}.jpg ${jpeg}`);
   }
   await page.keyboard.press('Escape');
   await sleep(800);
