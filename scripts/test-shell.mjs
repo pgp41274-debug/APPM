@@ -734,6 +734,59 @@ try {
     check('... Copy text puts the words on Android\'s clipboard', !!words && copied.at(-1) === words && await settle(() => !window.__state.selection),
       JSON.stringify({ words, copied }));
 
+    // A comment on the page, tapped: a card comments on it, colours it or deletes it, which a
+    // desktop does with a right click or the Delete key. The tap keeps the bars.
+    {
+      for (const [fx, fy] of [onWord, [0.36, 0.37], [0.3, 0.33], [0.45, 0.4]]) {
+        await hold(fb.x + fb.width * fx, fb.y + fb.height * fy, 1500);
+        if (await settle(() => !!(window.__state.selection && window.__state.selection.text), 4000)) break;
+      }
+      if (await settle(() => !document.getElementById('selcard').hidden, 3000)) await p.tap('#sel-highlight');
+      await settle(() => !window.__state.selection && window.__state.undo === true);
+      // A new highlight opens its note in Acrobat; leave it empty.
+      if (await settle(() => !!window.__state.composer, 1500)) {
+        await p.evaluate(() => window.shell.back());
+        await settle(() => !window.__state.composer);
+      }
+      // Let it go with a tap beside it, then tap it again.
+      const hl = await settle(() => !!window.__state.comment, 3000) ? (await st()).comment : null;
+      if (hl) {
+        await p.touchscreen.tap(fb.x + fb.width * 0.5, fb.y + fb.height * 0.85);
+        await settle(() => !window.__state.comment, 3000);
+        await sleep(600);
+        await p.touchscreen.tap(fb.x + hl.x + hl.w / 2, fb.y + hl.y + hl.h / 2);
+      }
+      const picked = hl && await settle(() => !!window.__state.comment && window.__state.comment.kind === 'Highlight', 4000);
+      const cardOn = picked && await settle(() => !document.getElementById('commentcard').hidden, 3000);
+      await sleep(600);
+      const barsKept = await p.evaluate(() => !document.body.classList.contains('immersive'));
+      await p.screenshot({ path: path.join(shots, 'phone-9c-comment-card.png') });
+      check('a tap on a comment picks it, with a card of Comment, Colour and Delete, and the bars stay', picked && cardOn && barsKept,
+        JSON.stringify({ hl, picked, cardOn, barsKept, comment: (await st()).comment }));
+      let green = false;
+      let deleted = false;
+      if (cardOn) {
+        await p.tap('#comment-color');
+        if (await settle(() => !document.getElementById('comment-colors').hidden, 2000)) {
+          await p.tap('#comment-colors [data-color="#43a047"]');
+          green = await settle(() => window.__state.comment && window.__state.comment.color === '#43a047', 4000);
+        }
+        await p.tap('#comment-delete');
+        deleted = await settle(() => !window.__state.comment, 4000) && await p.evaluate(() => document.getElementById('commentcard').hidden);
+      }
+      check('... its Colour turns it green', green, JSON.stringify((await st()).comment));
+      check('... its Delete deletes it, and the card goes', deleted, JSON.stringify((await st()).comment));
+      // Undo the delete, the colour and the highlight.
+      for (let k = 0; k < 3 && (await st()).undo; k++) {
+        await p.tap('#undo');
+        await sleep(400);
+      }
+      // (Back with nothing open would go to the home screen.)
+      if ((await st()).comment) await p.evaluate(() => window.shell.back());
+      await settle(() => !window.__state.comment, 2000);
+      await settle(() => window.__state.undo === false, 3000);
+    }
+
     // Held, then dragged on without lifting: the selection widens a word at a time (Android's
     // touch, hold and drag), the page doesn't scroll, and the card waits for the finger to lift.
     {

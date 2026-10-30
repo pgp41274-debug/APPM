@@ -13,7 +13,8 @@
 //            a tap at the screen's edge turns the page; a finger held on a word selects it (with
 //            Android's touch-and-hold delay and buzz) and, dragged on, widens it a word at a
 //            time; handles at its ends move it (whole words outward, letters back, with a
-//            magnifier), and a card shows what to do with it once the finger lifts; the
+//            magnifier), and a card shows what to do with it once the finger lifts; a tap on
+//            a comment shows a card that comments on it, colours it or deletes it; the
 //            scrubber at the right edge drags through the pages
 //   a mode:  Edit PDF, Comment, Highlight, Draw or Fill & Sign: ✓ (done) at the top left, the
 //            mode's tools along the bottom with its colour (and thickness), a hint on the page
@@ -321,6 +322,26 @@
     } }, icon('copy'), el('span', {}, 'Copy text')));
   const handles = [el('div', { class: 'handle start', id: 'handle-start', hidden: true }), el('div', { class: 'handle end', id: 'handle-end', hidden: true })];
 
+  // A comment tapped on the page (a highlight, a shape, a note, a Fill & Sign mark), as in
+  // Acrobat's phone app: a card over it comments on it, colours it or deletes it. A desktop
+  // reaches these with a right click or the Delete key, which a finger has neither of.
+  const commentColors = el('div', { class: 'swatches', id: 'comment-colors', hidden: true }, ...SWATCHES.map((c) =>
+    el('button', { class: 'swatch', 'aria-label': `Colour ${c}`, 'data-color': c, style: `background:${c}`, onclick: () => {
+      post('pdfcraft:comment', { action: 'color', color: c });
+      commentColors.hidden = true;
+    } })));
+  const commentCard = el('div', { id: 'commentcard', role: 'menu', hidden: true },
+    el('div', { class: 'sel-icons' },
+      el('button', { class: 'icon-btn', id: 'comment-edit', role: 'menuitem', 'aria-label': 'Comment', title: 'Comment',
+        onclick: () => post('pdfcraft:comment', { action: 'edit' }) }, icon('message-square')),
+      el('button', { class: 'icon-btn', id: 'comment-color', role: 'menuitem', 'aria-label': 'Colour', title: 'Colour', onclick: () => {
+        commentColors.hidden = !commentColors.hidden;
+        if (state) renderComment(state);
+      } }, el('span', { class: 'dot' })),
+      el('button', { class: 'icon-btn', id: 'comment-delete', role: 'menuitem', 'aria-label': 'Delete', title: 'Delete',
+        onclick: () => post('pdfcraft:comment', { action: 'delete' }) }, icon('trash-2'))),
+    commentColors);
+
   function selButton(id, label, name, act) {
     return el('button', { class: 'icon-btn', id, role: 'menuitem', 'aria-label': label, title: label, onclick: () => post('pdfcraft:selection', { action: act }) }, icon(name));
   }
@@ -349,7 +370,7 @@
   const scrim = el('div', { id: 'scrim', hidden: true, onclick: () => closeSheet() });
   const sheet = el('div', { id: 'sheet', role: 'dialog', 'aria-modal': 'true', hidden: true });
 
-  document.body.append(topbar, modebar, searchbar, bottombar, toolbar, panelbar, pill, scrubber, hint, composer, selCard, ...handles,
+  document.body.append(topbar, modebar, searchbar, bottombar, toolbar, panelbar, pill, scrubber, hint, composer, selCard, commentCard, ...handles,
     homeScreen, scrim, sheet);
   // `phone`: the host draws the controls (phones and tablets); `tablet`: 600 dp or wider.
   body.classList.add('phone', 'home');
@@ -393,6 +414,7 @@
     if (searching) renderFind(s);
     renderComposer(s, before);
     renderSelection(s);
+    renderComment(s, before);
     // A finger held on a word selected it: Android's long-press buzz, as everywhere else.
     if (s.selection && !(before && before.selection) && fingersDown > 0) shell.haptic && shell.haptic();
     if (doc && s.page !== lastPage) {
@@ -743,6 +765,36 @@
     selCard.style.transform = `translate(${x}px, ${y}px)`;
   }
 
+  // ---- a comment tapped on the page ----
+
+  function renderComment(s, before) {
+    const c = s.comment;
+    const f = frame.getBoundingClientRect();
+    // Not over a drawing being drawn: a stroke the pen drew is no comment to act on.
+    const shown = !!c && !home && !s.busy && sheet.hidden && composer.hidden && !s.selection && mode !== 'draw'
+      && fingersDown === 0 && c.y + c.h > 0 && c.y < f.height && c.x + c.w > 0 && c.x < f.width;
+    // Another comment (or none) closes the colours.
+    const same = before && before.comment && c && before.comment.x === c.x && before.comment.y === c.y;
+    if (!shown || (before && !same && before.comment !== c)) commentColors.hidden = true;
+    commentCard.hidden = !shown;
+    if (!shown) return;
+    commentCard.querySelector('#comment-edit').disabled = !c.edit;
+    commentCard.querySelector('#comment-color').disabled = !c.edit;
+    commentCard.querySelector('#comment-delete').disabled = !c.delete;
+    commentCard.querySelector('#comment-color .dot').style.background = c.color || 'transparent';
+    for (const b of commentColors.children) b.classList.toggle('on', b.dataset.color === c.color);
+    // Above the comment when there is room under the top bar, otherwise below it.
+    const cardW = Math.min(commentColors.hidden ? 180 : 300, window.innerWidth - 24);
+    commentCard.style.width = `${cardW}px`;
+    const cardH = commentCard.offsetHeight || 56;
+    const bars = !immersive && !s.fullScreen;
+    const topLimit = (bars && !topbar.hidden ? topbar.getBoundingClientRect().bottom : bars && !modebar.hidden ? modebar.getBoundingClientRect().bottom : 0) + 8;
+    let y = f.top + c.y - cardH - 12;
+    if (y < topLimit) y = Math.min(f.top + c.y + c.h + 12, window.innerHeight - cardH - 8);
+    const x = Math.max(12, Math.min(window.innerWidth - cardW - 12, f.left + c.x + c.w / 2 - cardW / 2));
+    commentCard.style.transform = `translate(${x}px, ${y}px)`;
+  }
+
   // A handle follows the finger as Android's do: the finger keeps the offset it pressed at from
   // the middle of the line the handle's end is on, so the selection doesn't jump to the finger,
   // and the line stays in sight above it. Its end moves whole words outward and letters back
@@ -790,6 +842,7 @@
     sheet.dataset.kind = kind;
     sheet.replaceChildren(el('div', { class: 'grabber' }), ...content);
     selCard.hidden = true;
+    commentCard.hidden = true;
     for (const h of handles) h.hidden = true;
     if (sheet.hidden) {
       scrim.hidden = false;
@@ -808,7 +861,10 @@
     sheet.classList.remove('open');
     scrim.hidden = true;
     sheet.hidden = true;
-    if (state) renderSelection(state);
+    if (state) {
+      renderSelection(state);
+      renderComment(state);
+    }
     return true;
   }
 
@@ -1000,8 +1056,10 @@
       // A pen taps as a finger does; it drags to select text, so it never swipes.
       const pen = e.pointerType === 'pen';
       const settled = !several && e.timeStamp - severalEnd >= 500;
+      // A tap with a comment selected lets it go (PdfCraft does), and keeps the bars.
+      const comment = !!(state && state.comment);
       down = settled && (pen ? fingersDown === 0 : fingersDown === 1 && e.pointerType === 'touch') && (reading || selecting)
-        ? { x: e.clientX, y: e.clientY, t: e.timeStamp, selecting, pen, moves: [{ x: e.clientX, t: e.timeStamp }] } : null;
+        ? { x: e.clientX, y: e.clientY, t: e.timeStamp, selecting, pen, comment, moves: [{ x: e.clientX, t: e.timeStamp }] } : null;
       if (!down) lastTap = null;
     }, true);
     const up = (e) => {
@@ -1067,6 +1125,8 @@
       const forward = e.clientX > width / 2;
       pending = setTimeout(() => {
         lastTap = null;
+        // A tap that picked a comment (PdfCraft reports it by now) is for the comment's card.
+        if (d.comment || (state && state.comment)) return;
         if (edge) post('pdfcraft:turnPage', { forward, swipe: false });
         else setImmersive(!immersive);
       }, wait + 20);
@@ -1084,6 +1144,10 @@
     if (finishComposer(false)) return true;
     if (state && state.selection) {
       post('pdfcraft:selection', { action: 'clear' });
+      return true;
+    }
+    if (state && state.comment) {
+      post('pdfcraft:comment', { action: 'clear' });
       return true;
     }
     if (closeSearch()) return true;
