@@ -790,12 +790,15 @@ try {
     // (a mouse's double and triple click select a word and a line; a finger lands in them by accident).
     // Both events go out together: a slow machine (CI draws in software) otherwise holds the
     // finger down for a frame or more between them, and a finger down for half a second IS a
-    // long press. Each tap's real time down is recorded, so a failure says which it was.
+    // long press. Each tap's real time down is recorded, so a failure says which it was: by the
+    // events' own times, as the shell measures a tap. (When the handlers ran is no measure: a slow
+    // frame delays the release's handler, and a tap the shell took as one was then made again,
+    // which landed with nothing selected and hid the bars.)
     await p.frames().find((f) => f.url().includes('/app/pdfcraft/')).evaluate(() => {
       window.top.__downs = [];
       let t0 = 0;
-      document.addEventListener('pointerdown', () => { t0 = performance.now(); }, true);
-      document.addEventListener('pointerup', () => { window.top.__downs.push(Math.round(performance.now() - t0)); }, true);
+      document.addEventListener('pointerdown', (e) => { t0 = e.timeStamp; }, true);
+      document.addEventListener('pointerup', (e) => { window.top.__downs.push(Math.round(e.timeStamp - t0)); }, true);
     });
     if (process.env.TAP_SLOW) await cdp.send('Emulation.setCPUThrottlingRate', { rate: Number(process.env.TAP_SLOW) });
     const tapAt = (x, y) => Promise.all([
@@ -839,8 +842,12 @@ try {
     const fb2 = await p.locator('#app').boundingBox(); // the bars may have moved the page
     // A finger takes about a tenth of a second to tap: press and release land in different frames,
     // which is what the shell sees on a phone. (The quick taps above are the harsh case.) A slow
-    // machine can stretch it, so a tap that took too long to be one is tried again.
+    // machine can stretch it, so a tap that took too long to be one is tried again. Too long is the
+    // shell's own measure (a press it holds for its long-press delay is no tap): a stricter one
+    // here tried again a tap the shell had taken, which then landed with nothing selected and hid
+    // the bars.
     const humanTap = async (x, y) => {
+      const limit = await p.evaluate(() => (window.shell.touch || {}).longPress || 400);
       for (let attempt = 0; attempt < 4; attempt++) {
         const before = await p.evaluate(() => window.__downs.length);
         await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
@@ -851,7 +858,7 @@ try {
         // land on a page that has already let go of its selection and hide the bars.
         for (let waited = 0; waited < 4000 && (await p.evaluate(() => window.__downs.length)) <= before; waited += 100) await sleep(100);
         const downs2 = await p.evaluate(() => window.__downs);
-        if (downs2.length > before && downs2.at(-1) <= 300) return downs2.at(-1);
+        if (downs2.length > before && downs2.at(-1) < limit) return downs2.at(-1);
         if (downs2.length <= before) return -1; // never logged: do not tap again blindly
         await sleep(800);
       }
