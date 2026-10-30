@@ -734,16 +734,71 @@ try {
     check('... Copy text puts the words on Android\'s clipboard', !!words && copied.at(-1) === words && await settle(() => !window.__state.selection),
       JSON.stringify({ words, copied }));
 
+    // Held, then dragged on without lifting: the selection widens a word at a time (Android's
+    // touch, hold and drag), the page doesn't scroll, and the card waits for the finger to lift.
+    {
+      const [hx, hy] = [fb.x + fb.width * onWord[0], fb.y + fb.height * onWord[1]];
+      const pageBefore = await p.evaluate(() => window.__state.page);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: hx, y: hy }] });
+      await sleep(1500);
+      const held = await settle(() => !!(window.__state.selection && window.__state.selection.touching), 3000);
+      const heldText = held && (await st()).selection.text;
+      for (let k = 1; k <= 8; k++) {
+        // On along the line and down onto the next one.
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: hx + k * fb.width * 0.025, y: hy + k * fb.height * 0.01 }] });
+        await sleep(60);
+      }
+      await sleep(400);
+      const during = await p.evaluate(() => ({ sel: window.__state.selection, card: !document.getElementById('selcard').hidden }));
+      await p.screenshot({ path: path.join(shots, 'phone-2b-held-and-dragging.png') }); // with the magnifier
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      const cardAfter = await settle(() => !document.getElementById('selcard').hidden && !window.__state.selection.touching, 4000);
+      const after = (await st()).selection;
+      check('a finger held on a word and dragged on widens the selection by words, and the card waits for the finger to lift',
+        held && !!during.sel && during.sel.text.length > heldText.length && !during.card && cardAfter && !!after
+        && after.text === during.sel.text && (await st()).page === pageBefore,
+        JSON.stringify({ heldText, during, after, cardAfter }));
+      await p.screenshot({ path: path.join(shots, 'phone-2b-held-and-dragged.png') }); // the card, once the finger lifts
+
+      // Its end handle dragged back towards the start: the selection shrinks, the finger keeps
+      // its offset from the handle (no jump on touch), and the drag ends when it lifts.
+      const hb = await p.locator('#handle-end').boundingBox();
+      const before = after.text;
+      const [ex, ey] = [hb.x + hb.width / 2, hb.y + hb.height / 2];
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: ex, y: ey }] });
+      await sleep(50);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: ex + 1, y: ey }] });
+      await sleep(300);
+      const noJump = (await st()).selection.text === before;
+      for (let k = 1; k <= 6; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: ex - k * fb.width * 0.03, y: ey }] });
+        await sleep(60);
+      }
+      await sleep(400);
+      const dragged = await p.evaluate(() => ({ sel: window.__state.selection, card: !document.getElementById('selcard').hidden }));
+      await p.screenshot({ path: path.join(shots, 'phone-2c-handle-dragging.png') });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      const ended = await settle(() => window.__state.selection && !window.__state.selection.moving && !document.getElementById('selcard').hidden, 4000);
+      check('... its end handle drawn back shrinks it, with no jump when touched, the card hidden until the finger lifts',
+        noJump && !!dragged.sel && dragged.sel.text.length < before.length && dragged.sel.moving === 'end' && !dragged.card && ended,
+        JSON.stringify({ before, noJump, dragged, ended }));
+      await p.evaluate(() => window.shell.back());
+      await settle(() => !window.__state.selection, 3000);
+    }
+
     // Taps are not a long press: one, two or three quick taps on that same word select nothing
     // (a mouse's double and triple click select a word and a line; a finger lands in them by accident).
     // Both events go out together: a slow machine (CI draws in software) otherwise holds the
     // finger down for a frame or more between them, and a finger down for half a second IS a
-    // long press. Each tap's real time down is recorded, so a failure says which it was.
+    // long press. Each tap's real time down is recorded, so a failure says which it was: by the
+    // events' own times, as the shell measures a tap. (When the handlers ran is no measure: a slow
+    // frame delays the release's handler, and a tap the shell took as one was then made again,
+    // which landed with nothing selected and hid the bars.)
     await p.frames().find((f) => f.url().includes('/app/pdfcraft/')).evaluate(() => {
       window.top.__downs = [];
       let t0 = 0;
-      document.addEventListener('pointerdown', () => { t0 = performance.now(); }, true);
-      document.addEventListener('pointerup', () => { window.top.__downs.push(Math.round(performance.now() - t0)); }, true);
+      document.addEventListener('pointerdown', (e) => { t0 = e.timeStamp; }, true);
+      document.addEventListener('pointerup', (e) => { window.top.__downs.push(Math.round(e.timeStamp - t0)); }, true);
     });
     if (process.env.TAP_SLOW) await cdp.send('Emulation.setCPUThrottlingRate', { rate: Number(process.env.TAP_SLOW) });
     const tapAt = (x, y) => Promise.all([
@@ -787,8 +842,12 @@ try {
     const fb2 = await p.locator('#app').boundingBox(); // the bars may have moved the page
     // A finger takes about a tenth of a second to tap: press and release land in different frames,
     // which is what the shell sees on a phone. (The quick taps above are the harsh case.) A slow
-    // machine can stretch it, so a tap that took too long to be one is tried again.
+    // machine can stretch it, so a tap that took too long to be one is tried again. Too long is the
+    // shell's own measure (a press it holds for its long-press delay is no tap): a stricter one
+    // here tried again a tap the shell had taken, which then landed with nothing selected and hid
+    // the bars.
     const humanTap = async (x, y) => {
+      const limit = await p.evaluate(() => (window.shell.touch || {}).longPress || 400);
       for (let attempt = 0; attempt < 4; attempt++) {
         const before = await p.evaluate(() => window.__downs.length);
         await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
@@ -799,7 +858,7 @@ try {
         // land on a page that has already let go of its selection and hide the bars.
         for (let waited = 0; waited < 4000 && (await p.evaluate(() => window.__downs.length)) <= before; waited += 100) await sleep(100);
         const downs2 = await p.evaluate(() => window.__downs);
-        if (downs2.length > before && downs2.at(-1) <= 300) return downs2.at(-1);
+        if (downs2.length > before && downs2.at(-1) < limit) return downs2.at(-1);
         if (downs2.length <= before) return -1; // never logged: do not tap again blindly
         await sleep(800);
       }

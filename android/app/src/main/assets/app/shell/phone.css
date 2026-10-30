@@ -121,9 +121,10 @@ body.busy .pbar { pointer-events: none; opacity: 0.5; }
 #composer-text { flex: 1; min-width: 0; min-height: 24px; max-height: 140px; padding: 12px; font: inherit; font-size: 16px;
   color: inherit; background: var(--home-bg); border: 1px solid var(--bar-line); border-radius: 12px; resize: none; outline: none; }
 
-/* A text selection: a handle hangs from each end; the card offers what to do with it. */
-.handle { position: fixed; z-index: 8; left: 0; top: 0; width: 22px; height: 22px; background: var(--accent);
-  border-radius: 50% 0 50% 50%; touch-action: none; }
+/* A text selection: a handle hangs from each end, its point on the end, as Android draws them
+   (24px, touched over 48px: Android's smallest touch target); the card offers what to do. */
+.handle { position: fixed; z-index: 8; left: 0; top: 0; width: 24px; height: 24px; background: var(--accent);
+  border-radius: 50% 0 50% 50%; touch-action: none; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3); }
 .handle.end { border-radius: 0 50% 50% 50%; }
 .handle::after { content: ""; position: absolute; inset: -12px; }
 .handle[hidden] { display: none; }

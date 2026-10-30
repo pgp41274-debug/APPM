@@ -11,8 +11,10 @@
 //            as in Acrobat's phone app: a tap on the page hides the bars; a double tap zooms in on
 //            the text there, and another zooms back out; in single-page view a sideways swipe or
 //            a tap at the screen's edge turns the page; a finger held on a word selects it (with
-//            Android's touch-and-hold delay and buzz), with handles to widen it and a card of
-//            what to do with it; the scrubber at the right edge drags through the pages
+//            Android's touch-and-hold delay and buzz) and, dragged on, widens it a word at a
+//            time; handles at its ends move it (whole words outward, letters back, with a
+//            magnifier), and a card shows what to do with it once the finger lifts; the
+//            scrubber at the right edge drags through the pages
 //   a mode:  Edit PDF, Comment, Highlight, Draw or Fill & Sign: ✓ (done) at the top left, the
 //            mode's tools along the bottom with its colour (and thickness), a hint on the page
 //   search:  the top bar turns into the search box
@@ -160,6 +162,7 @@
   let hintTimer = 0;
   let repickAt = 0;
   let dragging = null; // the selection handle being dragged
+  const HANDLE = 24; // a selection handle's drawn size (phone.css); it is touched over twice that
   let fingersDown = 0; // fingers on the page
   let scrubbing = false; // a finger is on the scrubber
   let scrubTimer = 0;
@@ -709,13 +712,24 @@
     const shown = !!sel && !home && !mode && !s.busy && sheet.hidden && composer.hidden
       && sel.y + sel.h > 0 && sel.y < f.height && sel.x + sel.w > 0 && sel.x < f.width;
     for (const h of handles) h.hidden = !shown;
-    selCard.hidden = !shown || !!dragging;
+    // The card waits for the finger: not while a handle is dragged, nor while the finger that
+    // held a word is still widening the selection.
+    selCard.hidden = !shown || !!dragging || !!sel.touching;
     if (!shown) return;
+    // A handle dragged past the other one swaps ends with it (PdfCraft says which end moves):
+    // the handle under the finger takes the moving end, and each takes the shape of its end.
+    const movingEnd = dragging ? (sel.moving || (dragging === handles[1] ? 'end' : 'start')) : null;
+    const startEl = dragging && (movingEnd === 'start') === (dragging === handles[1]) ? handles[1] : handles[0];
+    const endEl = startEl === handles[0] ? handles[1] : handles[0];
+    startEl.classList.add('start');
+    startEl.classList.remove('end');
+    endEl.classList.add('end');
+    endEl.classList.remove('start');
     const [sx, sy] = sel.start;
     const [ex, ey] = sel.end;
-    handles[0].style.transform = `translate(${f.left + sx - 22}px, ${f.top + sy}px)`;
-    handles[1].style.transform = `translate(${f.left + ex}px, ${f.top + ey}px)`;
-    if (dragging) return;
+    startEl.style.transform = `translate(${f.left + sx - HANDLE}px, ${f.top + sy}px)`;
+    endEl.style.transform = `translate(${f.left + ex}px, ${f.top + ey}px)`;
+    if (selCard.hidden) return;
     // Above the words when there is room under the top bar, otherwise below the handles.
     const cardW = Math.min(300, window.innerWidth - 24);
     selCard.style.width = `${cardW}px`;
@@ -724,31 +738,46 @@
     const bottom = f.top + sel.y + sel.h;
     const topLimit = (topbar.hidden ? 0 : topbar.getBoundingClientRect().bottom) + 8;
     let y = top - cardH - 12;
-    if (y < topLimit) y = Math.min(bottom + 34, window.innerHeight - cardH - 8);
+    if (y < topLimit) y = Math.min(bottom + HANDLE + 12, window.innerHeight - cardH - 8);
     const x = Math.max(12, Math.min(window.innerWidth - cardW - 12, f.left + sel.x + sel.w / 2 - cardW / 2));
     selCard.style.transform = `translate(${x}px, ${y}px)`;
   }
 
-  // A handle follows the finger: the text nearest the point above the finger, where the line is.
-  for (const [i, h] of handles.entries()) {
+  // A handle follows the finger as Android's do: the finger keeps the offset it pressed at from
+  // the middle of the line the handle's end is on, so the selection doesn't jump to the finger,
+  // and the line stays in sight above it. Its end moves whole words outward and letters back
+  // (PdfCraft decides), with a magnifier over the line.
+  for (const h of handles) {
     let frameRect = null;
+    let offset = null;
     let queued = null;
+    let startedAs = true;
     h.addEventListener('pointerdown', (e) => {
+      const sel = state && state.selection;
+      if (!sel) return;
       e.preventDefault();
       h.setPointerCapture(e.pointerId);
       dragging = h;
       frameRect = frame.getBoundingClientRect();
+      startedAs = h.classList.contains('end');
+      const [x, y] = startedAs ? sel.end : sel.start;
+      const lineH = (startedAs ? sel.endH : sel.startH) || 16;
+      offset = { x: frameRect.left + x - e.clientX, y: frameRect.top + y - lineH / 2 - e.clientY };
       selCard.hidden = true;
     });
     h.addEventListener('pointermove', (e) => {
-      if (dragging !== h) return;
-      const at = { end: i === 1, x: e.clientX - frameRect.left, y: e.clientY - frameRect.top - 26 };
-      if (!queued) requestAnimationFrame(() => { post('pdfcraft:selectionHandle', queued); queued = null; });
+      if (dragging !== h || !offset) return;
+      const at = { end: startedAs, x: e.clientX + offset.x - frameRect.left, y: e.clientY + offset.y - frameRect.top };
+      if (!queued) requestAnimationFrame(() => { if (queued) post('pdfcraft:selectionHandle', queued); queued = null; });
       queued = at;
     });
     const drop = () => {
       if (dragging !== h) return;
+      if (queued) post('pdfcraft:selectionHandle', queued);
+      queued = null;
+      post('pdfcraft:selectionHandle', { end: startedAs, done: true });
       dragging = null;
+      offset = null;
       if (state) renderSelection(state);
     };
     h.addEventListener('pointerup', drop);
@@ -994,6 +1023,12 @@
       // second sideways as the finger lifts; a slow drag only moves the page.
       // Over the path's last 50 ms or more (moves can arrive bunched in one frame), from the
       // press itself when the path is shorter.
+      // A finger that held a word (and maybe dragged on, widening the selection) is no tap and
+      // no swipe.
+      if (!d.selecting && state && state.selection) {
+        lastTap = null;
+        return;
+      }
       const last = d.moves[d.moves.length - 1];
       const from = d.moves.findLast((m) => last.t - m.t >= 50) || d.moves[0];
       const speed = Math.abs(last.x - from.x) / Math.max(1, last.t - from.t) * 1000 * (window.devicePixelRatio || 1);

@@ -1,0 +1,678 @@
+diff --git a/apps/pdfcraft-web/src/main.rs b/apps/pdfcraft-web/src/main.rs
+index 0027c4f..9d2e2c6 100644
+--- a/apps/pdfcraft-web/src/main.rs
++++ b/apps/pdfcraft-web/src/main.rs
+@@ -301,7 +301,8 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+ ///   `pdfcraft:gotoPage`: `{ page }` (1-based). `pdfcraft:style`: `{ color: "#rrggbb", width,
+ ///   opacity }` for the current comment tool. `pdfcraft:selection`: `{ action }` on the text
+ ///   selection (`note`, `highlight`, `underline`, `strikeout`, `replace`, `clear`), and
+-///   `pdfcraft:selectionHandle`: `{ end, x, y }` moves one of its ends. `pdfcraft:composerText`:
++///   `pdfcraft:selectionHandle`: `{ end, x, y }` moves one of its ends (`{ done: true }` when
++///   the finger lifts). `pdfcraft:composerText`:
+ ///   `{ text }` and `pdfcraft:composerDone`: `{ post }` write the comment being added.
+ ///   `pdfcraft:find`: `{ query }`, `pdfcraft:findStep`: `{ forward }`, `pdfcraft:findClose`.
+ ///   `pdfcraft:night`: `{ on }`. `pdfcraft:share` asks for `pdfcraft:share` (to the parent):
+@@ -397,8 +398,11 @@ mod host {
+                                 opacity: real(&data, "opacity"),
+                             }),
+                             "pdfcraft:selection" => string(&data, "action").map(HostRequest::SelectionAction),
+-                            "pdfcraft:selectionHandle" => match (real(&data, "x"), real(&data, "y")) {
+-                                (Some(x), Some(y)) => Some(HostRequest::SelectionHandle { end: boolean(&data, "end"), x: x as f32, y: y as f32 }),
++                            "pdfcraft:selectionHandle" => match (real(&data, "x"), real(&data, "y"), boolean(&data, "done")) {
++                                (Some(x), Some(y), done) => {
++                                    Some(HostRequest::SelectionHandle { end: boolean(&data, "end"), x: x as f32, y: y as f32, done })
++                                }
++                                (_, _, true) => Some(HostRequest::SelectionHandle { end: boolean(&data, "end"), x: f32::NAN, y: f32::NAN, done: true }),
+                                 _ => None,
+                             },
+                             "pdfcraft:composerText" => string(&data, "text").map(HostRequest::ComposerText),
+diff --git a/crates/ui-egui/src/canvas.rs b/crates/ui-egui/src/canvas.rs
+index df6f081..56ec141 100644
+--- a/crates/ui-egui/src/canvas.rs
++++ b/crates/ui-egui/src/canvas.rs
+@@ -294,6 +294,29 @@ fn click_unit(text: &PageText, clicks: u32, a: usize) -> Option<(usize, usize)>
+     }
+ }
+ 
++/// A selection handle being dragged by a finger, as Android's text handles move: away from the
++/// other end the selection grows a whole word at a time (once the finger is past the middle of
++/// the next word); drawn back, it shrinks a letter at a time, and stays that fine until the
++/// finger goes on into another word. A handle dragged past the other end swaps ends with it.
++///
++/// Ends are carets, the gaps between glyphs (`0..=glyphs`): glyphs `fixed..moving` (either way
++/// round) are selected.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct HandleDrag {
++    fixed: usize,
++    moving: usize,
++    /// Drawn back into a word: letter by letter until the finger leaves that word.
++    letters: bool,
++    /// The finger's sideways distance from the caret it last snapped to (screen points), kept
++    /// so the selection does not jump back to the finger when it is drawn back.
++    slack: f32,
++    /// Where the host last put the handle (screen points), and when (egui's clock).
++    pub(crate) at: Pos2,
++    pub(crate) when: f64,
++    /// The finger rests at the top or bottom of the view, which scrolls under it.
++    scrolling: bool,
++}
++
+ struct PageTex {
+     tag: u64,
+     tex: TextureHandle,
+@@ -493,6 +516,13 @@ pub struct DocView {
+     pub(crate) host_compose: Option<bool>,
+     /// A long press selected a word: its release is not a tap that clears the selection.
+     long_pressed: bool,
++    /// The word a finger held selected, while that finger stays down: dragged on, it widens the
++    /// selection a word at a time (Android's touch, hold and drag) and scrolls nothing.
++    touch_word: Option<(usize, usize)>,
++    /// A selection handle the host is dragging (`pdfcraft:selectionHandle`).
++    handle_drag: Option<HandleDrag>,
++    /// Where the magnifier looks this frame (screen points), and the height of the line there.
++    pub(crate) magnify: Option<(Pos2, f32)>,
+     /// The latest press on a page was a finger's (a mouse on the same screen keeps its double click).
+     press_touch: bool,
+     /// A second finger joined the fingers on the page: they scroll or pinch, and select nothing,
+@@ -813,6 +843,9 @@ impl DocView {
+             host: false,
+             host_compose: None,
+             long_pressed: false,
++            touch_word: None,
++            handle_drag: None,
++            magnify: None,
+             press_touch: false,
+             two_fingers: false,
+             viewport_h: 600.0,
+@@ -1220,22 +1253,129 @@ impl DocView {
+     }
+ 
+     /// Move one end of the text selection to the text nearest `pos` (screen points) on the
+-    /// selection's page; the other end stays. A selection can't span pages.
++    /// selection's page, as a finger drags its handle ([`HandleDrag`]); `end` is the handle the
++    /// drag began with. A selection can't span pages.
+     pub(crate) fn move_selection_end(&mut self, end: bool, pos: Pos2) {
+         let Some(sel) = self.selection else { return };
+         let Span::Run { anchor, head } = sel.span else { return };
+         let (Some(text), Some(xf)) = (self.texts.get(&sel.page), self.page_xform(sel.page)) else { return };
+-        let (vx, vy) = xf.screen_to_view(pos);
+-        let Some(to) = text.nearest(vx, vy) else { return };
+-        let (lo, hi) = (anchor.min(head), anchor.max(head));
+-        let (lo, hi) = if end { (lo, to.max(lo)) } else { (to.min(hi), hi) };
+-        self.selection = Some(Selection::run(sel.page, lo, hi));
++        let n = text.glyphs.len();
++        if n == 0 || !pos.is_finite() {
++            return;
++        }
++        // The caret's x on screen: the right edge of the glyph before it (`right` of the fixed
++        // end) or the left edge of the one after it.
++        let caret_x = |c: usize, right: bool| {
++            let g = if right { c.checked_sub(1) } else { Some(c) };
++            g.and_then(|g| text.glyphs.get(g)).map(|g| {
++                let r = xf.view_rect(g.rect);
++                if right { r.right() } else { r.left() }
++            })
++        };
++        let (lo, hi) = (anchor.min(head), anchor.max(head).saturating_add(1).min(n));
++        // The host keeps the finger's own offset from the handle (it moves the point the handle
++        // hangs from), so the first move starts where the end is.
++        let mut d = self.handle_drag.unwrap_or_else(|| {
++            let (fixed, moving) = if end { (lo, hi) } else { (hi, lo) };
++            HandleDrag { fixed, moving, letters: false, slack: 0.0, at: pos, when: 0.0, scrolling: false }
++        });
++        d.at = pos;
++        let finger = pos + vec2(d.slack, 0.0);
++        let (vx, vy) = xf.screen_to_view(finger);
++        let Some(g) = text.nearest(vx, vy) else { return };
++        let Some(gr) = text.glyphs.get(g).map(|g| g.rect) else { return };
++        // The caret by the half of the glyph the finger is over.
++        let raw = if vx > (gr[0] + gr[2]) / 2.0 { g + 1 } else { g };
++        let was_right = d.moving > d.fixed;
++        // The finger is past the fixed end (`right`), or before it.
++        let right = g >= d.fixed;
++        // The glyph beside the moving caret, inside the selection.
++        let inner = if was_right { d.moving.saturating_sub(1) } else { d.moving.min(n - 1) };
++        let line = |k: usize| text.line_of.get(k).copied();
++        let word = text.word_at(g);
++        let boundary = word.map_or(raw, |(f, l)| if right { l + 1 } else { f });
++        // Over a glyph the selection does not hold yet, on the moving side.
++        let outside = if right { g >= d.moving } else { g < d.moving };
++        let mut snapped = false;
++        let mut c = if right != was_right {
++            // Over the other end: whole words again, on its other side.
++            d.letters = false;
++            snapped = true;
++            boundary
++        } else if outside {
++            if line(g) != line(inner) {
++                // Onto another line: whole words.
++                d.letters = false;
++                snapped = true;
++                boundary
++            } else if d.letters && word == text.word_at(inner) {
++                raw
++            } else {
++                // Into another word: all of it, once the finger is past its middle.
++                let past_middle = word.is_none_or(|(f, l)| {
++                    let (Some(a), Some(b)) = (text.glyphs.get(f), text.glyphs.get(l)) else { return true };
++                    let mid = (xf.view_rect(a.rect).left() + xf.view_rect(b.rect).right()) / 2.0;
++                    if right { finger.x >= mid } else { finger.x <= mid }
++                });
++                if past_middle {
++                    d.letters = false;
++                    snapped = true;
++                    boundary
++                } else {
++                    d.moving
++                }
++            }
++        } else if line(g) != line(inner) {
++            // Drawn back onto an earlier line: to the word there.
++            snapped = true;
++            boundary
++        } else {
++            // Drawn back: a letter at a time.
++            d.letters = true;
++            raw
++        };
++        // Never empty: at least the glyph beside the fixed end.
++        if c == d.fixed {
++            c = if right { d.fixed + 1 } else { d.fixed.saturating_sub(1) };
++        }
++        let c = c.min(n);
++        if snapped {
++            d.slack = caret_x(c, c > d.fixed).map_or(0.0, |x| (x - pos.x).clamp(-40.0, 40.0));
++        }
++        d.moving = c;
++        let (a, b) = if c > d.fixed { (d.fixed, c - 1) } else { (d.fixed - 1, c) };
++        self.selection = Some(Selection::run(sel.page, a, b));
++        self.handle_drag = Some(d);
++    }
++
++    /// The host let go of its selection handle.
++    pub(crate) fn end_handle_drag(&mut self) {
++        self.handle_drag = None;
++    }
++
++    /// The host moved its selection handle at `now` (egui's clock): a drag the host stops
++    /// telling of (its page went away mid-drag) drops its magnifier after a while.
++    pub(crate) fn touch_handle_seen(&mut self, now: f64) {
++        if let Some(d) = self.handle_drag.as_mut() {
++            d.when = now;
++        }
++    }
++
++    /// A finger that held a word is still down, widening the selection by words.
++    pub(crate) fn touch_selecting(&self) -> bool {
++        self.touch_word.is_some()
++    }
++
++    /// Which end of the selection a dragged handle moves now (`Some(true)`: the end), as handles
++    /// that cross swap ends.
++    pub(crate) fn dragged_end(&self) -> Option<bool> {
++        self.handle_drag.map(|d| d.moving > d.fixed)
+     }
+ 
+-    /// Where the text selection is on screen (points): its bounding box, the bottom-left of
+-    /// its first piece and the bottom-right of its last (where a phone draws its handles), and
+-    /// the selected text. `None` without a selection on a page that is drawn.
+-    pub(crate) fn selection_on_screen(&self) -> Option<(Rect, Pos2, Pos2, String)> {
++    /// Where the text selection is on screen (points): its bounding box, its first piece and its
++    /// last (a phone draws its handles at the first's bottom-left and the last's bottom-right),
++    /// and the selected text. `None` without a selection on a page that is drawn.
++    pub(crate) fn selection_on_screen(&self) -> Option<(Rect, Rect, Rect, String)> {
+         let sel = self.selection?;
+         let text = self.texts.get(&sel.page)?;
+         let xf = self.page_xform(sel.page)?;
+@@ -1243,7 +1383,7 @@ impl DocView {
+         let (first, last) = (rects.first()?, rects.last()?);
+         let bounds = rects.iter().fold(*first, |a, b| a.union(*b));
+         let words = sel.text(text);
+-        (!words.is_empty()).then(|| (bounds, first.left_bottom(), last.right_bottom(), words))
++        (!words.is_empty()).then(|| (bounds, *first, *last, words))
+     }
+ 
+     /// A double tap at `pos` (screen points), as in Acrobat's phone app: zoom in on the column of
+@@ -3179,9 +3319,25 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+     // holds a word to select it.
+     let finger_scrolls = tool == QuickTool::Select || (pen_seen && matches!(tool, QuickTool::Comment(_)));
+     let pen_scrolls = pointer_pen && tool == QuickTool::Select && !preparing;
++    // A finger that held a word and stays down widens the selection instead (`touch_word`).
+     let touch_pan = finger_scrolls
+         && !preparing
++        && view.touch_word.is_none()
+         && (pen_scrolls || (!pointer_pen && ui.input(|i| i.any_touches() && i.multi_touch().is_none())));
++    // A finger lifted (or joined by another) ends its hold-and-drag; the selection stays.
++    if view.touch_word.is_some() && (!ui.input(|i| i.pointer.primary_down()) || ui.input(|i| i.multi_touch().is_some())) {
++        view.touch_word = None;
++    }
++    // A handle drag outlives neither its selection nor two seconds of silence from the host.
++    if view.selection.is_none() || view.handle_drag.is_some_and(|d| ui.input(|i| i.time) - d.when > 2.0) {
++        view.handle_drag = None;
++    }
++    // A handle resting at the top or bottom of the view, which scrolls under it, moves on with
++    // the text that comes under it.
++    if let Some(d) = view.handle_drag.filter(|d| d.scrolling) {
++        view.move_selection_end(d.moving > d.fixed, d.at);
++    }
++    view.magnify = None;
+     // Such a finger leaves the tool alone: the page only scrolls under it.
+     let finger_only_scrolls = touch_pan && tool != QuickTool::Select;
+     // Text selection runs for the Select tool and for the markup tools (highlight…).
+@@ -3797,8 +3953,17 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                     }
+                 }
+                 if let Some(sel) = view.selection.filter(|s| s.page == i) {
+-                    for lr in sel.rects(&text) {
+-                        painter.rect_filled(to_screen(lr), CornerRadius::same(1), Color32::from_rgba_unmultiplied(0x3A, 0x7B, 0xF0, 70));
++                    let rects = sel.rects(&text);
++                    for lr in &rects {
++                        painter.rect_filled(to_screen(*lr), CornerRadius::same(1), Color32::from_rgba_unmultiplied(0x3A, 0x7B, 0xF0, 70));
++                    }
++                    // A handle being dragged: the magnifier shows the line its end is on, where
++                    // the finger is along it.
++                    if let Some(d) = view.handle_drag {
++                        let piece = if d.moving > d.fixed { rects.last() } else { rects.first() };
++                        if let Some(line) = piece.map(|r| to_screen(*r)) {
++                            view.magnify = Some((pos2(d.at.x, line.center().y), line.height()));
++                        }
+                     }
+                     // The rectangle being drawn, as Acrobat shows it while column-selecting.
+                     if let Span::Column { rect } = sel.span
+@@ -3888,13 +4053,31 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                         if still && held.is_some_and(|h| h >= long_press) {
+                             if let Some((first, last)) = text.nearest(vx, vy).and_then(|a| text.word_at(a)) {
+                                 view.selection = Some(Selection::run(i, first, last));
++                                view.touch_word = Some((first, last));
+                             }
+                             view.long_pressed = true;
+                         } else if still && let Some(h) = held {
+                             ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((long_press - h).max(0.01)));
+                         }
+                     }
+-                    if resp.drag_started() && press_here && !over_link && !touch_pan && !view.two_fingers {
++                    // A finger held on a word and dragged on widens the selection a word at a time,
++                    // keeping the word held, as Android does; the magnifier shows the text under it.
++                    if let Some((first, last)) = view.touch_word
++                        && let Some(sel) = view.selection.as_mut().filter(|s| s.page == i)
++                        && let Some(h) = text.nearest(vx, vy)
++                    {
++                        let (to_first, to_last) = text.word_at(h).unwrap_or((h, h));
++                        let (anchor, head) = if to_first < first { (last, to_first) } else { (first, to_last.max(last)) };
++                        sel.span = Span::Run { anchor, head };
++                        if let Some(g) = text.glyphs.get(h) {
++                            let line = to_screen(g.rect);
++                            view.magnify = Some((pos2(p.x, line.center().y), line.height()));
++                        }
++                    }
++                    // A finger (with a host drawing the controls) highlights, underlines or
++                    // selects by whole words: a fingertip is no I-beam.
++                    let finger_words = view.host && view.press_touch && !pointer_pen && !column;
++                    if resp.drag_started() && press_here && !over_link && !touch_pan && !view.two_fingers && view.touch_word.is_none() {
+                         // A drag replaces the selection without passing through none, so a
+                         // re-drag over text whose bar Copy closed would keep the bar hidden.
+                         view.actions_dismissed = None;
+@@ -3904,17 +4087,27 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                         if view.clicks < 2 {
+                             view.selection = if column {
+                                 Some(Selection { page: i, span: Span::Column { rect: [ox, oy, vx, vy] } })
++                            } else if finger_words {
++                                text.nearest(ox, oy).and_then(|a| text.word_at(a)).map(|(f, l)| Selection::run(i, f, l))
+                             } else {
+                                 text.nearest(ox, oy).map(|a| Selection::run(i, a, a))
+                             };
+                         }
+                     }
+                     let clicks = if view.clicks > 2 && tool != QuickTool::Select { 1 } else { view.clicks };
++                    let clicks = if finger_words { clicks.max(2) } else { clicks };
+                     if resp.dragged()
+                         && !touch_pan
+                         && !view.two_fingers
++                        && view.touch_word.is_none()
+                         && let Some(sel) = view.selection.as_mut().filter(|s| s.page == i)
+                     {
++                        if finger_words
++                            && let Some(g) = text.nearest(vx, vy).and_then(|h| text.glyphs.get(h))
++                        {
++                            let line = to_screen(g.rect);
++                            view.magnify = Some((pos2(p.x, line.center().y), line.height()));
++                        }
+                         match &mut sel.span {
+                             // After a multi-click the drag extends by its unit (#1685), as in
+                             // Acrobat and browsers: whole words or lines, always keeping the one
+@@ -4182,13 +4375,35 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+                 ui.ctx().request_repaint();
+             }
+         }
++        // A finger widening a selection (held on a word, or on a handle) at the top or bottom of
++        // the view scrolls it on, as a mouse's selection drag does.
++        let finger_end = if view.touch_word.is_some() {
++            ui.input(|i| i.pointer.latest_pos())
++        } else {
++            view.handle_drag.map(|d| d.at)
++        };
++        let mut finger_scrolling = false;
++        if let Some(p) = finger_end
++            && navigation_enabled
++            && !single_paging
++        {
++            let dy = crate::autoscroll::edge_delta(p.y, avail, ui.input(|i| i.stable_dt));
++            if dy != 0.0 {
++                ui.scroll_with_delta_animation(vec2(0.0, dy), egui::style::ScrollAnimation::none());
++                ui.ctx().request_repaint();
++                finger_scrolling = true;
++            }
++        }
++        if let Some(d) = view.handle_drag.as_mut() {
++            d.scrolling = finger_scrolling;
++        }
+         // Scrolled by a finger: the drag pans, unless it is moving or resizing a comment.
+         // A finger resting on the page is a drag to egui once it is down too long to be a click
+         // (0.8 s), but it scrolls nothing until it moves: a hold longer than that (Android's
+         // Medium and Long touch-and-hold delays) still selects the word under it.
+         let (from, to) = ui.input(|i| (i.pointer.press_origin(), i.pointer.interact_pos()));
+         let moved = view.touch_panning || from.zip(to).is_some_and(|(a, b)| a.distance(b) > TOUCH_SLOP);
+-        if touch_pan && resp.dragged() && !comment_grabbed && moved {
++        if touch_pan && resp.dragged() && !comment_grabbed && moved && view.touch_word.is_none() {
+             // egui reports no motion on the frame a drag starts, and none for a finger that only
+             // now moved past the slop: take it from the press.
+             let delta = match (from, to) {
+@@ -4347,6 +4562,10 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+     });
+ 
+     view.viewport_screen = out.inner_rect;
++    if let Some((focus, line_h)) = view.magnify {
++        paint_magnifier(ui.ctx(), ui.layer_id(), focus, line_h, out.inner_rect);
++        ui.ctx().request_repaint();
++    }
+     view.auto_scroll.paint(ui, avail);
+     if unobstructed && !view.host && matches!(tool, QuickTool::Select | QuickTool::ColumnSelect) {
+         copy_selected |= selection_actions(ui, avail, view, info, prefs, allowed && !comments_hidden, can_copy);
+@@ -4724,6 +4943,51 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
+ /// otherwise ([`crate::PdfCraftApp::host_long_press`]: Android's own touch-and-hold delay).
+ pub(crate) const LONG_PRESS: f64 = 0.5;
+ 
++/// A magnifier over the text a finger is selecting, as Android and Acrobat show one: the page
++/// around `focus` (screen points, on a line `line_h` tall), half as large again, in a rounded box
++/// above the line (below it when there is no room above). It repaints this frame's page shapes,
++/// so it shows the selection as it is now.
++fn paint_magnifier(ctx: &egui::Context, page_layer: egui::LayerId, focus: Pos2, line_h: f32, view: Rect) {
++    const ZOOM: f32 = 1.5;
++    if !focus.is_finite() || !view.is_positive() {
++        return;
++    }
++    let size = vec2(144.0, (line_h * ZOOM + 28.0).clamp(56.0, 96.0));
++    let gap = line_h / 2.0 + 18.0;
++    let x = focus.x.clamp(view.left() + size.x / 2.0 + 4.0, (view.right() - size.x / 2.0 - 4.0).max(view.left() + size.x / 2.0 + 4.0));
++    let above = focus.y - gap - size.y / 2.0;
++    let y = if above - size.y / 2.0 >= view.top() + 4.0 { above } else { focus.y + gap + 48.0 + size.y / 2.0 };
++    let loupe = Rect::from_center_size(pos2(x, y), size);
++    let src = Rect::from_center_size(focus, size / ZOOM);
++    // Focus maps to the loupe's centre.
++    let t = egui::emath::TSTransform::new(loupe.center().to_vec2() - focus.to_vec2() * ZOOM, ZOOM);
++    let shapes: Vec<egui::epaint::ClippedShape> = ctx.graphics(|g| {
++        g.get(page_layer).map_or_else(Vec::new, |list| {
++            list.all_entries()
++                .filter(|c| !matches!(c.shape, egui::Shape::Callback(_)) && c.clip_rect.intersects(src) && c.shape.visual_bounding_rect().intersects(src))
++                .cloned()
++                .collect()
++        })
++    });
++    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("pdfcraft-magnifier"));
++    let painter = ctx.layer_painter(layer);
++    let radius = CornerRadius::same(12);
++    painter.add(egui::epaint::Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(90) }.as_shape(loupe, radius));
++    painter.rect_filled(loupe, radius, Color32::WHITE);
++    let inside = loupe.shrink(2.0);
++    ctx.graphics_mut(|g| {
++        let list = g.entry(layer);
++        for egui::epaint::ClippedShape { clip_rect, mut shape } in shapes {
++            shape.transform(t);
++            let clip = t.mul_rect(clip_rect).intersect(inside);
++            if clip.is_positive() {
++                list.add(clip, shape);
++            }
++        }
++    });
++    painter.rect_stroke(loupe, radius, Stroke::new(1.0, Color32::from_black_alpha(60)), egui::StrokeKind::Inside);
++}
++
+ /// How far a finger moves before it scrolls the page rather than resting on it (points; Android's
+ /// touch slop is 8 dp).
+ const TOUCH_SLOP: f32 = 8.0;
+@@ -7395,13 +7659,19 @@ pub(crate) mod touch_tests {
+ 
+     /// A PDF of `pages` Letter pages, each with a line of text.
+     pub(crate) fn long_pdf(pages: usize) -> Vec<u8> {
++        lines_pdf(&(1..=pages).map(|n| format!("Page {n}")).collect::<Vec<_>>())
++    }
++
++    /// A PDF with a Letter page for each of `lines`, the line in large type near its top.
++    pub(crate) fn lines_pdf(lines: &[String]) -> Vec<u8> {
++        let pages = lines.len();
+         let mut objs = vec![
+             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+             format!("<< /Type /Pages /Kids [{}] /Count {pages} >>", (0..pages).map(|n| format!("{} 0 R", 4 + 2 * n)).collect::<Vec<_>>().join(" ")),
+             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+         ];
+         for n in 0..pages {
+-            let stream = format!("BT /F1 36 Tf 72 680 Td (Page {}) Tj ET", n + 1);
++            let stream = format!("BT /F1 36 Tf 72 680 Td ({}) Tj ET", lines[n]);
+             objs.push(format!(
+                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {} 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+                 5 + 2 * n
+diff --git a/crates/ui-egui/src/host_chrome.rs b/crates/ui-egui/src/host_chrome.rs
+index 8de82b5..c563fd1 100644
+--- a/crates/ui-egui/src/host_chrome.rs
++++ b/crates/ui-egui/src/host_chrome.rs
+@@ -103,13 +103,17 @@ impl PdfCraftApp {
+                         self.views[i].host_selection_action(&name, &doc.info, &self.comment_prefs, can_comment);
+                     }
+                 }
+-                HostRequest::SelectionHandle { end, x, y } => {
++                HostRequest::SelectionHandle { end, x, y, done } => {
+                     let scale = self.ctx.as_ref().map_or(1.0, |c| c.zoom_factor()).max(0.01);
+-                    if let Some(view) = self.active.and_then(|i| self.views.get_mut(i))
+-                        && x.is_finite()
+-                        && y.is_finite()
+-                    {
+-                        view.move_selection_end(end, egui::pos2(x / scale, y / scale));
++                    let now = self.ctx.as_ref().map_or(0.0, |c| c.input(|i| i.time));
++                    if let Some(view) = self.active.and_then(|i| self.views.get_mut(i)) {
++                        if x.is_finite() && y.is_finite() {
++                            view.move_selection_end(end, egui::pos2(x / scale, y / scale));
++                            view.touch_handle_seen(now);
++                        }
++                        if done {
++                            view.end_handle_drag();
++                        }
+                     }
+                 }
+                 HostRequest::ComposerText(text) => {
+@@ -197,10 +201,17 @@ impl PdfCraftApp {
+         // Positions go out in CSS pixels of the canvas, as the host lays out its own controls.
+         let scale = self.ctx.as_ref().map_or(1.0, |c| c.zoom_factor());
+         let px = |v: f32| ((v * scale) as f64 * 10.0).round() / 10.0;
+-        let selection = active.and_then(|v| v.selection_on_screen()).map(|(bounds, start, end, text)| {
++        // `start` and `end` are where the handles hang, under the ends of the first and last
++        // lines; `startH` and `endH` those lines' heights. `moving` is the end a handle being
++        // dragged moves (handles that cross swap ends), and `touching` a finger that held a word
++        // and is still down, widening the selection.
++        let selection = active.and_then(|v| v.selection_on_screen().map(|s| (v, s))).map(|(v, (bounds, first, last, text))| {
+             json!({
+                 "x": px(bounds.left()), "y": px(bounds.top()), "w": px(bounds.width()), "h": px(bounds.height()),
+-                "start": [px(start.x), px(start.y)], "end": [px(end.x), px(end.y)],
++                "start": [px(first.left()), px(first.bottom())], "end": [px(last.right()), px(last.bottom())],
++                "startH": px(first.height()), "endH": px(last.height()),
++                "moving": v.dragged_end().map(|end| if end { "end" } else { "start" }),
++                "touching": v.touch_selecting(),
+                 "text": text,
+             })
+         });
+@@ -435,7 +446,7 @@ mod tests {
+         assert!(h.query_by_label("Underline").is_none());
+         assert!(h.query_by_label_contains("sticky note").is_none(), "no context menu");
+         // Its end handle dragged to the last glyph takes in the page number.
+-        ask(&mut h, HostRequest::SelectionHandle { end: true, x: last.x, y: last.y });
++        ask(&mut h, HostRequest::SelectionHandle { end: true, x: last.x, y: last.y, done: false });
+         let s = state(&h);
+         assert_eq!(s["selection"]["text"], "Page 1", "{s}");
+         assert!(s["selection"]["end"][0].as_f64().unwrap() > s["selection"]["start"][0].as_f64().unwrap());
+@@ -807,6 +818,137 @@ mod tests {
+         assert_eq!(state(&h)["tool"], "comment.ink", "and the pen is still the pen");
+     }
+ 
++    /// A phone showing one page of "The quick brown fox", its text read.
++    fn words() -> Harness<'static, PdfCraftApp> {
++        let mut h = Harness::builder().with_size(egui::vec2(412.0, 800.0)).build_eframe(move |_| {
++            let mut app = PdfCraftApp::new();
++            app.set_option("language", "en").unwrap();
++            app.host_chrome = true;
++            app.open_bytes("words.pdf", None, crate::canvas::touch_tests::lines_pdf(&["The quick brown fox".into(), "Two".into()])).unwrap();
++            app
++        });
++        h.run_steps(8);
++        until(&mut h, |h| h.state().views[0].page_text(0).is_some());
++        h
++    }
++
++    /// The screen centre of the first glyph `letter` on the first page.
++    fn letter(h: &Harness<'static, PdfCraftApp>, letter: &str) -> egui::Pos2 {
++        let view = &h.state().views[0];
++        let (text, xf) = (view.page_text(0).expect("the page's text"), view.page_xform(0).expect("the page on screen"));
++        let g = text.glyphs.iter().find(|g| g.text == letter).unwrap_or_else(|| panic!("no {letter} on the page"));
++        xf.view_rect(g.rect).center()
++    }
++
++    fn selected(h: &Harness<'static, PdfCraftApp>) -> String {
++        state(h)["selection"]["text"].as_str().unwrap_or("").trim().to_string()
++    }
++
++    /// The finger, still down, moves to `to` over a few frames.
++    fn slide(h: &mut Harness<'static, PdfCraftApp>, from: egui::Pos2, to: egui::Pos2) {
++        for k in 1..=4 {
++            let at = from + (to - from) * (k as f32 / 4.0);
++            finger(h, 1, TouchPhase::Move, at);
++            h.event(Event::PointerMoved(at));
++            h.step();
++        }
++        h.run_steps(2);
++    }
++
++    #[test]
++    fn a_finger_held_on_a_word_then_dragged_widens_the_selection_by_words() {
++        let mut h = words();
++        pen(&mut h, false, false);
++        let top = page_top(&h);
++        let at = letter(&h, "i");
++        press(&mut h, at);
++        h.run_steps(40);
++        assert_eq!(selected(&h), "quick", "{}", state(&h));
++        assert_eq!(state(&h)["selection"]["touching"], true);
++        let at_0 = letter(&h, "w");
++        slide(&mut h, at, at_0);
++        assert_eq!(selected(&h), "quick brown", "{}", state(&h));
++        assert!(h.state().views[0].magnify.is_some(), "a magnifier shows the text under the finger");
++        let at_0 = letter(&h, "w");
++        let at_1 = letter(&h, "x");
++        slide(&mut h, at_0, at_1);
++        assert_eq!(selected(&h), "quick brown fox", "{}", state(&h));
++        // Back past the word held: that word stays, and the selection runs the other way.
++        let at_0 = letter(&h, "x");
++        let at_1 = letter(&h, "h");
++        slide(&mut h, at_0, at_1);
++        assert_eq!(selected(&h), "The quick", "{}", state(&h));
++        assert_eq!(page_top(&h), top, "the drag scrolled nothing");
++        let at_0 = letter(&h, "h");
++        lift(&mut h, at_0);
++        h.run_steps(4);
++        assert_eq!(selected(&h), "The quick", "the selection stays when the finger lifts");
++        assert_eq!(state(&h)["selection"]["touching"], false);
++        assert!(h.state().views[0].magnify.is_none(), "and the magnifier goes");
++    }
++
++    #[test]
++    fn a_handle_grows_the_selection_by_words_shrinks_it_by_letters_and_crosses_the_other() {
++        let mut h = words();
++        pen(&mut h, false, false);
++        let at = letter(&h, "i");
++        press(&mut h, at);
++        h.run_steps(40);
++        lift(&mut h, at);
++        h.run_steps(4);
++        assert_eq!(selected(&h), "quick");
++        let handle = |h: &mut Harness<'static, PdfCraftApp>, end: bool, at: egui::Pos2| {
++            ask(h, HostRequest::SelectionHandle { end, x: at.x, y: at.y, done: false });
++        };
++        // Into the first half of the next word: not yet; past its middle: all of it.
++        let at_0 = letter(&h, "b");
++        handle(&mut h, true, at_0);
++        assert_eq!(selected(&h), "quick", "{}", state(&h));
++        assert_eq!(state(&h)["selection"]["moving"], "end");
++        let at_0 = letter(&h, "w");
++        handle(&mut h, true, at_0);
++        assert_eq!(selected(&h), "quick brown", "{}", state(&h));
++        assert!(h.state().views[0].magnify.is_some(), "a magnifier shows the handle's end");
++        // Drawn back: letter by letter.
++        let at_0 = letter(&h, "r");
++        handle(&mut h, true, at_0);
++        let t = selected(&h);
++        assert!(t.starts_with("quick b") && t.len() < "quick brown".len(), "{t}");
++        // On into the next word: whole words again.
++        let at_0 = letter(&h, "x");
++        handle(&mut h, true, at_0);
++        assert_eq!(selected(&h), "quick brown fox", "{}", state(&h));
++        ask(&mut h, HostRequest::SelectionHandle { end: true, x: f32::NAN, y: f32::NAN, done: true });
++        assert!(state(&h)["selection"]["moving"].is_null());
++        assert!(h.state().views[0].magnify.is_none());
++        // The end handle taken back past the start: the handles swap, and the start moves on.
++        let at_0 = letter(&h, "T");
++        handle(&mut h, true, at_0);
++        assert_eq!(selected(&h), "The", "{}", state(&h));
++        assert_eq!(state(&h)["selection"]["moving"], "start");
++        ask(&mut h, HostRequest::SelectionHandle { end: true, x: f32::NAN, y: f32::NAN, done: true });
++    }
++
++    #[test]
++    fn a_finger_highlights_whole_words() {
++        let mut h = words();
++        pen(&mut h, false, false);
++        ask(&mut h, HostRequest::Command("comment.highlight".into()));
++        // From the middle of one word to the middle of the next.
++        let (from, to) = (letter(&h, "u"), letter(&h, "r"));
++        press(&mut h, from);
++        h.step();
++        slide(&mut h, from, to);
++        assert_eq!(selected(&h), "quick brown", "{}", state(&h));
++        lift(&mut h, to);
++        h.run_steps(6);
++        let app = h.state();
++        let marks: Vec<String> = app.session.get(app.views[0].id).map_or(vec![], |d| {
++            d.info.annotations.iter().filter(|a| a.subtype == "Highlight").map(|a| format!("{:?}", a.rect)).collect()
++        });
++        assert_eq!(marks.len(), 1, "one highlight: {}", state(&h));
++    }
++
+     #[test]
+     fn the_host_sets_how_long_a_finger_holds_a_word_to_select_it() {
+         let mut h = phone(3);
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 8f7afb6..166abdf 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -469,11 +469,14 @@ pub enum HostRequest {
+     /// or `clear` (the host copied it, or let it go).
+     SelectionAction(String),
+     /// Move the start (`end: false`) or the end of the text selection to the text nearest this
+-    /// point of the page, in CSS pixels from the canvas's top-left (a drag of a handle).
++    /// point of the page, in CSS pixels from the canvas's top-left (a drag of a handle; `end` is
++    /// the handle the drag began with). `done`: the finger lifted (a point that is not finite
++    /// moves nothing).
+     SelectionHandle {
+         end: bool,
+         x: f32,
+         y: f32,
++        done: bool,
+     },
+     /// The text of the comment being written (the host's box replaces PdfCraft's card).
+     ComposerText(String),
