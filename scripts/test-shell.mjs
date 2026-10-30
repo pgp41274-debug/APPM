@@ -734,6 +734,58 @@ try {
     check('... Copy text puts the words on Android\'s clipboard', !!words && copied.at(-1) === words && await settle(() => !window.__state.selection),
       JSON.stringify({ words, copied }));
 
+    // Held, then dragged on without lifting: the selection widens a word at a time (Android's
+    // touch, hold and drag), the page doesn't scroll, and the card waits for the finger to lift.
+    {
+      const [hx, hy] = [fb.x + fb.width * onWord[0], fb.y + fb.height * onWord[1]];
+      const pageBefore = await p.evaluate(() => window.__state.page);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: hx, y: hy }] });
+      await sleep(1500);
+      const held = await settle(() => !!(window.__state.selection && window.__state.selection.touching), 3000);
+      const heldText = held && (await st()).selection.text;
+      for (let k = 1; k <= 8; k++) {
+        // On along the line and down onto the next one.
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: hx + k * fb.width * 0.025, y: hy + k * fb.height * 0.01 }] });
+        await sleep(60);
+      }
+      await sleep(400);
+      const during = await p.evaluate(() => ({ sel: window.__state.selection, card: !document.getElementById('selcard').hidden }));
+      await p.screenshot({ path: path.join(shots, 'phone-2b-held-and-dragging.png') }); // with the magnifier
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      const cardAfter = await settle(() => !document.getElementById('selcard').hidden && !window.__state.selection.touching, 4000);
+      const after = (await st()).selection;
+      check('a finger held on a word and dragged on widens the selection by words, and the card waits for the finger to lift',
+        held && !!during.sel && during.sel.text.length > heldText.length && !during.card && cardAfter && !!after
+        && after.text === during.sel.text && (await st()).page === pageBefore,
+        JSON.stringify({ heldText, during, after, cardAfter }));
+      await p.screenshot({ path: path.join(shots, 'phone-2b-held-and-dragged.png') }); // the card, once the finger lifts
+
+      // Its end handle dragged back towards the start: the selection shrinks, the finger keeps
+      // its offset from the handle (no jump on touch), and the drag ends when it lifts.
+      const hb = await p.locator('#handle-end').boundingBox();
+      const before = after.text;
+      const [ex, ey] = [hb.x + hb.width / 2, hb.y + hb.height / 2];
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: ex, y: ey }] });
+      await sleep(50);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: ex + 1, y: ey }] });
+      await sleep(300);
+      const noJump = (await st()).selection.text === before;
+      for (let k = 1; k <= 6; k++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: ex - k * fb.width * 0.03, y: ey }] });
+        await sleep(60);
+      }
+      await sleep(400);
+      const dragged = await p.evaluate(() => ({ sel: window.__state.selection, card: !document.getElementById('selcard').hidden }));
+      await p.screenshot({ path: path.join(shots, 'phone-2c-handle-dragging.png') });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      const ended = await settle(() => window.__state.selection && !window.__state.selection.moving && !document.getElementById('selcard').hidden, 4000);
+      check('... its end handle drawn back shrinks it, with no jump when touched, the card hidden until the finger lifts',
+        noJump && !!dragged.sel && dragged.sel.text.length < before.length && dragged.sel.moving === 'end' && !dragged.card && ended,
+        JSON.stringify({ before, noJump, dragged, ended }));
+      await p.evaluate(() => window.shell.back());
+      await settle(() => !window.__state.selection, 3000);
+    }
+
     // Taps are not a long press: one, two or three quick taps on that same word select nothing
     // (a mouse's double and triple click select a word and a line; a finger lands in them by accident).
     // Both events go out together: a slow machine (CI draws in software) otherwise holds the
